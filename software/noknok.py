@@ -733,159 +733,146 @@ class LedButtonStatus:
                 f"release_event={self.release_event}, "
                 f"count={self.count})")
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ============================================================================
+# noknok LEDs module - USB CDC device, driven by the Pico as a USB HOST.
+#
+# The I2C modules above are driven by the I2C Conductor. The LED module is a
+# USB device instead, so the Pico talks to it as a USB host using usb.core.
+# We use RAW BULK WRITES to the data endpoint (no CDC line-coding needed),
+# which keeps it simple and robust.
+#
+# Hardware / setup (Pico 2 W, RP2350, CircuitPython with USB host support):
+#   1) Power: the module needs 5 V on VBUS (supplied by the DataHub/PicoHub).
+#   2) In boot.py, before code.py runs, bring up the USB host port:
+#          import usb_host, board
+#          usb_host.Port(board.GP16, board.GP17)   # D+ , D-   (noknok standard)
+#      (D+ and D- must be a consecutive GPIO pair for PIO-USB. The PicoHub/
+#       DataHub routes the upstream USB data lines to GP16/GP17.)
+#   3) Then in your code:
+#          from noknok import NoknokLEDs
+#          leds = NoknokLEDs.find()
+#          if leds:
+#              leds.set_all(255, 0, 0)
+#
+# NOTE: untested on real noknok hardware until the DataHub/PicoHub exists.
+# ============================================================================
+
+_LEDS_VID = 0x1209
+_LEDS_PID = 0x4E4E
+
+
+def _clamp(v):
+    v = int(v)
+    return 0 if v < 0 else 255 if v > 255 else v
+
+
 class NoknokLEDs:
     """
-    Driver for the noknok LEDs module (8Ã— WS2812b RGB over USB CDC).
+    Driver for the noknok LEDs module (8x WS2812b RGB) over USB.
 
-    On Pico 2W (RP2350, CircuitPython 9+), obtain via Conductor.find_leds():
-        c = Conductor()
-        c.enumerate()
-        leds = c.find_leds()       # auto-detects module on USB host
-        leds = c.leds[0]           # or by discovery index
+    The module is a USB CDC device; the Pico drives it as a USB host via
+    CircuitPython's usb.core (raw bulk writes to the data endpoint). The API
+    mirrors the I2C module drivers so it feels the same to use.
 
-    Or instantiate directly if you already have a USB serial stream:
-        leds = NoknokLEDs(serial_device)
-
-    LED control:
-        leds.set_all(255, 0, 0)          # all red
-        leds.set_pixel(3, 0, 255, 0)     # LED 3 green
-        leds.fill(0xFF8800)              # hex colour
-        leds.set_brightness(128)         # half brightness
-        leds.set_all_pixels([            # 8 individual colours
-            (255,0,0),(0,255,0),(0,0,255),(255,255,0),
-            (0,255,255),(255,0,255),(128,128,128),(0,0,0)
-        ])
-        leds.off()
+        from noknok import NoknokLEDs
+        leds = NoknokLEDs.find()           # auto-detect on the USB host port
+        if leds:
+            leds.set_all(255, 0, 0)        # all red
+            leds.set_pixel(3, 0, 255, 0)   # LED 3 green
+            leds.set_brightness(128)       # half brightness
+            leds.fill(0xFF8800)            # hex colour
+            leds.set_all_pixels([          # 8 individual (r, g, b) colours
+                (255,0,0),(0,255,0),(0,0,255),(255,255,0),
+                (0,255,255),(255,0,255),(80,80,80),(0,0,0)])
+            leds.off()
     """
 
     LED_COUNT   = 8
     MODULE_TYPE = 0x04
+    _EP_OUT     = 0x02     # CDC data OUT  (host -> module: commands)
+    _EP_IN      = 0x83     # CDC data IN   (module -> host: responses)
 
     def __init__(self, device):
-        """
-        device: any object with a write(bytes) method.
-        On CircuitPython USB host this is typically a usb.core Device wrapper.
-        """
+        # device is a CircuitPython usb.core.Device
         self._dev = device
 
-    # â”€â”€ Discovery (CircuitPython USB host) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- discovery -------------------------------------------------------------
 
     @classmethod
-    def find(cls):
+    def find(cls, vid=_LEDS_VID, pid=_LEDS_PID):
         """
-        Scan USB host for a noknok LEDs module.
-        Requires CircuitPython 9+ on Pico 2W (RP2350) with USB host enabled.
-        Returns a NoknokLEDs instance, or None if not found.
-
-        Usage in boot.py:
-            import usb_host
-            import board
-            usb_host.Port(board.USB_HOST_DP, board.USB_HOST_DM)
+        Find the LED module on the Pico's USB host port. Returns a NoknokLEDs
+        instance, or None if not present. Requires usb_host.Port(...) in boot.py
+        and a CircuitPython build with USB host (usb.core) support.
         """
         try:
             import usb.core
         except ImportError:
             raise RuntimeError(
-                "usb.core not available â€” requires CircuitPython 9+ on Pico 2W "
-                "with USB host enabled in boot.py"
-            )
+                "usb.core not available - enable the USB host port in boot.py "
+                "(usb_host.Port) on a CircuitPython build with USB host support.")
 
-        for device in usb.core.find(find_all=True):
-            ep_out, ep_in = cls._find_cdc_endpoints(device)
-            if ep_out is None:
-                continue
-            try:
-                # Try identity query
-                ep_out.write(bytes([0xF0]))
-                resp = bytes(ep_in.read(3, timeout=300))
-                if resp == bytes([0x4E, 0x4E, cls.MODULE_TYPE]):
-                    wrapper = _USBCDCWrapper(ep_out, ep_in)
-                    print(f"noknok LEDs found (USB {device.bus}/{device.address})")
-                    return cls(wrapper)
-            except Exception:
-                pass
-        return None
-
-    @staticmethod
-    def _find_cdc_endpoints(device):
-        """Return (ep_out, ep_in) for the CDC data interface, or (None, None)."""
+        dev = usb.core.find(idVendor=vid, idProduct=pid)
+        if dev is None:
+            return None
         try:
-            import usb.util
-            for cfg in device:
-                for intf in cfg:
-                    if intf.bInterfaceClass == 0x0A:   # CDC Data interface
-                        ep_out = ep_in = None
-                        for ep in intf:
-                            if usb.util.endpoint_direction(ep.bEndpointAddress) \
-                                    == usb.util.ENDPOINT_OUT:
-                                ep_out = ep
-                            else:
-                                ep_in = ep
-                        if ep_out and ep_in:
-                            return ep_out, ep_in
+            dev.set_configuration()
         except Exception:
-            pass
-        return None, None
+            pass  # often already configured by the host stack
+        return cls(dev)
 
-    # â”€â”€ LED control â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-    def set_all(self, r, g, b):
-        """Set all 8 LEDs to one colour. R, G, B each 0â€“255."""
-        self._send(bytes([0x01, _clamp(r), _clamp(g), _clamp(b)]))
-
-    def set_pixel(self, index, r, g, b):
-        """Set a single LED (0â€“7) to a colour."""
-        self._send(bytes([0x02, index & 0xFF, _clamp(r), _clamp(g), _clamp(b)]))
-
-    def set_brightness(self, brightness):
-        """Global brightness scale 0â€“255. Applied on top of individual colours."""
-        self._send(bytes([0x03, _clamp(brightness)]))
-
-    def fill(self, hex_color):
-        """Set all LEDs to a hex colour, e.g. fill(0xFF0000) for red."""
-        r = (hex_color >> 16) & 0xFF
-        g = (hex_color >> 8)  & 0xFF
-        b =  hex_color        & 0xFF
-        self.set_all(r, g, b)
-
-    def set_all_pixels(self, pixels):
-        """
-        Set all 8 LEDs individually in one call.
-        pixels: list of 8 (r, g, b) tuples.
-        """
-        data = bytearray([0x04])
-        for r, g, b in list(pixels)[:self.LED_COUNT]:
-            data += bytes([_clamp(r), _clamp(g), _clamp(b)])
-        while len(data) < 1 + self.LED_COUNT * 3:
-            data += bytes([0, 0, 0])
-        self._send(bytes(data))
-
-    def show(self):
-        """Explicit show (all commands already auto-show; use for timing sync)."""
-        self._send(bytes([0x05]))
+    # -- LED control -----------------------------------------------------------
 
     def off(self):
         """Turn all LEDs off."""
-        self._send(bytes([0x00]))
+        self._send((0x00,))
+
+    def set_all(self, r, g, b):
+        """Set all 8 LEDs to one colour. R, G, B each 0-255."""
+        self._send((0x01, _clamp(r), _clamp(g), _clamp(b)))
+
+    def set_pixel(self, index, r, g, b):
+        """Set a single LED (0-7) to a colour."""
+        self._send((0x02, int(index) & 0xFF, _clamp(r), _clamp(g), _clamp(b)))
+
+    def set_brightness(self, brightness):
+        """Global brightness 0-255, applied on top of the per-LED colours."""
+        self._send((0x03, _clamp(brightness)))
+
+    def fill(self, hex_color):
+        """Set all LEDs to a 24-bit hex colour, e.g. fill(0xFF8800)."""
+        self.set_all((hex_color >> 16) & 0xFF, (hex_color >> 8) & 0xFF, hex_color & 0xFF)
+
+    def set_all_pixels(self, pixels):
+        """
+        Set all 8 LEDs at once. `pixels` is an iterable of up to 8 (r, g, b)
+        tuples; any missing LEDs are turned off.
+        """
+        data = bytearray((0x04,))
+        for px in list(pixels)[:self.LED_COUNT]:
+            data += bytes((_clamp(px[0]), _clamp(px[1]), _clamp(px[2])))
+        while len(data) < 1 + self.LED_COUNT * 3:
+            data += b"\x00\x00\x00"
+        self._send(data)
+
+    def show(self):
+        """Explicit show (setters already auto-show; here for completeness)."""
+        self._send((0x05,))
+
+    def identify(self):
+        """
+        Send the identity query (0xF0) and check for the [0x4E,0x4E,0x04] reply.
+        Returns True if the module identifies correctly.
+        """
+        try:
+            self._send((0xF0,))
+            resp = self._dev.read(self._EP_IN, 3, timeout=300)
+            return bytes(resp) == bytes((0x4E, 0x4E, self.MODULE_TYPE))
+        except Exception:
+            return False
+
+    # -- low level -------------------------------------------------------------
 
     def _send(self, data):
-        self._dev.write(data)
-
-
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-class _USBCDCWrapper:
-    """Thin wrapper so usb.core endpoints look like a write()-able device."""
-    def __init__(self, ep_out, ep_in):
-        self._ep_out = ep_out
-        self._ep_in  = ep_in
-
-    def write(self, data):
-        self._ep_out.write(data)
-
-    def read(self, n, timeout=500):
-        return bytes(self._ep_in.read(n, timeout=timeout))
-
-
-def _clamp(v):
-    return max(0, min(255, int(v)))
+        # Raw bulk OUT to the CDC data endpoint. No CDC line-coding required.
+        self._dev.write(self._EP_OUT, bytes(data), timeout=1000)
