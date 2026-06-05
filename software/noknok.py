@@ -1,9 +1,12 @@
-# noknok.py  v1.1
+# noknok.py  v1.2
 # CircuitPython library for the noknok modular ecosystem
 # Raspberry Pi Pico — I2C master ("Conductor")
 #
 # v1.1 (Sam): added Conductor.check_factory_reset() — hold the knob button 5 s
 #             to wipe creds/state and reboot into the noknok-setup AP.
+# v1.2 (Sue): check_factory_reset(knob_status) now takes the KnobStatus the
+#             product already read, instead of reading the knob itself — a second
+#             read was eating the rotation delta and breaking knob control.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -388,7 +391,7 @@ class Conductor:
     # ── Factory reset ─────────────────────────────────────────────────────────
     # Added v1.1 (Sam): hold the knob button for 5 s to wipe all credentials /
     # state and reboot into the noknok-setup provisioning AP. Call once per
-    # product main-loop iteration: c.check_factory_reset()
+    # product main-loop iteration: ks = knb.read(); c.check_factory_reset(ks)
 
     # Files removed on reset — must match what code.py expects absent for a
     # clean re-provision (WIFI_CREDENTIALS_FILE / PRODUCT_SCRIPT_FILE), plus
@@ -396,9 +399,17 @@ class Conductor:
     _RESET_FILES = ("wifi.json", "product.py",
                     "noknok_state.json", "noknok_roles.json")
 
-    def check_factory_reset(self, hold_seconds=5.0):
+    def check_factory_reset(self, knob_status, hold_seconds=5.0):
         """
-        Non-blocking factory-reset watchdog. Call ONCE per main-loop iteration.
+        Non-blocking factory-reset watchdog. Call ONCE per main-loop iteration,
+        passing the KnobStatus you already read this loop:
+
+            ks = knb.read()
+            c.check_factory_reset(ks)
+
+        Pass the status in (rather than reading the knob here) so there is only
+        ONE knob read per loop. A second read would consume the rotation delta
+        (it auto-clears on read) and the product would never see the knob turn.
 
         Hold the knob button continuously for `hold_seconds` (default 5 s) to
         wipe credentials/state and reboot into the noknok-setup AP. Releasing
@@ -407,19 +418,9 @@ class Conductor:
         Escalating, best-effort feedback (a missing buzzer/LED never breaks it):
           ~3 s held  → short warning beep + LED flash (once)
           5 s held   → confirmation beep + LED flash, then wipe & reboot
-
-        Requires a knob. If the conductor has no knob, returns immediately.
         """
-        # No knob → nothing to watch. Never crash if one isn't present.
-        if not self.knob:
-            return
-
-        # Robust button read — treat any I2C error / None as not-pressed.
-        try:
-            ks = self.knob[0].read()
-        except Exception:
-            ks = None
-        pressed = bool(ks is not None and ks.pressed)
+        # Use the status the product already read — treat None as not-pressed.
+        pressed = bool(knob_status is not None and knob_status.pressed)
 
         now = time.monotonic()
 
