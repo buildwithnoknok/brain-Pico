@@ -1,5 +1,5 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.5 (PoC — WiFi AP mode; script_url from /connect makes Pico product-agnostic)
+# Version: 0.6 (PoC — WiFi AP; script_url from /connect; URL-decode form fields)
 #
 # v0.5 changes (Sam):
 #   - log() now timestamps every line with monotonic uptime [  12.34], and
@@ -197,6 +197,30 @@ def delete_wifi_credentials():
     except OSError:
         pass
 
+def _url_decode(s):
+    """Percent-decode an application/x-www-form-urlencoded value.
+    '+' -> space, %XX -> byte. Robust: leaves malformed sequences as-is."""
+    if not s:
+        return s
+    s = s.replace("+", " ")
+    out = bytearray()
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "%" and i + 2 < n:
+            try:
+                out.append(int(s[i + 1:i + 3], 16))
+                i += 3
+                continue
+            except ValueError:
+                pass
+        out.append(ord(c))
+        i += 1
+    try:
+        return out.decode("utf-8")
+    except Exception:
+        return out.decode("latin-1")
+
 def product_script_exists():
     try:
         os.stat(PRODUCT_SCRIPT_FILE)
@@ -284,9 +308,9 @@ def register_routes(server):
     @server.route("/connect", POST)
     def _connect(request: Request):
         form = request.form_data
-        ssid = (form.get("ssid") or "").strip() if form else ""
-        pw   = (form.get("password") or "") if form else ""
-        url  = (form.get("script_url") or "").strip() if form else ""
+        ssid = _url_decode(form.get("ssid") or "").strip() if form else ""
+        pw   = _url_decode(form.get("password") or "") if form else ""
+        url  = _url_decode(form.get("script_url") or "").strip() if form else ""
 
         if not ssid:
             # No network name entered — show the form again
