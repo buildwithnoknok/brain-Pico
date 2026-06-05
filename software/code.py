@@ -1,5 +1,15 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.4 (PoC — WiFi AP mode; script_url from /connect makes Pico product-agnostic)
+# Version: 0.5 (PoC — WiFi AP mode; script_url from /connect makes Pico product-agnostic)
+#
+# v0.5 changes (Sam):
+#   - log() now timestamps every line with monotonic uptime [  12.34], and
+#     after a successful WiFi connect does a one-time NTP sync so lines also
+#     carry wall-clock HH:MM:SS. NTP is wrapped in try/except — never crashes boot.
+#   - Instrumented + hardened the normal (STA) boot download path so we can SEE
+#     where it fails: explicit branch logging, script_url source logging, and
+#     2-3 retries on the direct-boot WiFi join before falling back to AP.
+#   - NOTE: NTP needs adafruit_ntp.mpy in /lib. If absent, logging still works
+#     (uptime only) — wall-clock is simply skipped.
 #
 # Boot logic:
 #   1. If wifi.json exists -> connect to home WiFi directly
@@ -36,17 +46,61 @@ from adafruit_httpserver import Server, Request, Response, POST
 
 LOG_FILE = "log.txt"
 
+# Wall-clock availability. The Pico 2W has no battery-backed RTC, so on every
+# boot we only know uptime (time.monotonic). After a successful WiFi connect we
+# try a one-time NTP sync; if it works, _rtc_synced flips True and log lines
+# additionally carry HH:MM:SS. Until then (and if NTP fails) we log uptime only.
+_rtc_synced = False
+
+def _timestamp():
+    """Build the log-line prefix.
+    Always: monotonic uptime, e.g. '[  12.34]'.
+    After NTP sync: also wall-clock, e.g. '[  12.34 14:03:09]'.
+    Must never raise — logging has to survive any clock state."""
+    try:
+        up = time.monotonic()
+        prefix = "[%8.2f" % up
+        if _rtc_synced:
+            try:
+                t = time.localtime()
+                prefix += " %02d:%02d:%02d" % (t.tm_hour, t.tm_min, t.tm_sec)
+            except Exception:
+                pass
+        return prefix + "] "
+    except Exception:
+        return "[ ?.??] "
+
 def log(msg):
     """Print to the serial console AND append to log.txt on the Pico.
+    Every line is timestamped (uptime, plus wall-clock once NTP has synced).
     Lets us read what happened after a power-cycle (when serial output is missed).
     Open log.txt in Thonny's file browser to review."""
-    line = str(msg)
+    line = _timestamp() + str(msg)
     sys.stdout.write(line + "\n")          # console output
     try:
         with open(LOG_FILE, "a") as f:
             f.write(line + "\n")
     except Exception:
         pass
+
+def sync_time_ntp(pool):
+    """One-time NTP sync to set the RTC so logs get wall-clock timestamps.
+    Best-effort: any failure (no adafruit_ntp.mpy, no internet, DNS) is swallowed
+    and we simply keep uptime-only logging. Call this AFTER a WiFi connect.
+    `pool` is a socketpool from the radio (reuse the existing one)."""
+    global _rtc_synced
+    if _rtc_synced:
+        return
+    try:
+        import rtc
+        import adafruit_ntp
+        # tz_offset stays 0 -> UTC. Keeps it simple; uptime gives relative timing.
+        ntp = adafruit_ntp.NTP(pool, tz_offset=0, cache_seconds=3600)
+        rtc.RTC().datetime = ntp.datetime
+        _rtc_synced = True
+        log("[ntp] RTC synced (UTC) — wall-clock timestamps now enabled")
+    except Exception as e:
+        log(f"[ntp] sync skipped ({e}) — keeping uptime-only timestamps")
 
 LOG_MAX_BYTES = 32000  # cap so the log can't fill the Pico flash (~32 KB)
 
@@ -61,7 +115,7 @@ def log_new_boot():
         except OSError:
             pass  # file doesn't exist yet
         with open(LOG_FILE, "a") as f:
-            f.write("\n===== BOOT =====\n")
+            f.write("\n" + _timestamp() + "===== BOOT =====\n")
     except Exception:
         pass
 
@@ -171,7 +225,16 @@ def download_and_save_script(script_url=None):
     correctly for the radio. Retries a few times since DNS can need a moment
     to settle after a fresh WiFi join."""
 
-    url = script_url or SCRIPT_URL
+    # Resolve the URL and log WHERE it came from. This is the key diagnostic:
+    # it tells us whether the app-supplied script_url actually arrived in
+    # wifi.json, or whether we silently fell back to the hardcoded PoC URL.
+    if script_url:
+        url = script_url
+        log(f"[download] script_url source: wifi.json (app-supplied)")
+    else:
+        url = SCRIPT_URL
+        log(f"[download] script_url source: fallback SCRIPT_URL (none in wifi.json)")
+    log(f"[download] resolved url: {url}")
 
     # Give the network stack a moment to settle DNS after connecting
     time.sleep(2)
@@ -198,14 +261,14 @@ def download_and_save_script(script_url=None):
             with open(PRODUCT_SCRIPT_FILE, "w") as f:
                 f.write(content)
 
-            log(f"[download] Saved {PRODUCT_SCRIPT_FILE} ({len(content)} bytes)")
+            log(f"[download] SUCCESS — saved {PRODUCT_SCRIPT_FILE} ({len(content)} bytes) from {url}")
             return True
 
         except Exception as e:
             log(f"[download] Attempt {attempt} error: {e}")
             time.sleep(2)  # wait and retry — usually DNS settling
 
-    log("[download] All attempts failed")
+    log(f"[download] FAILED — all attempts exhausted for {url}")
     return False
 
 # ── HTTP routes ────────────────────────────────────────────────────────────────
@@ -331,20 +394,45 @@ def main():
 
     if creds:
         log("[boot] Found wifi.json — connecting directly")
-        if connect_wifi(creds["ssid"], creds["password"]):
+        log(f"[boot] wifi.json ssid='{creds.get('ssid')}' "
+            f"script_url={'present' if creds.get('script_url') else 'MISSING'}")
+
+        # Direct-boot WiFi join can be flaky right after a hardware reset (the
+        # radio/AP may need a moment). Try a few times before giving up to AP.
+        connected = False
+        for attempt in range(1, 4):  # up to 3 attempts
+            log(f"[boot] WiFi join attempt {attempt}/3")
+            if connect_wifi(creds["ssid"], creds["password"]):
+                connected = True
+                break
+            if attempt < 3:
+                time.sleep(3)  # brief pause before retry
+
+        # Explicit post-connect marker so the log never goes silent here.
+        log(f"[boot] connect_wifi result: {'CONNECTED' if connected else 'FAILED'}")
+
+        if connected:
+            # One-time NTP sync so subsequent log lines carry wall-clock time.
+            # Best-effort — wrapped internally, never blocks the boot.
+            try:
+                sync_time_ntp(socketpool.SocketPool(wifi.radio))
+            except Exception as e:
+                log(f"[ntp] setup error (ignored): {e}")
+
             if product_script_exists():
-                log(f"[boot] Running {PRODUCT_SCRIPT_FILE}")
+                log(f"[boot] product.py present — running {PRODUCT_SCRIPT_FILE}")
                 exec(open(PRODUCT_SCRIPT_FILE).read(), {"__name__": "__main__"})
             else:
-                log("[boot] No product script — downloading")
+                log("[boot] product.py missing — will download")
                 if download_and_save_script(creds.get("script_url")):
+                    log("[boot] download OK — reloading to run product.py")
                     supervisor.reload()
                 else:
                     log("[boot] Download failed — starting AP provisioning")
                     delete_wifi_credentials()
                     run_ap_provisioning()
         else:
-            log("[boot] WiFi failed — clearing credentials, starting AP provisioning")
+            log("[boot] WiFi failed after 3 tries — clearing credentials, starting AP provisioning")
             delete_wifi_credentials()
             run_ap_provisioning()
     else:
@@ -352,3 +440,4 @@ def main():
         run_ap_provisioning()
 
 main()
+
