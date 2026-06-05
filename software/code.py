@@ -1,5 +1,5 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.3 (PoC — WiFi AP mode, adafruit_httpserver)
+# Version: 0.4 (PoC — WiFi AP mode; script_url from /connect makes Pico product-agnostic)
 #
 # Boot logic:
 #   1. If wifi.json exists -> connect to home WiFi directly
@@ -81,7 +81,7 @@ PRODUCT_SCRIPT_FILE   = "product.py"
 WIFI_TIMEOUT_S        = 15
 
 # Shared state: the /connect handler fills this, the main loop acts on it.
-pending = {"ssid": None, "password": None, "ready": False}
+pending = {"ssid": None, "password": None, "script_url": None, "ready": False}
 
 # ── HTML pages ─────────────────────────────────────────────────────────────────
 
@@ -129,9 +129,11 @@ def load_wifi_credentials():
     except (OSError, ValueError):
         return None
 
-def save_wifi_credentials(ssid, password):
+def save_wifi_credentials(ssid, password, script_url=None):
     with open(WIFI_CREDENTIALS_FILE, "w") as f:
-        json.dump({"ssid": ssid, "password": password}, f)
+        json.dump(
+            {"ssid": ssid, "password": password, "script_url": script_url}, f
+        )
     log("[storage] Saved wifi.json")
 
 def delete_wifi_credentials():
@@ -163,11 +165,13 @@ def connect_wifi(ssid, password):
 
 # ── Script download ────────────────────────────────────────────────────────────
 
-def download_and_save_script():
+def download_and_save_script(script_url=None):
     """Download product script from GitHub and save as product.py.
     Uses adafruit_connection_manager so DNS and the SSL context are set up
     correctly for the radio. Retries a few times since DNS can need a moment
     to settle after a fresh WiFi join."""
+
+    url = script_url or SCRIPT_URL
 
     # Give the network stack a moment to settle DNS after connecting
     time.sleep(2)
@@ -179,9 +183,9 @@ def download_and_save_script():
     session = adafruit_requests.Session(pool, context)
 
     for attempt in range(1, 4):  # up to 3 tries
-        log(f"[download] Attempt {attempt}: fetching {SCRIPT_URL}")
+        log(f"[download] Attempt {attempt}: fetching {url}")
         try:
-            response = session.get(SCRIPT_URL, timeout=30)
+            response = session.get(url, timeout=30)
 
             if response.status_code != 200:
                 log(f"[download] HTTP {response.status_code}")
@@ -219,6 +223,7 @@ def register_routes(server):
         form = request.form_data
         ssid = (form.get("ssid") or "").strip() if form else ""
         pw   = (form.get("password") or "") if form else ""
+        url  = (form.get("script_url") or "").strip() if form else ""
 
         if not ssid:
             # No network name entered — show the form again
@@ -226,9 +231,10 @@ def register_routes(server):
 
         # Store credentials; the main loop will act on them after the
         # success page has been delivered to the browser.
-        pending["ssid"]     = ssid
-        pending["password"] = pw
-        pending["ready"]    = True
+        pending["ssid"]       = ssid
+        pending["password"]   = pw
+        pending["script_url"] = url
+        pending["ready"]      = True
         log(f"[ap] Credentials received for '{ssid}'")
         return Response(request, HTML_SUCCESS, content_type="text/html")
 
@@ -286,6 +292,7 @@ def run_ap_provisioning():
         time.sleep(1)
         ssid = pending["ssid"]
         pw   = pending["password"]
+        su   = pending["script_url"]
 
         wifi.radio.stop_ap()
         log("[ap] Hotspot stopped — attempting WiFi join")
@@ -296,7 +303,7 @@ def run_ap_provisioning():
             # AP->STA transition (without a chip reset) leaves DNS broken.
             # A hardware reset brings the radio up clean in STA-only mode, and
             # main() will then connect + download on the fresh boot.
-            save_wifi_credentials(ssid, pw)
+            save_wifi_credentials(ssid, pw, su)
             log("[boot] Credentials saved — hardware reset into WiFi mode")
             time.sleep(2)  # let the success page flush to the browser
             microcontroller.reset()
@@ -330,7 +337,7 @@ def main():
                 exec(open(PRODUCT_SCRIPT_FILE).read(), {"__name__": "__main__"})
             else:
                 log("[boot] No product script — downloading")
-                if download_and_save_script():
+                if download_and_save_script(creds.get("script_url")):
                     supervisor.reload()
                 else:
                     log("[boot] Download failed — starting AP provisioning")
