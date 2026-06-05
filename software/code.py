@@ -1,5 +1,5 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.6 (PoC — WiFi AP; script_url from /connect; URL-decode form fields)
+# Version: 0.7 (PoC — WiFi AP; script_url; URL-decode; retry provisioning join 3x)
 #
 # v0.5 changes (Sam):
 #   - log() now timestamps every line with monotonic uptime [  12.34], and
@@ -384,7 +384,20 @@ def run_ap_provisioning():
         wifi.radio.stop_ap()
         log("[ap] Hotspot stopped — attempting WiFi join")
 
-        if connect_wifi(ssid, pw):
+        # The Pico W radio often fails the FIRST join right after AP mode with
+        # "Unknown failure 205", then succeeds on a retry. Try a few times
+        # before giving up — otherwise a transient blip kicks the user back to
+        # re-entering credentials in the app.
+        joined = False
+        for attempt in range(1, 4):
+            log(f"[ap] WiFi join attempt {attempt}/3")
+            if connect_wifi(ssid, pw):
+                joined = True
+                break
+            if attempt < 3:
+                time.sleep(3)
+
+        if joined:
             # Credentials verified. Save them, then do a FULL hardware reset.
             # We do NOT download here: this radio was just in AP mode, and the
             # AP->STA transition (without a chip reset) leaves DNS broken.
@@ -396,10 +409,10 @@ def run_ap_provisioning():
             microcontroller.reset()
             return
         else:
-            # WiFi join failed — restart the AP so the user can retry.
-            # We do NOT supervisor.reload() here: a soft reload leaves the
-            # CYW43 radio in a state where AP mode no longer works.
-            log("[ap] WiFi join failed — restarting hotspot for retry")
+            # WiFi join failed after all retries — restart the AP so the user
+            # can retry. We do NOT supervisor.reload() here: a soft reload leaves
+            # the CYW43 radio in a state where AP mode no longer works.
+            log("[ap] WiFi join failed after 3 attempts — restarting hotspot for retry")
             try:
                 server.stop()
             except Exception:
