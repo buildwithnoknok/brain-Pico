@@ -1,4 +1,4 @@
-# noknok.py  v1.2
+# noknok.py  v1.3
 # CircuitPython library for the noknok modular ecosystem
 # Raspberry Pi Pico — I2C master ("Conductor")
 #
@@ -7,6 +7,9 @@
 # v1.2 (Sue): check_factory_reset(knob_status) now takes the KnobStatus the
 #             product already read, instead of reading the knob itself — a second
 #             read was eating the rotation delta and breaking knob control.
+# v1.3 (Sue): factory reset no longer wipes noknok_state.json (the I2C address
+#             map). A soft reset doesn't power-cycle modules, so they keep their
+#             addresses; keeping the map lets the next product find them.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -393,11 +396,14 @@ class Conductor:
     # state and reboot into the noknok-setup provisioning AP. Call once per
     # product main-loop iteration: ks = knb.read(); c.check_factory_reset(ks)
 
-    # Files removed on reset — must match what code.py expects absent for a
-    # clean re-provision (WIFI_CREDENTIALS_FILE / PRODUCT_SCRIPT_FILE), plus
-    # this library's own persisted state.
-    _RESET_FILES = ("wifi.json", "product.py",
-                    "noknok_state.json", "noknok_roles.json")
+    # Files removed on reset. We wipe the credentials (wifi.json), the product
+    # script (product.py) and the product-level role map (noknok_roles.json).
+    # We deliberately KEEP noknok_state.json — it's the I2C address map. A reset
+    # reboots the Pico but does NOT power-cycle the modules, so they keep their
+    # assigned addresses; the map lets the next product find them again. The
+    # restore logic self-heals if the hardware changed (pings + skips missing,
+    # discovers new at 0x7F), so keeping it is safe.
+    _RESET_FILES = ("wifi.json", "product.py", "noknok_roles.json")
 
     def check_factory_reset(self, knob_status, hold_seconds=5.0):
         """
