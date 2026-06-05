@@ -1,6 +1,9 @@
-# noknok.py
+# noknok.py  v1.1
 # CircuitPython library for the noknok modular ecosystem
 # Raspberry Pi Pico — I2C master ("Conductor")
+#
+# v1.1 (Sam): added Conductor.check_factory_reset() — hold the knob button 5 s
+#             to wipe creds/state and reboot into the noknok-setup AP.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -381,6 +384,106 @@ class Conductor:
         """Return a module by its UID hex string (hyphens and spaces ignored)."""
         key = uid_hex.lower().replace("-", "").replace(" ", "")
         return self._registry.get(key)
+
+    # ── Factory reset ─────────────────────────────────────────────────────────
+    # Added v1.1 (Sam): hold the knob button for 5 s to wipe all credentials /
+    # state and reboot into the noknok-setup provisioning AP. Call once per
+    # product main-loop iteration: c.check_factory_reset()
+
+    # Files removed on reset — must match what code.py expects absent for a
+    # clean re-provision (WIFI_CREDENTIALS_FILE / PRODUCT_SCRIPT_FILE), plus
+    # this library's own persisted state.
+    _RESET_FILES = ("wifi.json", "product.py",
+                    "noknok_state.json", "noknok_roles.json")
+
+    def check_factory_reset(self, hold_seconds=5.0):
+        """
+        Non-blocking factory-reset watchdog. Call ONCE per main-loop iteration.
+
+        Hold the knob button continuously for `hold_seconds` (default 5 s) to
+        wipe credentials/state and reboot into the noknok-setup AP. Releasing
+        the button at any point resets the timer.
+
+        Escalating, best-effort feedback (a missing buzzer/LED never breaks it):
+          ~3 s held  → short warning beep + LED flash (once)
+          5 s held   → confirmation beep + LED flash, then wipe & reboot
+
+        Requires a knob. If the conductor has no knob, returns immediately.
+        """
+        # No knob → nothing to watch. Never crash if one isn't present.
+        if not self.knob:
+            return
+
+        # Robust button read — treat any I2C error / None as not-pressed.
+        try:
+            ks = self.knob[0].read()
+        except Exception:
+            ks = None
+        pressed = bool(ks is not None and ks.pressed)
+
+        now = time.monotonic()
+
+        # Released (or read failed) → reset the hold timer and bail.
+        if not pressed:
+            self._reset_hold_start = None
+            self._reset_warned     = False
+            return
+
+        # First frame of a press → start the timer.
+        if getattr(self, "_reset_hold_start", None) is None:
+            self._reset_hold_start = now
+            self._reset_warned     = False
+            return
+
+        held = now - self._reset_hold_start
+
+        # ~3 s warning (fire once per hold).
+        if held >= 3.0 and not getattr(self, "_reset_warned", False):
+            self._reset_warned = True
+            self._reset_feedback(warn=True)
+
+        # Target reached → confirm and reset.
+        if held >= hold_seconds:
+            self._reset_feedback(warn=False)   # confirmation
+            self._do_factory_reset()
+
+    def _reset_feedback(self, warn):
+        """Best-effort buzzer + LED feedback. Each output wrapped so a missing
+        module can never break the reset path."""
+        # Buzzer: low tone for warning, higher confirmation tone.
+        if self.buzzer:
+            try:
+                if warn:
+                    self.buzzer[0].play(220, 150, 60)   # low warn beep
+                else:
+                    self.buzzer[0].play(880, 250, 80)   # confirmation beep
+            except Exception:
+                pass
+        # LED button flash.
+        if self.ledbutton:
+            try:
+                if warn:
+                    self.ledbutton[0].set_color(60, 30, 0)    # dim amber warn
+                else:
+                    self.ledbutton[0].set_color(120, 0, 0)    # red confirm
+            except Exception:
+                pass
+
+    def _do_factory_reset(self):
+        """Wipe credentials/state and reboot into the provisioning AP."""
+        import os
+        print("[reset] Factory reset triggered — wiping credentials and state.")
+        for fname in self._RESET_FILES:
+            try:
+                os.remove(fname)
+                print(f"[reset] removed {fname}")
+            except OSError:
+                pass   # already absent / read-only — ignore
+        # Let the confirmation beep/flash finish before the board drops out.
+        time.sleep(0.8)
+        print("[reset] rebooting...")
+        import microcontroller
+        microcontroller.reset()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -876,3 +979,4 @@ class NoknokLEDs:
     def _send(self, data):
         # Raw bulk OUT to the CDC data endpoint. No CDC line-coding required.
         self._dev.write(self._EP_OUT, bytes(data), timeout=1000)
+
