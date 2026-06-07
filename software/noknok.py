@@ -1,4 +1,4 @@
-# noknok.py  v1.3
+# noknok.py  v1.4
 # CircuitPython library for the noknok modular ecosystem
 # Raspberry Pi Pico — I2C master ("Conductor")
 #
@@ -10,6 +10,13 @@
 # v1.3 (Sue): factory reset no longer wipes noknok_state.json (the I2C address
 #             map). A soft reset doesn't power-cycle modules, so they keep their
 #             addresses; keeping the map lets the next product find them.
+# v1.4 (Sam): app-driven role assignment ("PoC v1 Step 3"). Added
+#             Conductor.detect_interaction() — watch a module type for a NEW
+#             physical interaction (knob turn/press, LED-button press) and return
+#             the UID of the module the customer touched. Added
+#             Conductor.append_role() — write a single role->UID entry into
+#             noknok_roles.json (compatible with load_roles()). Both are additive;
+#             no existing methods changed.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -390,6 +397,137 @@ class Conductor:
         """Return a module by its UID hex string (hyphens and spaces ignored)."""
         key = uid_hex.lower().replace("-", "").replace(" ", "")
         return self._registry.get(key)
+
+    # ── App-driven role assignment (v1.4) ──────────────────────────────────────
+    # Added v1.4 (Sam): the noknok app drives role assignment over the AP HTTP
+    # connection. The app asks the customer to interact with a specific module
+    # ("press the button you want for OK"); detect_interaction() watches the
+    # modules of that type and returns the UID of the one that was touched.
+    # append_role() then persists that role->UID mapping to noknok_roles.json.
+
+    # module_type strings accepted by detect_interaction(), mapped to the list
+    # attribute on this Conductor that holds those module instances.
+    _ROLE_TYPE_LISTS = {
+        "knob":       "knob",
+        "led_button": "ledbutton",
+        "buzzer":     "buzzer",
+    }
+
+    def _modules_for_type(self, module_type):
+        """Return the module list for a module_type string, or None if unknown."""
+        attr = self._ROLE_TYPE_LISTS.get(str(module_type).lower())
+        if attr is None:
+            return None
+        return getattr(self, attr, None)
+
+    def detect_interaction(self, module_type, timeout=20.0, exclude=None):
+        """
+        Watch all modules of `module_type` and return the UID (hex string) of the
+        first one the customer physically interacts with, or None on timeout.
+
+        module_type : "knob", "led_button", or "buzzer".
+        timeout     : seconds to wait for an interaction (default 20 s).
+        exclude     : optional list/set of uid_hex strings to ignore (modules
+                      that have already been assigned a role).
+
+        Requires the Conductor to be enumerated already (the caller ensures this).
+        Returns None if there are no modules of that type.
+
+        What counts as a NEW interaction:
+          knob       : a read with delta != 0 (rotation) OR a button press edge
+                       (was not pressed, now pressed).
+          led_button : a button press edge (was not pressed, now pressed).
+        The press_event edge flag is unreliable, so we detect presses via the
+        .pressed level edge instead.
+
+        A baseline read of every candidate is taken first to clear any pending
+        knob delta and capture the current pressed state, so a button already
+        held when detection starts does not count as a new interaction.
+        Robust to read() returning None (those samples are skipped).
+        Non-destructive to enumeration/state.
+        """
+        modules = self._modules_for_type(module_type)
+        if not modules:
+            return None
+
+        # Normalise the exclude set to comparable uid_hex strings.
+        excluded = set()
+        if exclude:
+            for u in exclude:
+                if u:
+                    excluded.add(str(u).lower().replace("-", "").replace(" ", ""))
+
+        # Candidate (uid_hex, module) pairs, skipping excluded modules.
+        candidates = []
+        for m in modules:
+            uid = getattr(m, "_uid_hex", None)
+            if uid is None:
+                continue
+            if uid.lower().replace("-", "").replace(" ", "") in excluded:
+                continue
+            candidates.append((uid, m))
+
+        if not candidates:
+            return None
+
+        # ── Baseline: one read each to clear knob delta and capture pressed ──
+        last_pressed = {}
+        for uid, m in candidates:
+            s = m.read()
+            last_pressed[uid] = bool(s.pressed) if s is not None else False
+
+        # ── Watch for a new interaction ──────────────────────────────────────
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for uid, m in candidates:
+                s = m.read()
+                if s is None:
+                    continue  # transient I2C error — skip this sample
+
+                # Knob rotation counts as an interaction.
+                if getattr(s, "delta", 0):
+                    return uid
+
+                # Button press: rising edge on .pressed (was up, now down).
+                pressed = bool(s.pressed)
+                if pressed and not last_pressed.get(uid, False):
+                    return uid
+                last_pressed[uid] = pressed
+
+            time.sleep(0.04)
+
+        return None
+
+    def append_role(self, role_id, uid_hex, filename="noknok_roles.json"):
+        """
+        Add or update a single role->UID entry in noknok_roles.json and write it
+        back. Compatible with load_roles() ({role_name: uid_hex} format).
+
+        Reads the existing file if present, sets data[role_id] = normalised uid
+        (lowercase, '-' and spaces stripped), and writes the whole dict back.
+        Creates the file if absent. All file IO is wrapped so a read-only
+        filesystem or malformed file can't crash the caller. Returns True on a
+        successful write, False otherwise.
+        """
+        uid = str(uid_hex).lower().replace("-", "").replace(" ", "")
+
+        data = {}
+        try:
+            with open(filename, "r") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+        except (OSError, ValueError):
+            data = {}   # file absent or malformed — start fresh
+
+        data[role_id] = uid
+
+        try:
+            with open(filename, "w") as f:
+                json.dump(data, f)
+            return True
+        except OSError:
+            return False   # read-only filesystem — silently fail
 
     # ── Factory reset ─────────────────────────────────────────────────────────
     # Added v1.1 (Sam): hold the knob button for 5 s to wipe all credentials /
@@ -986,4 +1124,5 @@ class NoknokLEDs:
     def _send(self, data):
         # Raw bulk OUT to the CDC data endpoint. No CDC line-coding required.
         self._dev.write(self._EP_OUT, bytes(data), timeout=1000)
+
 
