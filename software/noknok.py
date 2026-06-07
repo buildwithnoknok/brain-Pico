@@ -1,4 +1,4 @@
-# noknok.py  v1.4
+# noknok.py  v1.5
 # CircuitPython library for the noknok modular ecosystem
 # Raspberry Pi Pico — I2C master ("Conductor")
 #
@@ -17,6 +17,10 @@
 #             Conductor.append_role() — write a single role->UID entry into
 #             noknok_roles.json (compatible with load_roles()). Both are additive;
 #             no existing methods changed.
+# v1.5 (Sue): detect_interaction() now guides the customer with light + sound —
+#             LED buttons go amber (waiting) / green (assigned), a buzzer "ready"
+#             beep when a choice is requested, and a green flash + confirm beep on
+#             the module they pick. Best-effort; never breaks detection.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -420,6 +424,44 @@ class Conductor:
             return None
         return getattr(self, attr, None)
 
+    # Role-assignment feedback colours (LED button): amber = waiting for a role,
+    # green = assigned. Best-effort cues so the customer is guided by light + sound.
+    _ROLE_COLOR_PENDING  = (180, 120, 0)   # amber / yellow
+    _ROLE_COLOR_ASSIGNED = (0, 180, 0)     # green
+
+    def _role_cue_ready(self, module_type, modules, excluded):
+        """Light the modules up for selection and play a 'make a choice' beep.
+        LED buttons: already-assigned (excluded) -> green, the rest -> amber.
+        All outputs best-effort (a missing LED/buzzer never breaks detection)."""
+        if module_type == "led_button":
+            for m in modules:
+                uid  = getattr(m, "_uid_hex", "") or ""
+                norm = uid.lower().replace("-", "").replace(" ", "")
+                try:
+                    if norm in excluded:
+                        m.set_color(*self._ROLE_COLOR_ASSIGNED)
+                    else:
+                        m.set_color(*self._ROLE_COLOR_PENDING)
+                except Exception:
+                    pass
+        if self.buzzer:
+            try:
+                self.buzzer[0].play(660, 150, 60)   # short "ready — choose now" beep
+            except Exception:
+                pass
+
+    def _role_cue_confirm(self, module):
+        """Confirm a just-picked module: turn it green + a confirmation beep."""
+        try:
+            module.set_color(*self._ROLE_COLOR_ASSIGNED)
+        except Exception:
+            pass   # not every module type has an LED (e.g. a knob)
+        if self.buzzer:
+            try:
+                self.buzzer[0].tune(self.buzzer[0].BEEP_OK)
+            except Exception:
+                pass
+
     def detect_interaction(self, module_type, timeout=20.0, exclude=None):
         """
         Watch all modules of `module_type` and return the UID (hex string) of the
@@ -470,6 +512,9 @@ class Conductor:
         if not candidates:
             return None
 
+        # ── Guide the customer: light up the candidates + a "ready" beep ──────
+        self._role_cue_ready(module_type, modules, excluded)
+
         # ── Baseline: one read each to clear knob delta and capture pressed ──
         last_pressed = {}
         for uid, m in candidates:
@@ -486,11 +531,13 @@ class Conductor:
 
                 # Knob rotation counts as an interaction.
                 if getattr(s, "delta", 0):
+                    self._role_cue_confirm(m)
                     return uid
 
                 # Button press: rising edge on .pressed (was up, now down).
                 pressed = bool(s.pressed)
                 if pressed and not last_pressed.get(uid, False):
+                    self._role_cue_confirm(m)
                     return uid
                 last_pressed[uid] = pressed
 
