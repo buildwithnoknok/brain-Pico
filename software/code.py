@@ -1,5 +1,17 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.7 (PoC — WiFi AP; script_url; URL-decode; retry provisioning join 3x)
+# Version: 0.8 (PoC — adds app-driven role assignment over the setup AP)
+#
+# v0.8 changes (Sam): app-driven role assignment ("PoC v1 Step 3"). Two new
+#   routes on the AP HTTP server let the noknok app assign roles to physical
+#   modules while the phone is still on the noknok-setup AP (before /connect):
+#     POST /roles/detect  — ask the customer to interact with a module type and
+#                           return the UID of the one they touched (or timeout).
+#     POST /roles/save    — persist a role_id -> UID mapping to noknok_roles.json.
+#   A Conductor (from noknok.py) is created + enumerated lazily on the first
+#   /roles/detect call and cached, so the ~3 s enumeration happens only once.
+#   The handlers are transport-agnostic (no AP-specific logic) so they could be
+#   served on home WiFi later unchanged. /connect and the provisioning flow are
+#   unchanged — the app calls the role endpoints BEFORE /connect.
 #
 # v0.5 changes (Sam):
 #   - log() now timestamps every line with monotonic uptime [  12.34], and
@@ -136,6 +148,30 @@ WIFI_TIMEOUT_S        = 15
 
 # Shared state: the /connect handler fills this, the main loop acts on it.
 pending = {"ssid": None, "password": None, "script_url": None, "ready": False}
+
+# ── Role assignment: lazily-created, cached Conductor ───────────────────────────
+# The role endpoints need a Conductor to talk to the I2C modules. Enumeration
+# takes a few seconds, so we create + enumerate it once on first use and reuse it.
+_conductor = None
+
+def get_conductor():
+    """Return a cached, enumerated Conductor, creating it on first use.
+    The Conductor (noknok.py) self-configures its own I2C bus on the noknok
+    standard pins, so no pins are passed here. Returns None if noknok.py is
+    missing or the bus can't be brought up — callers degrade gracefully."""
+    global _conductor
+    if _conductor is None:
+        try:
+            from noknok import Conductor
+            log("[roles] Creating Conductor + enumerating modules (first use)...")
+            c = Conductor()                 # self-configures I2C (GP8/GP9, 100 kHz)
+            found = c.enumerate()           # ~3 s — discovers all connected modules
+            log(f"[roles] Enumeration done — {found} module(s) found")
+            _conductor = c
+        except Exception as e:
+            log(f"[roles] Conductor init failed: {e}")
+            return None
+    return _conductor
 
 # ── HTML pages ─────────────────────────────────────────────────────────────────
 
@@ -325,6 +361,80 @@ def register_routes(server):
         log(f"[ap] Credentials received for '{ssid}'")
         return Response(request, HTML_SUCCESS, content_type="text/html")
 
+    # ── Role assignment endpoints (v0.8) ─────────────────────────────────────
+    # Called by the noknok app BEFORE /connect, while the phone is on the
+    # noknok-setup AP. Transport-agnostic: no AP-specific logic lives here.
+
+    @server.route("/roles/detect", POST)
+    def _roles_detect(request: Request):
+        """Ask the customer to interact with a module of a given type and return
+        the UID of the one they touched.
+        Form fields:
+          module_type : "knob", "led_button", or "buzzer"
+          exclude     : optional comma-separated uid_hex of already-assigned modules
+        Response JSON: {"uid": "<hex>", "type": "<module_type>"} on detection,
+                       or {"timeout": true} if nobody interacted in time.
+        Blocks up to ~20 s — acceptable for a single-client setup interaction."""
+        form = request.form_data
+        module_type = (_url_decode(form.get("module_type") or "").strip()
+                       if form else "")
+        exclude_raw = (_url_decode(form.get("exclude") or "").strip()
+                       if form else "")
+        exclude = [u.strip() for u in exclude_raw.split(",") if u.strip()] \
+            if exclude_raw else []
+
+        log(f"[roles] /roles/detect type='{module_type}' "
+            f"exclude={len(exclude)} module(s)")
+
+        c = get_conductor()
+        if c is None:
+            # No bus / noknok.py — degrade gracefully, never 500.
+            return Response(request, json.dumps({"timeout": True}),
+                            content_type="application/json")
+
+        try:
+            uid = c.detect_interaction(module_type, timeout=20, exclude=exclude)
+        except Exception as e:
+            log(f"[roles] detect_interaction error: {e}")
+            uid = None
+
+        if uid:
+            log(f"[roles] detected uid={uid} for type='{module_type}'")
+            body = json.dumps({"uid": uid, "type": module_type})
+        else:
+            log(f"[roles] detect timed out for type='{module_type}'")
+            body = json.dumps({"timeout": True})
+        return Response(request, body, content_type="application/json")
+
+    @server.route("/roles/save", POST)
+    def _roles_save(request: Request):
+        """Persist a role_id -> UID mapping to noknok_roles.json.
+        Form fields: role_id, uid.
+        Response JSON: {"ok": true} (or {"ok": false} if the write failed)."""
+        form = request.form_data
+        role_id = (_url_decode(form.get("role_id") or "").strip()
+                   if form else "")
+        uid = (_url_decode(form.get("uid") or "").strip()
+               if form else "")
+
+        log(f"[roles] /roles/save role_id='{role_id}' uid={uid}")
+
+        if not role_id or not uid:
+            return Response(request, json.dumps({"ok": False}),
+                            content_type="application/json")
+
+        c = get_conductor()
+        ok = False
+        if c is not None:
+            try:
+                ok = bool(c.append_role(role_id, uid))
+            except Exception as e:
+                log(f"[roles] append_role error: {e}")
+                ok = False
+
+        return Response(request, json.dumps({"ok": ok}),
+                        content_type="application/json")
+
     # Captive-portal probe paths: serving the setup page (instead of the
     # expected 204/empty) makes iOS/Android/Windows show a "Sign in to
     # network" prompt that opens our page automatically.
@@ -477,4 +587,5 @@ def main():
         run_ap_provisioning()
 
 main()
+
 
