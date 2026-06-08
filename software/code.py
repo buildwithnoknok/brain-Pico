@@ -1,5 +1,5 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.8 (PoC — adds app-driven role assignment over the setup AP)
+# Version: 0.9 (PoC — role assignment; adds /roles/assign = detect+save in one call)
 #
 # v0.8 changes (Sam): app-driven role assignment ("PoC v1 Step 3"). Two new
 #   routes on the AP HTTP server let the noknok app assign roles to physical
@@ -433,6 +433,59 @@ def register_routes(server):
                 ok = False
 
         return Response(request, json.dumps({"ok": ok}),
+                        content_type="application/json")
+
+    @server.route("/roles/assign", POST)
+    def _roles_assign(request: Request):
+        """Detect which module the customer touches AND save the role in ONE
+        round-trip. Avoids a fragile second request (the old /roles/save) right
+        after the long blocking detect, which could fail against a single-client
+        server that just came out of a multi-second block.
+        Form fields:
+          role_id     : role to assign (e.g. "ok_button")
+          module_type : "knob", "led_button", or "buzzer"
+          exclude     : optional comma-separated uid_hex of already-assigned modules
+        Response JSON: {"uid": "<hex>", "saved": true} on success,
+                       {"uid": "<hex>", "saved": false} if detected but write failed,
+                       or {"timeout": true} if nobody interacted in time."""
+        form = request.form_data
+        role_id = (_url_decode(form.get("role_id") or "").strip()
+                   if form else "")
+        module_type = (_url_decode(form.get("module_type") or "").strip()
+                       if form else "")
+        exclude_raw = (_url_decode(form.get("exclude") or "").strip()
+                       if form else "")
+        exclude = [u.strip() for u in exclude_raw.split(",") if u.strip()] \
+            if exclude_raw else []
+
+        log(f"[roles] /roles/assign role_id='{role_id}' type='{module_type}' "
+            f"exclude={len(exclude)} module(s)")
+
+        c = get_conductor()
+        if c is None:
+            return Response(request, json.dumps({"timeout": True}),
+                            content_type="application/json")
+
+        try:
+            uid = c.detect_interaction(module_type, timeout=20, exclude=exclude)
+        except Exception as e:
+            log(f"[roles] detect_interaction error: {e}")
+            uid = None
+
+        if not uid:
+            log(f"[roles] assign timed out for type='{module_type}'")
+            return Response(request, json.dumps({"timeout": True}),
+                            content_type="application/json")
+
+        saved = False
+        if role_id:
+            try:
+                saved = bool(c.append_role(role_id, uid))
+            except Exception as e:
+                log(f"[roles] append_role error: {e}")
+                saved = False
+        log(f"[roles] assigned role_id='{role_id}' uid={uid} saved={saved}")
+        return Response(request, json.dumps({"uid": uid, "saved": saved}),
                         content_type="application/json")
 
     # Captive-portal probe paths: serving the setup page (instead of the
