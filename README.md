@@ -33,7 +33,7 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
 
 ## Current versions & features (PoC v1)
 
-**`code.py` v0.7** — provisioning + launcher:
+**`code.py` v0.9** — provisioning + launcher:
 - The app POSTs `ssid`, `password` and **`script_url`** to `192.168.4.1/connect`. The Pico
   downloads whatever product `script_url` points to, so the brain is **product-agnostic** —
   a new product is just a new manifest + script, no firmware change. (`SCRIPT_URL` remains a
@@ -43,8 +43,14 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
   radio often fails the first join after AP mode with "Unknown failure 205", then succeeds.
 - **Timestamped logging** to `log.txt` (uptime, plus UTC wall-clock once `adafruit_ntp` syncs).
 - Crash-safe: a failing `product.py` is caught and the board enters a safe idle, not a reboot loop.
+- **Role assignment over the AP** (PoC v1 Step 3): `POST /roles/assign` (form `role_id`,
+  `module_type`, `exclude`) detects which module the customer touches **and** saves the
+  `role → UID` in one request → `{"uid","saved":true}` or `{"timeout":true}`. (Older
+  `/roles/detect` + `/roles/save` endpoints are kept too.) A `Conductor` is created and
+  enumerated lazily on first use and cached. Handlers are transport-agnostic (reusable for a
+  future home-WiFi settings page).
 
-**`noknok.py` v1.3** — Conductor library:
+**`noknok.py` v1.5** — Conductor library:
 - Dynamic I2C addressing: modules boot at staging address `0x7F` and are assigned runtime
   addresses; `noknok_state.json` caches the UID→address map so reboots re-find modules without
   re-enumerating (and self-heals if hardware changed).
@@ -53,6 +59,11 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
   `noknok_roles.json` and reboot into the `noknok-setup` AP, so the app can install a different
   product. `noknok_state.json` is deliberately **kept** (a soft reset doesn't power-cycle the
   modules, so they keep their addresses).
+- **`Conductor.detect_interaction(module_type, timeout, exclude)`** — return the UID of the
+  module the customer interacts with (knob turn/press, LED-button press). Guides them with
+  light + sound: candidate LED buttons go amber, the picked one green, with ready/confirm
+  buzzer beeps (best-effort). **`Conductor.append_role(role_id, uid)`** writes one entry to
+  `noknok_roles.json`. **`load_roles()`** maps roles back to modules for the product to use.
 
 ### Required CircuitPython libs (/lib)
 - `adafruit_httpserver/`
