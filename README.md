@@ -14,6 +14,8 @@ over I2C.
 | `boot.py` | Runs first on boot. Remounts the filesystem writable so the firmware can save files. |
 | `code.py` | Provisioning brain + launcher. WiFi-AP setup on first boot, then connect + download + run the app-selected product script crash-safely on every boot. |
 | `noknok.py` | Conductor library — module discovery/enumeration + drivers (Buzzer, Knob, LED Button, ...). Includes the factory-reset watchdog. |
+| `module_flasher.py` | I2C OTA flasher — streams a module application `.bin` to the CH32V003 bootloader (`ModuleFlasher`). Shared by the bench tool and (later) the provisioning flow. |
+| `bench_flash.py` | Bench bring-up tool — flashes application firmware onto a blank module (bootloader only) one at a time from the REPL. See [Bench-flashing modules](#bench-flashing-modules-bring-up). |
 | `trio_demo.py` | Light & Sound Controller demo — uses all three I2C modules. |
 | `noknok_setup_roles.py` | One-time role-assignment wizard. |
 | `noknok_roles_test.py` | Roles smoke test. |
@@ -79,3 +81,43 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
 3. Join `noknok-setup`, open the setup page (or use the noknok app), enter WiFi credentials.
 4. Review `log.txt` on the Pico for the boot/provisioning log (or watch the live serial console
    in Thonny — the host drive view of `log.txt` can be stale while the device owns the filesystem).
+
+## Bench-flashing modules (bring-up)
+
+`bench_flash.py` puts **application firmware** onto a CH32V003 module that has only the
+bootloader on it (a fresh board flashed via SWD with `module-I2C-bootloader`, no app yet). It's
+a one-time factory/bench step — customers receive modules already flashed.
+
+**Why it's manual / one module at a time:** a blank module has *no type identity*. The bootloader
+is the same code on every buzzer, knob and LED button, so a module waiting in flash mode at `0x7E`
+can't tell the Pico what it is — the type only exists once an app is flashed (and reported during
+enumeration). And every blank module answers at `0x7E`, so two on the bus at once = address
+collision. Hence: connect one module, tell it the type, flash, swap in the next.
+
+### Prerequisites — files on the CIRCUITPY root
+| File | From |
+|------|------|
+| `noknok.py` | this folder |
+| `module_flasher.py` | this folder |
+| `bench_flash.py` | this folder |
+| `buzzer_firmware.bin` | `module-I2C-buzzer/firmware/bin/` |
+| `knob_firmware.bin` | `module-I2C-knob/firmware/bin/` |
+| `keyboard_firmware.bin` | `module-I2C-ledbutton/firmware/bin/` (this is the LED button — note the legacy name) |
+
+Copy the `.py` files **without a BOM** (use Thonny or plain file copy, not
+`Set-Content -Encoding utf8`). The `.bin` files are the **offset-linked application images**
+(`make build` output, linked at `0x1000`) — *not* full-flash images. They are open-source and
+also published on each module repo's GitHub Releases.
+
+### Steps
+1. Connect **one** module to the Pico's I2C bus (PicoHub). It can be blank or already running an app.
+2. In Thonny's REPL: `import bench_flash`
+3. Pick the module type from the menu (`1` buzzer / `2` knob / `3` led_button).
+4. It flashes over I2C (with a live `%` progress print), boots the app, then re-enumerates to
+   **confirm** the module came up as the expected type and prints its UID.
+5. Swap in the next module and press Enter; type `q` at the menu to stop.
+
+The flash is CRC-verified by the bootloader and the validity marker is only written on a full,
+correct flash — so a failed or interrupted flash never bricks the module; it simply stays in the
+bootloader at `0x7E`, ready to retry. SWD (the 5-pin header) remains the unbrickable fallback.
+Full bootloader design is in Confluence: *Software Development → I²C Module Bootloader — Design & Process*.
