@@ -1,5 +1,17 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.9 (PoC — role assignment; adds /roles/assign = detect+save in one call)
+# Version: 0.10 (PoC v2 — module firmware OTA: /firmware/check + headless flash)
+#
+# v0.10 changes (Sue): module-firmware version check + OTA (DEV-1 / PoC v2 Step 5).
+#   - POST /firmware/check (AP time): the app sends the manifest's module_firmware{};
+#     the Pico enumerates, reads each module's installed version (GET_VERSION 0xB1
+#     via noknok.py) and returns {update_needed, modules[]} so the app can show a
+#     "firmware update available" notice before /connect. No flashing here.
+#   - /connect now also accepts module_firmware (JSON) and persists it in wifi.json.
+#   - On the connected boot, BEFORE running product.py, check_and_flash_modules()
+#     downloads any outdated module .bin from its public raw URL and flashes it over
+#     I2C (module_flasher.ModuleFlasher), then re-verifies the version. Crash-safe:
+#     a failed flash leaves the module safe in its bootloader and never blocks boot.
+#   - Outcomes logged to log.txt (verbose) + noknok_events.txt (durable audit).
 #
 # v0.8 changes (Sam): app-driven role assignment ("PoC v1 Step 3"). Two new
 #   routes on the AP HTTP server let the noknok app assign roles to physical
@@ -56,7 +68,8 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-LOG_FILE = "log.txt"
+LOG_FILE    = "log.txt"
+EVENTS_FILE = "noknok_events.txt"   # durable, categorized audit log (FW/CFG/ROLE/RESET)
 
 # Wall-clock availability. The Pico 2W has no battery-backed RTC, so on every
 # boot we only know uptime (time.monotonic). After a successful WiFi connect we
@@ -91,6 +104,20 @@ def log(msg):
     sys.stdout.write(line + "\n")          # console output
     try:
         with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+def event(msg):
+    """Append a categorized line to the durable event/audit log.
+    Separate from the verbose boot log.txt — this is the permanent record of
+    significant events (firmware updates [FW], config changes [CFG], role
+    assignments [ROLE], factory resets [RESET], ...), so a single module's
+    history is easy to find. Best-effort; never raises."""
+    line = _timestamp() + str(msg)
+    sys.stdout.write(line + "\n")
+    try:
+        with open(EVENTS_FILE, "a") as f:
             f.write(line + "\n")
     except Exception:
         pass
@@ -147,7 +174,8 @@ PRODUCT_SCRIPT_FILE   = "product.py"
 WIFI_TIMEOUT_S        = 15
 
 # Shared state: the /connect handler fills this, the main loop acts on it.
-pending = {"ssid": None, "password": None, "script_url": None, "ready": False}
+pending = {"ssid": None, "password": None, "script_url": None,
+           "module_firmware": None, "ready": False}
 
 # ── Role assignment: lazily-created, cached Conductor ───────────────────────────
 # The role endpoints need a Conductor to talk to the I2C modules. Enumeration
@@ -219,10 +247,11 @@ def load_wifi_credentials():
     except (OSError, ValueError):
         return None
 
-def save_wifi_credentials(ssid, password, script_url=None):
+def save_wifi_credentials(ssid, password, script_url=None, module_firmware=None):
     with open(WIFI_CREDENTIALS_FILE, "w") as f:
         json.dump(
-            {"ssid": ssid, "password": password, "script_url": script_url}, f
+            {"ssid": ssid, "password": password, "script_url": script_url,
+             "module_firmware": module_firmware}, f
         )
     log("[storage] Saved wifi.json")
 
@@ -347,19 +376,70 @@ def register_routes(server):
         ssid = _url_decode(form.get("ssid") or "").strip() if form else ""
         pw   = _url_decode(form.get("password") or "") if form else ""
         url  = _url_decode(form.get("script_url") or "").strip() if form else ""
+        mf_raw = (_url_decode(form.get("module_firmware") or "").strip()
+                  if form else "")
 
         if not ssid:
             # No network name entered — show the form again
             return Response(request, HTML_SETUP, content_type="text/html")
 
+        # Optional: the manifest's module_firmware{} block (JSON string). Persisted
+        # so the post-WiFi boot can compare installed vs required and flash any
+        # outdated module headless. Absent (older app) -> OTA simply skipped.
+        module_firmware = None
+        if mf_raw:
+            try:
+                module_firmware = json.loads(mf_raw)
+            except Exception as e:
+                log(f"[ap] module_firmware parse failed ({e}) — ignoring")
+
         # Store credentials; the main loop will act on them after the
         # success page has been delivered to the browser.
-        pending["ssid"]       = ssid
-        pending["password"]   = pw
-        pending["script_url"] = url
-        pending["ready"]      = True
-        log(f"[ap] Credentials received for '{ssid}'")
+        pending["ssid"]            = ssid
+        pending["password"]        = pw
+        pending["script_url"]      = url
+        pending["module_firmware"] = module_firmware
+        pending["ready"]           = True
+        log(f"[ap] Credentials received for '{ssid}' "
+            f"(module_firmware: {'yes' if module_firmware else 'none'})")
         return Response(request, HTML_SUCCESS, content_type="text/html")
+
+    # ── Firmware version check (v0.10) ───────────────────────────────────────
+    # Called by the app BEFORE /connect (still on the noknok-setup AP) so it can
+    # tell the user "firmware update available" up front. Reads installed versions
+    # over I2C (GET_VERSION) and compares against the manifest's module_firmware{}.
+    # No flashing here — the actual OTA happens headless once the Pico has WiFi.
+    @server.route("/firmware/check", POST)
+    def _firmware_check(request: Request):
+        form = request.form_data
+        mf_raw = (_url_decode(form.get("module_firmware") or "").strip()
+                  if form else "")
+        try:
+            module_firmware = json.loads(mf_raw) if mf_raw else {}
+        except Exception:
+            module_firmware = {}
+
+        c = get_conductor()
+        if c is None:
+            return Response(request,
+                            json.dumps({"update_needed": False, "modules": []}),
+                            content_type="application/json")
+        try:
+            report = c.firmware_report(module_firmware)
+        except Exception as e:
+            log(f"[fw] /firmware/check error: {e}")
+            report = []
+
+        update_needed = any(r["needs_update"] for r in report)
+        slim = [{"type": r["type"], "installed": r["installed"],
+                 "required": r["required"], "needs_update": r["needs_update"]}
+                for r in report]
+        log(f"[fw] /firmware/check — update_needed={update_needed} "
+            f"({len(slim)} module(s))")
+        return Response(request,
+                        json.dumps({"update_needed": update_needed,
+                                    "modules": slim}),
+                        content_type="application/json")
 
     # ── Role assignment endpoints (v0.8) ─────────────────────────────────────
     # Called by the noknok app BEFORE /connect, while the phone is on the
@@ -543,6 +623,7 @@ def run_ap_provisioning():
         ssid = pending["ssid"]
         pw   = pending["password"]
         su   = pending["script_url"]
+        mf   = pending["module_firmware"]
 
         wifi.radio.stop_ap()
         log("[ap] Hotspot stopped — attempting WiFi join")
@@ -566,7 +647,7 @@ def run_ap_provisioning():
             # AP->STA transition (without a chip reset) leaves DNS broken.
             # A hardware reset brings the radio up clean in STA-only mode, and
             # main() will then connect + download on the fresh boot.
-            save_wifi_credentials(ssid, pw, su)
+            save_wifi_credentials(ssid, pw, su, mf)
             log("[boot] Credentials saved — hardware reset into WiFi mode")
             time.sleep(2)  # let the success page flush to the browser
             microcontroller.reset()
@@ -583,6 +664,144 @@ def run_ap_provisioning():
             pending["ready"] = False
             time.sleep(1)
             # loop back to top -> start_ap again
+
+# ── Module firmware OTA (v0.10) ─────────────────────────────────────────────────
+
+def _release_conductor():
+    """Free the cached Conductor's I2C bus so product.py can create its own.
+    busio.I2C can only own the pins once per process — without this, the product
+    script's Conductor() would collide with the one code.py created here."""
+    global _conductor
+    if _conductor is not None:
+        try:
+            _conductor.i2c.deinit()
+        except Exception:
+            pass
+        _conductor = None
+
+def _flash_one_module(session, flasher, r):
+    """Download one module's .bin from its manifest URL and flash it over I2C.
+    Returns True if the flash completed (verification happens in the caller),
+    False on download/flash failure. Never raises."""
+    from module_flasher import FlashError
+    mtype, addr, url = r["type"], r["address"], r["url"]
+    frm, to = r["installed"], r["required"]
+
+    if not url:
+        log(f"[fw] {mtype}: no URL in manifest — skipping")
+        event(f"[FW]    {mtype:<11} uid={r['uid']}  {frm} -> {to}  SKIP (no url)")
+        return False
+
+    # 1) download the offset-linked application image (BINARY — not .text)
+    try:
+        log(f"[fw] {mtype}: downloading {to} from {url}")
+        resp = session.get(url, timeout=30)
+        if resp.status_code != 200:
+            log(f"[fw] {mtype}: HTTP {resp.status_code} — skipping")
+            resp.close()
+            event(f"[FW]    {mtype:<11} uid={r['uid']}  {frm} -> {to}  "
+                  f"FAIL (HTTP {resp.status_code})")
+            return False
+        image = resp.content
+        resp.close()
+        log(f"[fw] {mtype}: downloaded {len(image)} bytes")
+    except Exception as e:
+        log(f"[fw] {mtype}: download error {e} — skipping")
+        event(f"[FW]    {mtype:<11} uid={r['uid']}  {frm} -> {to}  FAIL (download {e})")
+        return False
+
+    # 2) flash: 0xB0 drops the running module into its bootloader (0x7E), then
+    #    ERASE -> WRITE_CHUNK* -> VERIFY (CRC) -> BOOT. CRC-verified by the
+    #    bootloader; a failure leaves the module safe at 0x7E (never bricked).
+    def _progress(done, total):
+        if total and (done == total or done % 512 == 0):
+            log(f"[fw] {mtype}: flashing {done}/{total} ({100 * done // total}%)")
+    try:
+        flasher.flash(image, runtime_addr=addr, progress=_progress)
+    except FlashError as e:
+        log(f"[fw] {mtype}: FLASH FAILED {e} — module safe in bootloader 0x7E")
+        event(f"[FW]    {mtype:<11} uid={r['uid']}  {frm} -> {to}  "
+              f"FAIL ({e}; safe in bootloader)")
+        return False
+    except Exception as e:
+        log(f"[fw] {mtype}: unexpected flash error {e}")
+        event(f"[FW]    {mtype:<11} uid={r['uid']}  {frm} -> {to}  FAIL ({e})")
+        return False
+
+    log(f"[fw] {mtype}: flash complete, booted new app")
+    return True
+
+def check_and_flash_modules(module_firmware):
+    """Compare installed module firmware against the manifest's module_firmware{}
+    and flash any outdated module over I2C, before product.py runs. Headless
+    (Pico already on WiFi). Best-effort + crash-safe: any failure is logged and
+    swallowed; a failed flash leaves the module safe in its bootloader at 0x7E."""
+    if not module_firmware:
+        return   # older app / no manifest fw block -> nothing to do
+
+    try:
+        c = get_conductor()              # enumerates + reads versions (0xB1)
+        if c is None:
+            log("[fw] no Conductor available — skipping firmware check")
+            return
+        report = c.firmware_report(module_firmware)
+    except Exception as e:
+        log(f"[fw] firmware check failed: {e}")
+        return
+
+    for r in report:
+        log(f"[fw] {r['type']} 0x{r['address']:02X} "
+            f"installed={r['installed']} required={r['required']} — {r['reason']}")
+    todo = [r for r in report if r["needs_update"]]
+    if not todo:
+        log("[fw] all modules up to date")
+        return
+    log(f"[fw] {len(todo)} module(s) need an update — starting OTA")
+
+    # HTTPS session (correct DNS/SSL for the radio) to download the bins.
+    try:
+        from module_flasher import ModuleFlasher
+        pool    = adafruit_connection_manager.get_radio_socketpool(wifi.radio)
+        context = adafruit_connection_manager.get_radio_ssl_context(wifi.radio)
+        session = adafruit_requests.Session(pool, context)
+        flasher = ModuleFlasher(c.i2c)
+    except Exception as e:
+        log(f"[fw] OTA setup failed: {e}")
+        return
+
+    flashed_any = False
+    for r in todo:
+        if _flash_one_module(session, flasher, r):
+            flashed_any = True
+
+    if not flashed_any:
+        return
+
+    # Flashed modules rebooted into their new app at the staging address, so the
+    # cached enumeration is stale. Drop noknok_state.json and re-enumerate to read
+    # the new versions, then log a definitive OK/FAIL per module (keyed by UID).
+    try:
+        os.remove("noknok_state.json")
+    except OSError:
+        pass
+    try:
+        c.enumerate()
+        verify = {v["uid"]: v for v in c.firmware_report(module_firmware)}
+    except Exception as e:
+        log(f"[fw] post-flash re-enumerate failed: {e}")
+        verify = {}
+
+    for r in todo:
+        v   = verify.get(r["uid"])
+        now = v["installed"] if v else None
+        if now == r["required"]:
+            log(f"[fw] {r['type']}: verified {now}")
+            event(f"[FW]    {r['type']:<11} uid={r['uid']}  "
+                  f"{r['installed']} -> {r['required']}  OK (verified {now})")
+        else:
+            log(f"[fw] {r['type']}: post-flash version is {now}, expected {r['required']}")
+            event(f"[FW]    {r['type']:<11} uid={r['uid']}  "
+                  f"{r['installed']} -> {r['required']}  FAIL (reports {now})")
 
 # ── Main flow ──────────────────────────────────────────────────────────────────
 
@@ -620,6 +839,15 @@ def main():
                 log(f"[ntp] setup error (ignored): {e}")
 
             if product_script_exists():
+                # PoC v2 OTA: bring connected modules up to the manifest's
+                # required firmware BEFORE handing off to the product. Best-effort;
+                # frees the I2C bus afterwards so product.py can create its own.
+                try:
+                    check_and_flash_modules(creds.get("module_firmware"))
+                except Exception as e:
+                    log(f"[fw] check_and_flash_modules error (ignored): {e}")
+                _release_conductor()
+
                 log(f"[boot] product.py present — running {PRODUCT_SCRIPT_FILE}")
                 exec(open(PRODUCT_SCRIPT_FILE).read(), {"__name__": "__main__"})
             else:
