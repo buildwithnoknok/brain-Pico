@@ -75,6 +75,11 @@ class Conductor:
     TYPE_KNOB      = 0x02
     TYPE_LEDBUTTON = 0x03
 
+    # Standard system commands — reserved ecosystem range 0xB0-0xBF, honoured by
+    # every noknok module (see DEV-1 / the bootloader doc). 0xB0 = ENTER_BOOTLOADER.
+    CMD_GET_VERSION  = 0xB1   # write 0xB1, read 4 bytes [PROTO, FW_MAJOR, MINOR, PATCH]
+    PROTOCOL_VERSION = 0x01   # the standard-command protocol version this lib understands
+
     def __init__(self, sda=board.GP8, scl=board.GP9, frequency=100_000):
         self.i2c       = busio.I2C(scl, sda, frequency=frequency)
         self.buzzer    = []    # NoknokBuzzer instances, indexed by discovery order
@@ -107,6 +112,120 @@ class Conductor:
             return False
         finally:
             self.i2c.unlock()
+
+    # ── Standard system commands (GET_VERSION) ─────────────────────────────────
+
+    def read_version(self, address):
+        """
+        Read a module's installed firmware version via the standard GET_VERSION
+        command (0xB1) at its RUNTIME address. The module replies with 4 bytes:
+        [PROTOCOL_VERSION, FW_MAJOR, FW_MINOR, FW_PATCH].
+
+        Returns (protocol_version:int, "MAJOR.MINOR.PATCH":str) on a valid reply,
+        or (None, None) if the module does not support the standard command.
+
+        Old / third-party firmware that doesn't implement 0xB1 may return nothing
+        OR garbage, so we only trust a reply whose first byte equals
+        PROTOCOL_VERSION (0x01). Anything else => "unknown firmware".
+        """
+        if not self._write(address, [self.CMD_GET_VERSION]):
+            return (None, None)
+        time.sleep(0.003)                       # let the module latch the command
+        buf = self._read(address, 4)
+        if buf is None or buf[0] != self.PROTOCOL_VERSION:
+            return (None, None)
+        return (buf[0], "%d.%d.%d" % (buf[1], buf[2], buf[3]))
+
+    def _apply_version(self, module, address):
+        """Populate module.protocol_version / module.firmware_version (both None if
+        the module doesn't speak GET_VERSION). Called for every enumerated module."""
+        if module is None:
+            return
+        module.protocol_version, module.firmware_version = self.read_version(address)
+
+    # ── Firmware version checking (against a product manifest) ─────────────────
+
+    # module list attribute -> manifest module_firmware{} key
+    _FW_GROUPS = (("buzzer", "buzzer"), ("knob", "knob"), ("ledbutton", "led_button"))
+
+    @staticmethod
+    def _parse_semver(s):
+        """'3.3.0' -> (3, 3, 0). Returns None if missing/unparseable."""
+        if not s:
+            return None
+        try:
+            parts = [int(x) for x in str(s).split(".")]
+        except ValueError:
+            return None
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts[:3])
+
+    def _update_decision(self, installed, proto, required):
+        """
+        Apply the DEV-3 safety policy and return (needs_update:bool, reason:str).
+        Auto-update ONLY official, outdated firmware within the SAME major version;
+        never silently overwrite firmware we can't positively identify (unknown
+        protocol, unparseable version, or a major-version gap -> confirm first).
+        """
+        req = self._parse_semver(required)
+        if req is None:
+            return (False, "no required version in manifest")
+        if proto != self.PROTOCOL_VERSION or installed is None:
+            return (False, "unknown firmware (no GET_VERSION) - confirm before flashing")
+        ins = self._parse_semver(installed)
+        if ins is None:
+            return (False, "unparseable installed version - confirm before flashing")
+        if ins[0] != req[0]:
+            return (False, "major-version gap %s vs %s - confirm before flashing"
+                           % (installed, required))
+        if ins < req:
+            return (True, "update available %s -> %s" % (installed, required))
+        return (False, "up to date (%s)" % installed)
+
+    def firmware_report(self, manifest_fw):
+        """
+        Compare every enumerated module's installed firmware against a manifest's
+        module_firmware{} block, e.g.
+            {"knob": {"version": "2.1.0", "url": "..."}, "buzzer": {...}}
+        Returns one dict per module:
+            {type, uid, address, installed, protocol, required, url,
+             needs_update, reason}
+        Single source of truth for PoC v1 (log) and PoC v2 (flash outdated ones).
+        """
+        manifest_fw = manifest_fw or {}
+        report = []
+        for list_attr, mf_key in self._FW_GROUPS:
+            spec     = manifest_fw.get(mf_key, {})
+            required = spec.get("version")
+            url      = spec.get("url")
+            for m in getattr(self, list_attr):
+                installed     = getattr(m, "firmware_version", None)
+                proto         = getattr(m, "protocol_version", None)
+                needs, reason = self._update_decision(installed, proto, required)
+                report.append({
+                    "type":         mf_key,
+                    "uid":          getattr(m, "_uid_hex", None),
+                    "address":      m.address,
+                    "installed":    installed,
+                    "protocol":     proto,
+                    "required":     required,
+                    "url":          url,
+                    "needs_update": needs,
+                    "reason":       reason,
+                })
+        return report
+
+    def log_firmware_report(self, manifest_fw, logfn=print):
+        """PoC v1 convenience: run firmware_report() and log one line per module.
+        Returns the report list so the caller can also act on needs_update."""
+        report = self.firmware_report(manifest_fw)
+        for r in report:
+            flag = "UPDATE AVAILABLE" if r["needs_update"] else "ok"
+            logfn("  fw %-11s 0x%02X  installed=%s required=%s  [%s] %s"
+                  % (r["type"], r["address"], r["installed"], r["required"],
+                     flag, r["reason"]))
+        return report
 
     # ── Enumeration ───────────────────────────────────────────────────────────
 
@@ -187,6 +306,7 @@ class Conductor:
 
             if module is not None:
                 module._uid_hex = uid_hex
+                self._apply_version(module, addr)
 
             self._registry[uid_hex] = module
             new_found += 1
@@ -264,6 +384,7 @@ class Conductor:
                 module = None
 
             if module is not None:
+                self._apply_version(module, addr)
                 self._registry[uid_hex] = module
                 restored += 1
 
