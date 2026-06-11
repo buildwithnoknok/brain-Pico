@@ -777,13 +777,15 @@ def check_and_flash_modules(module_firmware):
     if not flashed_any:
         return
 
-    # Flashed modules rebooted into their new app at the staging address, so the
-    # cached enumeration is stale. Drop noknok_state.json and re-enumerate to read
-    # the new versions, then log a definitive OK/FAIL per module (keyed by UID).
-    try:
-        os.remove("noknok_state.json")
-    except OSError:
-        pass
+    # A flashed module rebooted into its new app and is back at the staging
+    # address (0x7F); the modules we did NOT flash keep their runtime addresses.
+    # Re-enumerate WITHOUT wiping noknok_state.json: _restore_state pings the saved
+    # addresses — the re-staged module no longer answers its old one, so it's
+    # skipped and then rediscovered at 0x7F and reassigned, while the untouched
+    # modules restore normally. Wiping the state here would STRAND the non-flashed
+    # modules (they don't re-advertise at 0x7F once assigned), so the product would
+    # only see the flashed one. We re-enumerate just to read the new version(s) and
+    # log a definitive OK/FAIL per module (keyed by UID).
     try:
         c.enumerate()
         verify = {v["uid"]: v for v in c.firmware_report(module_firmware)}
