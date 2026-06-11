@@ -35,7 +35,7 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
 
 ## Current versions & features (PoC v1)
 
-**`code.py` v0.9** — provisioning + launcher:
+**`code.py` v0.10** — provisioning + launcher + module firmware OTA:
 - The app POSTs `ssid`, `password` and **`script_url`** to `192.168.4.1/connect`. The Pico
   downloads whatever product `script_url` points to, so the brain is **product-agnostic** —
   a new product is just a new manifest + script, no firmware change. (`SCRIPT_URL` remains a
@@ -51,6 +51,15 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
   `/roles/detect` + `/roles/save` endpoints are kept too.) A `Conductor` is created and
   enumerated lazily on first use and cached. Handlers are transport-agnostic (reusable for a
   future home-WiFi settings page).
+- **Module firmware OTA (PoC v2 Step 5):** `POST /firmware/check` (AP time) compares each
+  module's installed version (read over I2C via `noknok.py` `read_version()` / GET_VERSION
+  `0xB1`) against the manifest's `module_firmware{}` and tells the app whether an update is
+  available. On the connected boot, before `product.py` runs, `check_and_flash_modules()`
+  downloads any outdated module `.bin` from its public raw URL and flashes it over I2C via
+  `module_flasher.py`, then re-verifies the version. Crash-safe — a failed flash leaves the
+  module safe in its bootloader (`0x7E`). Outcomes are logged to `log.txt` (verbose) and
+  `noknok_events.txt` (durable `[FW]` audit trail). The post-flash re-enumerate deliberately
+  does **not** wipe `noknok_state.json`, so modules that weren't flashed keep their addresses.
 
 **`noknok.py` v1.5** — Conductor library:
 - Dynamic I2C addressing: modules boot at staging address `0x7F` and are assigned runtime
