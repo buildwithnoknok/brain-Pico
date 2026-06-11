@@ -121,3 +121,15 @@ The flash is CRC-verified by the bootloader and the validity marker is only writ
 correct flash — so a failed or interrupted flash never bricks the module; it simply stays in the
 bootloader at `0x7E`, ready to retry. SWD (the 5-pin header) remains the unbrickable fallback.
 Full bootloader design is in Confluence: *Software Development → I²C Module Bootloader — Design & Process*.
+
+---
+
+## License
+
+- Code: MIT — see [LICENSE](LICENSE).
+
+---
+
+## Safety & Liability
+
+noknok hardware is an electronic device and a DIY/maker kit. You assemble, modify, flash, power, and operate it at your own risk, and it is provided as is, without warranty. See the full notice: [License, Safety & Liability](https://buildwithnoknok.github.io/safety-and-license/).
