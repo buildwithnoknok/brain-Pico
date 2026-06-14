@@ -21,6 +21,7 @@ over I2C.
 | `noknok_roles_test.py` | Roles smoke test. |
 | `knob_test.py` | Knob module standalone test. |
 | `keyboard_test.py` | LED button module standalone test. |
+| `ledbutton_color_test.py` | Test one or many LED Buttons at once: a button press cycles that button's colour; number keys 1-9 set all to a colour (0 = off). Quick "is this module alive?" check + brightness comparison. |
 
 ## Provisioning (PoC Step 1 — done)
 
