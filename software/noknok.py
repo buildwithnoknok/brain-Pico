@@ -1287,6 +1287,18 @@ class NoknokLEDs:
         except Exception:
             return False
 
+    def version(self):
+        """
+        Send GET_VERSION (0xB1) and return (protocol, major, minor, patch),
+        or None on error. Requires module firmware v1.5+.
+        """
+        try:
+            self._send((0xB1,))
+            resp = self._dev.read(self._EP_IN, 4, timeout=300)
+            return tuple(resp) if len(resp) == 4 else None
+        except Exception:
+            return None
+
     # -- low level -------------------------------------------------------------
 
     def _send(self, data):
