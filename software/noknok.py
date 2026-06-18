@@ -1282,8 +1282,11 @@ class NoknokLEDs:
         """
         try:
             self._send((0xF0,))
-            resp = self._dev.read(self._EP_IN, 3, timeout=300)
-            return bytes(resp) == bytes((0x4E, 0x4E, self.MODULE_TYPE))
+            # CircuitPython usb.core.read() needs a buffer to read INTO and
+            # returns the byte count (unlike desktop PyUSB's size-int form).
+            buf = bytearray(3)
+            n = self._dev.read(self._EP_IN, buf, timeout=300)
+            return bytes(buf[:n]) == bytes((0x4E, 0x4E, self.MODULE_TYPE))
         except Exception:
             return False
 
@@ -1294,8 +1297,11 @@ class NoknokLEDs:
         """
         try:
             self._send((0xB1,))
-            resp = self._dev.read(self._EP_IN, 4, timeout=300)
-            return tuple(resp) if len(resp) == 4 else None
+            # CircuitPython usb.core.read() reads into a buffer and returns the
+            # byte count (not desktop PyUSB's size-int form).
+            buf = bytearray(4)
+            n = self._dev.read(self._EP_IN, buf, timeout=300)
+            return tuple(buf[:n]) if n == 4 else None
         except Exception:
             return None
 
