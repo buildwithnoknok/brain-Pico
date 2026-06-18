@@ -1275,6 +1275,45 @@ class NoknokLEDs:
         """Explicit show (setters already auto-show; here for completeness)."""
         self._send((0x05,))
 
+    def set_led(self, index, r, g, b, brightness=255, duration_ms=0):
+        """
+        Full control of one LED (or all) in a single command (firmware v1.6+):
+        colour, brightness and an optional auto-off duration.
+
+            index       : 0-7 for one LED, or 0xFF / "all" for all 8
+            r, g, b     : colour 0-255
+            brightness  : global brightness 0-255
+            duration_ms : 0 = hold indefinitely; otherwise the LED(s) turn off
+                          automatically after this many milliseconds (max 65535)
+
+        The module runs the timing itself (non-blocking), so this is fire-and-forget.
+        """
+        idx = 0xFF if index == "all" else (int(index) & 0xFF)
+        d = int(duration_ms) & 0xFFFF
+        self._send((0x10, idx, _clamp(r), _clamp(g), _clamp(b),
+                    _clamp(brightness), d & 0xFF, (d >> 8) & 0xFF))
+
+    # Preset animation ids (firmware v1.6+), run autonomously on the module.
+    PRESET_RAINBOW = 1
+    PRESET_BREATHE = 2
+    PRESET_CHASE   = 3
+    PRESET_WIPE    = 4
+    PRESET_TWINKLE = 5
+
+    def play_preset(self, preset, speed=0, r=0, g=0, b=0):
+        """
+        Run one of the 5 built-in animations on the module (firmware v1.6+),
+        fire-and-forget: the module animates on its own until the next command.
+
+            preset : 1-5 (PRESET_RAINBOW/BREATHE/CHASE/WIPE/TWINKLE)
+            speed  : ms per animation step (0 = module default ~40 ms)
+            r,g,b  : base colour (ignored by the rainbow preset)
+
+        Any other LED command (set_all, set_led, off, ...) stops the animation.
+        """
+        self._send((0x20, int(preset) & 0xFF, int(speed) & 0xFF,
+                    _clamp(r), _clamp(g), _clamp(b)))
+
     def identify(self):
         """
         Send the identity query (0xF0) and check for the [0x4E,0x4E,0x04] reply.
