@@ -205,6 +205,12 @@ _USB_MODULES = {
 _host_port = None
 
 
+def available():
+    """True if this CircuitPython build has USB host support (usb.core + usb_host).
+    Lets the Conductor skip USB enumeration cleanly on I2C-only builds."""
+    return _USB_OK
+
+
 def ensure_host_port(dp=None, dm=None):
     """Bring up the PIO-USB host port once (idempotent). Returns the Port."""
     global _host_port
@@ -217,23 +223,34 @@ def ensure_host_port(dp=None, dm=None):
     return _host_port
 
 
-def discover(dp=None, dm=None, settle_sec=3, max_sec=15):
+def discover(dp=None, dm=None, settle_sec=3, max_sec=20, empty_grace=6):
     """
     Bring up the USB host port and discover every noknok USB module on the bus.
-    Returns a list of (serial_hex_lower, type_name, module_instance).
+    Returns a list of (serial_hex_lower, type_name, module_instance) - empty if
+    no USB modules are connected (e.g. an I2C-only assembly), so the caller skips
+    USB cleanly.
 
-    Modules enumerate sequentially through a hub (~3 s each), so we scan
-    repeatedly and stop once no NEW module has appeared for `settle_sec` seconds
-    (or after `max_sec` total). Each module's serial (chip-UID hex) is the stable
-    identity; the Conductor keys its registry by it, exactly like an I2C UID.
+    Modules enumerate sequentially through a hub (~3 s each). Timing:
+      - wait up to `empty_grace` s for the FIRST module to appear; if none does,
+        assume there are no USB modules and stop (fast skip for I2C-only setups);
+      - once at least one is found, stop `settle_sec` s after the last NEW module;
+      - hard cap at `max_sec` s.
+    Each module's serial (chip-UID hex) is the stable identity; the Conductor
+    keys its registry by it, exactly like an I2C UID.
     """
     ensure_host_port(dp, dm)
     found = {}                          # serial(lower) -> (type_name, module)
-    start = last_new = time.monotonic()
+    start = time.monotonic()
+    last_new = None
     while True:
         now = time.monotonic()
-        if now - last_new >= settle_sec or now - start >= max_sec:
+        if now - start >= max_sec:
             break
+        if last_new is None:
+            if now - start >= empty_grace:
+                break                   # nothing appeared -> no USB modules
+        elif now - last_new >= settle_sec:
+            break                       # found some, settled
         for d in usb.core.find(find_all=True):
             try:
                 if d.idVendor != NOKNOK_VID:

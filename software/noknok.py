@@ -81,7 +81,9 @@ class Conductor:
     PROTOCOL_VERSION = 0x01   # the standard-command protocol version this lib understands
 
     def __init__(self, sda=board.GP8, scl=board.GP9, frequency=100_000):
-        self.i2c       = busio.I2C(scl, sda, frequency=frequency)
+        self._sda, self._scl, self._freq = sda, scl, frequency
+        self.i2c = None
+        self._init_i2c()   # tolerant: warns + leaves i2c=None if no pull-ups / no bus
         self.buzzer    = []    # NoknokBuzzer instances, indexed by discovery order
         self.knob      = []    # NoknokKnob instances
         self.ledbutton = []    # NoknokLedButton instances
@@ -91,7 +93,24 @@ class Conductor:
 
     # ── Low-level I2C ─────────────────────────────────────────────────────────
 
+    def _init_i2c(self):
+        """Bring up the I2C bus, tolerantly. If it can't initialise - e.g. no
+        pull-ups because no I2C modules are connected (USB-only product, or a
+        breakout without host pull-ups) - warn and leave self.i2c = None so the
+        USB side still works. Returns True if the bus is up."""
+        if self.i2c is not None:
+            return True
+        try:
+            self.i2c = busio.I2C(self._scl, self._sda, frequency=self._freq)
+            return True
+        except Exception as e:
+            print("I2C bus unavailable (%s) - I2C modules will be skipped." % e)
+            self.i2c = None
+            return False
+
     def _read(self, addr, n):
+        if self.i2c is None:
+            return None
         buf = bytearray(n)
         while not self.i2c.try_lock():
             pass
@@ -104,6 +123,8 @@ class Conductor:
             self.i2c.unlock()
 
     def _write(self, addr, data):
+        if self.i2c is None:
+            return False
         while not self.i2c.try_lock():
             pass
         try:
@@ -243,6 +264,10 @@ class Conductor:
         self._registry = {}
         self.role      = {}
 
+        if not self._init_i2c():
+            print("  No I2C bus (no pull-ups / no I2C modules) - skipping I2C enumeration.")
+            return 0
+
         # ── Step 1: Restore already-assigned modules ──────────────────────────
         restored = self._restore_state()
         if restored > 0:
@@ -344,7 +369,10 @@ class Conductor:
         try:
             import noknok_usb
         except ImportError as e:
-            print("USB modules unavailable:", e)
+            print("USB stack unavailable (%s) - skipping USB enumeration." % e)
+            return 0
+        if not noknok_usb.available():
+            print("No USB host support on this build - skipping USB enumeration.")
             return 0
 
         print("Enumerating noknok USB modules...")
