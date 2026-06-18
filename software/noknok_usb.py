@@ -58,6 +58,7 @@ class NoknokLEDs:
     LED_COUNT   = 8
     MODULE_TYPE = 0x04
     PID         = 0x4E4E
+    ROLE_SELECT = "output"   # role assignment via cue-and-confirm (output-only module)
     _EP_OUT     = 0x02     # CDC data OUT  (host -> module: commands)
     _EP_IN      = 0x83     # CDC data IN   (module -> host: responses)
 
@@ -161,6 +162,14 @@ class NoknokLEDs:
         """
         self._send((0x20, int(preset) & 0xFF, int(speed) & 0xFF,
                     _clamp(r), _clamp(g), _clamp(b)))
+
+    def role_cue(self, on=True):
+        """Role-assignment cue (output module): light up bright white to identify
+        THIS physical module during cue-and-confirm. on=False clears it."""
+        if on:
+            self.set_all(255, 255, 255)
+        else:
+            self.off()
 
     def identify(self):
         """

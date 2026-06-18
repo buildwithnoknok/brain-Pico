@@ -612,6 +612,19 @@ class Conductor:
         "knob":       "knob",
         "led_button": "ledbutton",
         "buzzer":     "buzzer",
+        "leds":       "leds",
+    }
+
+    # Role-assignment method per module type: "input" = the customer interacts
+    # with the module (detect_interaction); "output" = the Conductor cues each
+    # candidate and the customer confirms via the app (cue-and-confirm). Mirrors
+    # each driver's ROLE_SELECT, kept here too so the mode is known even when no
+    # module of that type is currently connected. Spans I2C and USB uniformly.
+    _ROLE_SELECT = {
+        "knob":       "input",
+        "led_button": "input",
+        "buzzer":     "output",
+        "leds":       "output",
     }
 
     def _modules_for_type(self, module_type):
@@ -620,6 +633,51 @@ class Conductor:
         if attr is None:
             return None
         return getattr(self, attr, None)
+
+    def role_select_mode(self, module_type):
+        """How a module type is role-assigned: "input" (customer interacts) or
+        "output" (cue-and-confirm via the app), or None if the type is unknown.
+        Prefers a live module's ROLE_SELECT, falling back to the static table."""
+        mods = self._modules_for_type(module_type)
+        if mods:
+            mode = getattr(mods[0], "ROLE_SELECT", None)
+            if mode:
+                return mode
+        return self._ROLE_SELECT.get(str(module_type).lower())
+
+    def role_candidates(self, module_type, exclude=None):
+        """Identities (uid_hex / USB serial) of all modules of a type, minus any
+        in `exclude`. The app cycles through these for OUTPUT modules during
+        cue-and-confirm. Order = discovery order."""
+        mods = self._modules_for_type(module_type) or []
+        excluded = set()
+        if exclude:
+            for u in exclude:
+                if u:
+                    excluded.add(str(u).lower().replace("-", "").replace(" ", ""))
+        out = []
+        for m in mods:
+            uid = getattr(m, "_uid_hex", None)
+            if uid is None:
+                continue
+            if uid.lower().replace("-", "").replace(" ", "") in excluded:
+                continue
+            out.append(uid)
+        return out
+
+    def role_cue(self, identity, on=True):
+        """Activate (on=True) or clear (on=False) the role-assignment cue on a
+        specific module — for OUTPUT modules (buzzer beeps, LED ring lights) during
+        cue-and-confirm. `identity` = uid_hex / serial. Returns True if cued."""
+        m = self.by_uid(identity)
+        fn = getattr(m, "role_cue", None) if m is not None else None
+        if fn is None:
+            return False
+        try:
+            fn(on)
+            return True
+        except Exception:
+            return False
 
     # Role-assignment feedback colours (LED button): amber = waiting for a role,
     # green = assigned. Best-effort cues so the customer is guided by light + sound.
@@ -893,6 +951,8 @@ class NoknokBuzzer:
     BEEP_ERROR      = 4
     STARTUP         = 5
 
+    ROLE_SELECT = "output"   # role assignment via cue-and-confirm (output-only module)
+
     _CMD_STOP      = 0x00
     _CMD_PLAY_NOTE = 0x01
     _CMD_PLAY_TUNE = 0x02
@@ -952,6 +1012,14 @@ class NoknokBuzzer:
         """Stop playback immediately."""
         self._send([self._CMD_STOP])
 
+    def role_cue(self, on=True):
+        """Role-assignment cue (output module): beep to identify THIS physical
+        buzzer during cue-and-confirm. on=False stops it."""
+        if on:
+            self.play(880, 200, 80)
+        else:
+            self.stop()
+
     def is_playing(self):
         """Returns True if currently playing. Returns False on I2C error."""
         buf = self._read(1)
@@ -999,6 +1067,8 @@ class NoknokKnob:
                 print("Button held")
             time.sleep(0.05)
     """
+
+    ROLE_SELECT = "input"   # role assignment by interaction (rotate or press)
 
     _CMD_RESET    = 0x10
     _CMD_SET_POS  = 0x11
@@ -1126,6 +1196,8 @@ class NoknokLedButton:
                 print("Button pressed!")
             time.sleep(0.05)
     """
+
+    ROLE_SELECT = "input"   # role assignment by interaction (press the button)
 
     _CMD_LED_OFF   = 0x00
     _CMD_LED_SET   = 0x10
