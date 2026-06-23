@@ -294,3 +294,251 @@ def discover(dp=None, dm=None, settle_sec=3, max_sec=20, empty_grace=6):
             last_new = now
         time.sleep(0.3)
     return [(k, t, m) for k, (t, m) in found.items()]
+
+
+# ============================================================================
+# USB OTA flasher — re-flash a noknok USB module's application over USB via the
+# noknok USB bootloader (module-USB-bootloader). The USB counterpart of the I2C
+# ModuleFlasher (module_flasher.py); the flow mirrors it deliberately.
+#
+# ONE fundamental difference from I2C: the module's USB PID CHANGES across the
+# OTA, so the device re-enumerates and the old usb.core handle goes stale:
+#
+#     app (PID 4E4E) --0xB0--> bootloader (PID 4E4F) --flash+BOOT--> app (4E4E)
+#
+# The I2C flasher holds one bus for the whole flow; this one cannot hold one
+# device handle. Instead it RE-FINDS the device (usb.core.find again) at every
+# transition, matching the module's chip-UID SERIAL — which the bootloader
+# reports identically to the app — so the right physical module is targeted even
+# with several USB modules on the bus.
+#
+# The .bin you pass is the OFFSET-LINKED application image (linked at 0x2000 via
+# app.ld) — exactly what `make build` produces in module-usb-led/firmware/src.
+#
+# Bootloader CDC protocol (host waits for each [state, err] reply on EP 0x83):
+#   0x01 ERASE                      app region + metadata
+#   0x02 WRITE n <n bytes>          one chunk (n <= 32)
+#   0x03 READ_STATUS                -> [state, err]
+#   0x04 VERIFY crc32(4 LE)         -> writes the validity marker; state==READY
+#   0x05 BOOT                       jump to the app (no reply; device resets)
+#   state: 0 IDLE 1 BUSY 2 READY 3 ERROR ; err: 0 ok, 5 CRC mismatch, 6 region
+#
+# A running app is flipped into the bootloader with CDC command 0xB0.
+# CRC32 = zlib (poly 0xEDB88320, init/final 0xFFFFFFFF) to match the bootloader.
+# ============================================================================
+
+
+def crc32(data):
+    """zlib CRC32 (poly 0xEDB88320). Matches the bootloader and binascii.crc32."""
+    try:
+        import binascii
+        return binascii.crc32(data) & 0xFFFFFFFF
+    except (ImportError, AttributeError):
+        pass
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xEDB88320 if (crc & 1) else (crc >> 1)
+    return crc ^ 0xFFFFFFFF
+
+
+class UsbFlashError(Exception):
+    pass
+
+
+class UsbModuleFlasher:
+    """
+    OTA flasher for noknok USB modules over the noknok USB bootloader.
+
+        from noknok_usb import UsbModuleFlasher
+        f = UsbModuleFlasher()                       # brings up the host port
+        with open("noknok_leds.bin", "rb") as fh:
+            f.flash(fh.read())                       # auto: app->0xB0->BL or blank BL
+
+    Pass `serial=` (a module's chip-UID hex, lower-case) to target ONE specific
+    module when several USB modules are on the bus.
+    """
+
+    PID_APP        = 0x4E4E
+    PID_BOOTLOADER = 0x4E4F
+    APP_CMD_ENTER  = 0xB0     # CDC command: app resets into the bootloader
+
+    CMD_ERASE   = 0x01
+    CMD_WRITE   = 0x02
+    CMD_STATUS  = 0x03
+    CMD_VERIFY  = 0x04
+    CMD_BOOT    = 0x05
+
+    ST_IDLE, ST_BUSY, ST_READY, ST_ERROR = 0, 1, 2, 3
+    CHUNK = 32                # bootloader WRITE accepts up to 32 bytes per chunk
+
+    _EP_OUT = 0x02            # CDC data OUT (host -> module: commands)
+    _EP_IN  = 0x83            # CDC data IN  (module -> host: [state, err])
+
+    _ERRMSG = {0: "none", 5: "CRC mismatch", 6: "region overflow"}
+
+    def __init__(self, dp=None, dm=None):
+        ensure_host_port(dp, dm)     # raises if this build has no USB host support
+        self._dp, self._dm = dp, dm
+
+    # ── device discovery (re-run at every PID transition) ────────────────────
+    def _find(self, pid, serial=None):
+        """Return the configured usb.core device for (NOKNOK_VID, pid), optionally
+        matching a chip-UID serial, or None. set_configuration() is idempotent."""
+        for d in usb.core.find(find_all=True):
+            try:
+                if d.idVendor != NOKNOK_VID or d.idProduct != pid:
+                    continue
+                if serial is not None:
+                    s = d.serial_number
+                    if not s or s.lower() != serial.lower():
+                        continue
+            except Exception:
+                continue
+            try:
+                d.set_configuration()
+            except Exception:
+                pass        # usually already configured by the host stack
+            return d
+        return None
+
+    def _wait_for(self, pid, serial=None, timeout=8.0):
+        """Poll the bus until the device with `pid` (re-)appears. The PIO-USB host
+        re-enumeration after a PID change is the known risk this loop rides out."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            d = self._find(pid, serial)
+            if d is not None:
+                return d
+            time.sleep(0.25)
+        return None
+
+    # ── low-level CDC helpers ────────────────────────────────────────────────
+    def _send(self, dev, data):
+        dev.write(self._EP_OUT, bytes(data), timeout=1000)
+
+    def _read_status(self, dev, timeout=3000):
+        """Read the 2-byte [state, err] reply, or None on timeout. `timeout` ms."""
+        buf = bytearray(2)
+        try:
+            n = dev.read(self._EP_IN, buf, timeout=timeout)
+        except Exception:
+            return None
+        if n < 2:
+            return None
+        return buf[0], buf[1]
+
+    def _check(self, st, what):
+        if st is None:
+            raise UsbFlashError("%s: no reply from bootloader" % what)
+        state, err = st
+        if err != 0:
+            raise UsbFlashError("%s: bootloader error %s (code %d, state %d)"
+                                % (what, self._ERRMSG.get(err, "unknown"), err, state))
+        return state
+
+    # ── high-level steps ─────────────────────────────────────────────────────
+    def present(self, serial=None):
+        """True if a noknok USB bootloader (PID 4E4F) is on the bus."""
+        return self._find(self.PID_BOOTLOADER, serial) is not None
+
+    def enter_bootloader(self, serial=None, timeout=8.0):
+        """Flip a running app into the bootloader: find it (PID 4E4E), send 0xB0,
+        then re-find it as the bootloader (PID 4E4F). Returns the bootloader dev."""
+        app = self._find(self.PID_APP, serial)
+        if app is None:
+            raise UsbFlashError("running app (PID 4E4E) not found to enter bootloader")
+        # Lock onto this module's serial so we re-find the SAME physical module
+        # after it resets (matters when several USB modules are present).
+        if serial is None:
+            try:
+                serial = (app.serial_number or "").lower() or None
+            except Exception:
+                serial = None
+        try:
+            self._send(app, [self.APP_CMD_ENTER])
+        except Exception:
+            pass        # the module resets immediately; the write need not complete
+        bl = self._wait_for(self.PID_BOOTLOADER, serial, timeout=timeout)
+        if bl is None:
+            raise UsbFlashError("bootloader (PID 4E4F) did not appear after 0xB0")
+        return bl, serial
+
+    def erase(self, bl):
+        self._send(bl, [self.CMD_ERASE])
+        self._check(self._read_status(bl, timeout=3000), "ERASE")   # ~300 ms+
+
+    def write_chunk(self, bl, data):
+        n = len(data)
+        self._send(bl, bytes([self.CMD_WRITE, n]) + bytes(data))
+        self._check(self._read_status(bl, timeout=1000), "WRITE")
+
+    def verify(self, bl, crc):
+        """VERIFY is crc32 only (4 LE) — unlike I2C, no length field; the
+        bootloader knows app_len from the bytes written. state must be READY."""
+        pkt = bytes([self.CMD_VERIFY,
+                     crc & 0xFF, (crc >> 8) & 0xFF,
+                     (crc >> 16) & 0xFF, (crc >> 24) & 0xFF])
+        self._send(bl, pkt)
+        state = self._check(self._read_status(bl, timeout=3000), "VERIFY")
+        if state != self.ST_READY:
+            raise UsbFlashError("VERIFY: app not accepted (state %d, expected READY)"
+                                % state)
+
+    def boot(self, bl):
+        """Jump to the freshly-flashed app. No reply — the module resets and
+        re-enumerates back to the application PID (4E4E)."""
+        try:
+            self._send(bl, [self.CMD_BOOT])
+        except Exception:
+            pass        # device resets into the app; the write need not complete
+
+    # ── orchestration (mirrors module_flasher.ModuleFlasher.flash) ───────────
+    def flash(self, data, serial=None, progress=None, confirm_app=True):
+        """
+        Flash an offset-linked app image (bytes) to a noknok USB module.
+
+        serial      : chip-UID hex of the target module; None = first one found.
+        progress    : optional callback(done_bytes, total_bytes).
+        confirm_app : after BOOT, wait for the module to re-enumerate as the app
+                      (PID 4E4E) and return its usb.core device (or None). Set
+                      False to skip the wait.
+
+        Returns the re-enumerated app device if confirm_app, else True.
+        """
+        total = len(data)
+        if total == 0:
+            raise UsbFlashError("empty image")
+
+        # 1. Get to the bootloader (directly if already there, else via 0xB0).
+        bl = self._find(self.PID_BOOTLOADER, serial)
+        if bl is None:
+            bl, serial = self.enter_bootloader(serial)
+        elif serial is None:
+            try:
+                serial = (bl.serial_number or "").lower() or None
+            except Exception:
+                serial = None
+        time.sleep(0.2)
+
+        # 2. Erase.
+        self.erase(bl)
+
+        # 3. Stream the image in <=32-byte chunks.
+        off = 0
+        while off < total:
+            self.write_chunk(bl, data[off:off + self.CHUNK])
+            off += self.CHUNK
+            if progress:
+                progress(min(off, total), total)
+
+        # 4. Verify (writes the validity marker only on a CRC match).
+        self.verify(bl, crc32(data))
+
+        # 5. Boot into the app.
+        self.boot(bl)
+
+        if confirm_app:
+            return self._wait_for(self.PID_APP, serial, timeout=8.0)
+        return True
