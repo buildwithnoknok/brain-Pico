@@ -168,7 +168,9 @@ class Conductor:
     # ── Firmware version checking (against a product manifest) ─────────────────
 
     # module list attribute -> manifest module_firmware{} key
-    _FW_GROUPS = (("buzzer", "buzzer"), ("knob", "knob"), ("ledbutton", "led_button"))
+    # I2C modules carry a runtime address; USB modules are identified by serial.
+    _FW_GROUPS     = (("buzzer", "buzzer"), ("knob", "knob"), ("ledbutton", "led_button"))
+    _USB_FW_GROUPS = (("leds", "usb_leds"),)
 
     @staticmethod
     def _parse_semver(s):
@@ -205,37 +207,46 @@ class Conductor:
             return (True, "update available %s -> %s" % (installed, required))
         return (False, "up to date (%s)" % installed)
 
+    def _fw_entry(self, m, mf_key, spec, bus, address):
+        """Build one firmware_report() entry for module `m`."""
+        installed     = getattr(m, "firmware_version", None)
+        proto         = getattr(m, "protocol_version", None)
+        required      = spec.get("version")
+        needs, reason = self._update_decision(installed, proto, required)
+        return {
+            "type":         mf_key,
+            "bus":          bus,            # "i2c" or "usb" — routes update_module()
+            "uid":          getattr(m, "_uid_hex", None),
+            "address":      address,        # I2C runtime addr, or None for USB
+            "installed":    installed,
+            "protocol":     proto,
+            "required":     required,
+            "url":          spec.get("url"),
+            "needs_update": needs,
+            "reason":       reason,
+        }
+
     def firmware_report(self, manifest_fw):
         """
         Compare every enumerated module's installed firmware against a manifest's
         module_firmware{} block, e.g.
-            {"knob": {"version": "2.1.0", "url": "..."}, "buzzer": {...}}
-        Returns one dict per module:
-            {type, uid, address, installed, protocol, required, url,
+            {"knob": {"version": "2.1.0", "url": "..."}, "usb_leds": {...}}
+        Returns one dict per module (both I2C and USB):
+            {type, bus, uid, address, installed, protocol, required, url,
              needs_update, reason}
+        `bus` is "i2c" (carries `address`) or "usb" (identified by `uid`/serial).
         Single source of truth for PoC v1 (log) and PoC v2 (flash outdated ones).
         """
         manifest_fw = manifest_fw or {}
         report = []
         for list_attr, mf_key in self._FW_GROUPS:
-            spec     = manifest_fw.get(mf_key, {})
-            required = spec.get("version")
-            url      = spec.get("url")
+            spec = manifest_fw.get(mf_key, {})
             for m in getattr(self, list_attr):
-                installed     = getattr(m, "firmware_version", None)
-                proto         = getattr(m, "protocol_version", None)
-                needs, reason = self._update_decision(installed, proto, required)
-                report.append({
-                    "type":         mf_key,
-                    "uid":          getattr(m, "_uid_hex", None),
-                    "address":      m.address,
-                    "installed":    installed,
-                    "protocol":     proto,
-                    "required":     required,
-                    "url":          url,
-                    "needs_update": needs,
-                    "reason":       reason,
-                })
+                report.append(self._fw_entry(m, mf_key, spec, "i2c", m.address))
+        for list_attr, mf_key in self._USB_FW_GROUPS:
+            spec = manifest_fw.get(mf_key, {})
+            for m in getattr(self, list_attr):
+                report.append(self._fw_entry(m, mf_key, spec, "usb", None))
         return report
 
     def log_firmware_report(self, manifest_fw, logfn=print):
@@ -243,11 +254,78 @@ class Conductor:
         Returns the report list so the caller can also act on needs_update."""
         report = self.firmware_report(manifest_fw)
         for r in report:
-            flag = "UPDATE AVAILABLE" if r["needs_update"] else "ok"
-            logfn("  fw %-11s 0x%02X  installed=%s required=%s  [%s] %s"
-                  % (r["type"], r["address"], r["installed"], r["required"],
+            flag  = "UPDATE AVAILABLE" if r["needs_update"] else "ok"
+            where = ("0x%02X" % r["address"]) if r["address"] is not None \
+                    else ("usb:%s" % (r["uid"] or "?"))
+            logfn("  fw %-11s %-14s installed=%s required=%s  [%s] %s"
+                  % (r["type"], where, r["installed"], r["required"],
                      flag, r["reason"]))
         return report
+
+    # ── Firmware update (OTA) ──────────────────────────────────────────────────
+    # Routes a firmware_report() entry to the right OTA flasher: the I2C
+    # ModuleFlasher (module_flasher.py) or the USB UsbModuleFlasher (noknok_usb.py).
+    # Both are lazily imported so a single-bus product never loads the other stack.
+
+    def update_module(self, entry, image, progress=None):
+        """
+        Flash one module's firmware. `entry` is a firmware_report() dict (needs
+        'bus' + 'address'/'uid'); `image` is the offset-linked app .bin as bytes.
+
+        NOTE: the module RE-ENUMERATES after a flash (new I2C address / new USB
+        handle), so the Conductor's existing instance for it goes stale — call
+        enumerate()/enumerate_usb()/enumerate_all() afterwards to refresh. update_all()
+        does this for you. Returns True on success; raises on failure.
+        """
+        bus = entry.get("bus")
+        if bus == "i2c":
+            from module_flasher import ModuleFlasher
+            ModuleFlasher(self.i2c).flash(image, runtime_addr=entry.get("address"),
+                                          progress=progress)
+            return True
+        if bus == "usb":
+            import noknok_usb
+            noknok_usb.UsbModuleFlasher().flash(image, serial=entry.get("uid"),
+                                                progress=progress)
+            return True
+        raise ValueError("update_module: unknown bus %r" % bus)
+
+    def update_all(self, manifest_fw, get_image, progress=None, logfn=print):
+        """
+        Flash every module that firmware_report() flags needs_update.
+
+        `get_image(entry) -> bytes` supplies the app .bin for an entry — INJECT the
+        source: a local-file reader on the bench, or a WiFi downloader of
+        entry['url'] in provisioning. (Keeps this method network-agnostic and
+        bench-testable.)
+
+        Re-enumerates at the end so the Conductor's module instances are fresh.
+        Returns the list of attempted entries, each with added 'updated':bool and
+        'error':str|None.
+        """
+        todo = [r for r in self.firmware_report(manifest_fw) if r["needs_update"]]
+        if not todo:
+            logfn("Firmware: all modules up to date.")
+            return []
+        done = []
+        for r in todo:
+            r2 = dict(r)
+            try:
+                image = get_image(r)
+                if not image:
+                    raise ValueError("no image available")
+                logfn("Updating %s (%s -> %s) over %s..."
+                      % (r["type"], r["installed"], r["required"], r["bus"]))
+                self.update_module(r, image, progress=progress)
+                r2["updated"], r2["error"] = True, None
+                logfn("  OK")
+            except Exception as e:
+                r2["updated"], r2["error"] = False, str(e)
+                logfn("  FAILED: %s" % e)
+            done.append(r2)
+        logfn("Re-enumerating after updates...")
+        self.enumerate_all()
+        return done
 
     # ── Enumeration ───────────────────────────────────────────────────────────
 
