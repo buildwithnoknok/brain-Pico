@@ -304,7 +304,7 @@ def discover(dp=None, dm=None, settle_sec=3, max_sec=20, empty_grace=6):
 # ONE fundamental difference from I2C: the module's USB PID CHANGES across the
 # OTA, so the device re-enumerates and the old usb.core handle goes stale:
 #
-#     app (PID 4E4E) --0xB0--> bootloader (PID 4E4F) --flash+BOOT--> app (4E4E)
+#     app (PID 4E4E) --0xB0--> bootloader (PID 4E42) --flash+BOOT--> app (4E4E)
 #
 # The I2C flasher holds one bus for the whole flow; this one cannot hold one
 # device handle. Instead it RE-FINDS the device (usb.core.find again) at every
@@ -361,7 +361,7 @@ class UsbModuleFlasher:
     """
 
     PID_APP        = 0x4E4E
-    PID_BOOTLOADER = 0x4E4F
+    PID_BOOTLOADER = 0x4E42
     APP_CMD_ENTER  = 0xB0     # CDC command: app resets into the bootloader
 
     CMD_ERASE   = 0x01
@@ -440,12 +440,12 @@ class UsbModuleFlasher:
 
     # ── high-level steps ─────────────────────────────────────────────────────
     def present(self, serial=None):
-        """True if a noknok USB bootloader (PID 4E4F) is on the bus."""
+        """True if a noknok USB bootloader (PID 4E42) is on the bus."""
         return self._find(self.PID_BOOTLOADER, serial) is not None
 
     def enter_bootloader(self, serial=None, timeout=8.0):
         """Flip a running app into the bootloader: find it (PID 4E4E), send 0xB0,
-        then re-find it as the bootloader (PID 4E4F). Returns the bootloader dev."""
+        then re-find it as the bootloader (PID 4E42). Returns the bootloader dev."""
         app = self._find(self.PID_APP, serial)
         if app is None:
             raise UsbFlashError("running app (PID 4E4E) not found to enter bootloader")
@@ -462,7 +462,7 @@ class UsbModuleFlasher:
             pass        # the module resets immediately; the write need not complete
         bl = self._wait_for(self.PID_BOOTLOADER, serial, timeout=timeout)
         if bl is None:
-            raise UsbFlashError("bootloader (PID 4E4F) did not appear after 0xB0")
+            raise UsbFlashError("bootloader (PID 4E42) did not appear after 0xB0")
         return bl, serial
 
     def erase(self, bl):

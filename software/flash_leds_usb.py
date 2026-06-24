@@ -12,12 +12,12 @@
 # (via BOOT0 jumper / WCHISPTool).
 #
 # Two scenarios, auto-detected:
-#   A) Bootloader present (PID 4E4F) — blank/invalid app. Flash, boot, confirm.
+#   A) Bootloader present (PID 4E42) — blank/invalid app. Flash, boot, confirm.
 #   B) Running app (PID 4E4E)        — send 0xB0 to flip it into the bootloader,
 #                                      re-flash, boot, re-enumerate.
 #
 # THE POINT OF THIS TEST is scenario B: it rides the full PID-change loop
-#   app 4E4E --0xB0--> BL 4E4F --flash--> BOOT --> app 4E4E
+#   app 4E4E --0xB0--> BL 4E42 --flash--> BOOT --> app 4E4E
 # which forces the PIO-USB host to RE-ENUMERATE the device three times. That
 # re-enumeration is the known risk (CP PIO-USB hot re-attach); this script prints
 # at each transition so we can see exactly where it succeeds or stalls.
@@ -44,11 +44,11 @@ def main():
     time.sleep(3)
 
     if f.present():
-        print("Bootloader present (PID 4E4F) — blank/invalid app. Flashing directly.")
+        print("Bootloader present (PID 4E42) — blank/invalid app. Flashing directly.")
     else:
         bl = f._find(f.PID_APP)
         if bl is None:
-            print("No noknok USB module found (neither app 4E4E nor bootloader 4E4F).")
+            print("No noknok USB module found (neither app 4E4E nor bootloader 4E42).")
             print("Check: powered hub, GP16/GP17 wiring, bootloader flashed, data cable.")
             return
         try:
@@ -58,7 +58,7 @@ def main():
         print("Running app found (PID 4E4E, serial %s)." % serial)
         print("flash() will send 0xB0 and wait for it to re-attach as the bootloader.")
 
-    # ── Flash (orchestrates 0xB0 -> re-find 4E4F -> erase/write/verify -> boot) ─
+    # ── Flash (orchestrates 0xB0 -> re-find 4E42 -> erase/write/verify -> boot) ─
     print("Starting USB OTA flash...")
     try:
         app_dev = f.flash(image, progress=_progress, confirm_app=True)
