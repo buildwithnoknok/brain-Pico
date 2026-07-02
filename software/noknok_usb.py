@@ -62,12 +62,13 @@ class NoknokLEDs:
     _EP_OUT     = 0x02     # CDC data OUT  (host -> module: commands)
     _EP_IN      = 0x83     # CDC data IN   (module -> host: responses)
 
-    # Preset animation ids (firmware v1.6+), run autonomously on the module.
-    PRESET_RAINBOW = 1
-    PRESET_BREATHE = 2
-    PRESET_CHASE   = 3
-    PRESET_WIPE    = 4
-    PRESET_TWINKLE = 5
+    # Preset animation ids, run autonomously on the module.
+    PRESET_RAINBOW = 1          # firmware v1.6+
+    PRESET_BREATHE = 2          # firmware v1.6+
+    PRESET_CHASE   = 3          # firmware v1.6+
+    PRESET_WIPE    = 4          # firmware v1.6+
+    PRESET_TWINKLE = 5          # firmware v1.6+
+    PRESET_SUNDOWN = 6          # firmware v1.8.1+ - one-shot eased fade to off, see below
 
     def __init__(self, device):
         self._dev = device
@@ -151,12 +152,24 @@ class NoknokLEDs:
 
     def play_preset(self, preset, speed=0, r=0, g=0, b=0):
         """
-        Run one of the 5 built-in animations on the module (firmware v1.6+),
-        fire-and-forget: the module animates on its own until the next command.
+        Run one of the built-in animations on the module, fire-and-forget: the
+        module animates on its own until the next command.
 
-            preset : 1-5 (PRESET_RAINBOW/BREATHE/CHASE/WIPE/TWINKLE)
+            preset : 1-6 (PRESET_RAINBOW/BREATHE/CHASE/WIPE/TWINKLE/SUNDOWN)
             speed  : ms per animation step (0 = module default ~40 ms)
+                     ** EXCEPT for PRESET_SUNDOWN (6, firmware v1.8.1+), where
+                     `speed` instead means MINUTES for the total fade duration
+                     (0 = default 30 min) - a single ms/step byte can't encode
+                     a useful multi-minute duration, so this preset repurposes
+                     the field. See module-usb-led/firmware/readme.md. **
             r,g,b  : base colour (ignored by the rainbow preset)
+
+        PRESET_SUNDOWN is also the only ONE-SHOT preset: it fades from full
+        brightness to off (quadratic ease-out - fast dim at the start, slow
+        crawl to zero at the end) over `speed` minutes and then stops itself
+        with the LEDs off, instead of looping forever like the other presets.
+        Typical use: leds.play_preset(leds.PRESET_SUNDOWN, speed=30, b=255)
+        for a 30-minute blue wind-down light.
 
         Any other LED command (set_all, set_led, off, ...) stops the animation.
         """
