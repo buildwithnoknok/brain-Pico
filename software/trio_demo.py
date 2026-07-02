@@ -16,6 +16,7 @@ import time
 # ── Setup ─────────────────────────────────────────────────────────────────────
 c = Conductor()
 c.enumerate()
+c.load_roles()   # noknok_roles.json — absent for a bare bench run, that's fine
 
 if not c.buzzer:
     raise SystemExit("No buzzer found — check wiring.")
@@ -24,9 +25,13 @@ if not c.knob:
 if not c.ledbutton:
     raise SystemExit("No LED button found — check wiring.")
 
+# Prefer the customer's app-assigned physical module (stable across boots,
+# by UID) over positional indexing. With 3 identical LED buttons on the bus,
+# c.ledbutton[0] is whichever one happened to enumerate first — not stable
+# boot to boot. Falls back to positional when there's no roles file (bench).
 buz = c.buzzer[0]
-knb = c.knob[0]
-kbd = c.ledbutton[0]
+knb = c.role.get("main_knob")   or c.knob[0]
+kbd = c.role.get("main_button") or c.ledbutton[0]
 
 print("\n noknok trio demo — Light & Sound Controller")
 print(" ─────────────────────────────────────────────")
