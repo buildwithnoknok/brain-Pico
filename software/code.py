@@ -1,5 +1,25 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.10 (PoC v2 — module firmware OTA: /firmware/check + headless flash)
+# Version: 0.11 (PoC v2 Step 5 — DEV-12: OTA wired to the bus-aware dispatcher)
+#
+# v0.11 changes (Sue): DEV-12 — wire update_all() into provisioning, both buses.
+#   - get_conductor() now calls enumerate_all() (I2C + USB) instead of enumerate()
+#     (I2C-only). Without this, a USB-only product's module (e.g. the desk lamp's
+#     USB LEDs) never had a firmware_report() entry at all — its OTA was silently
+#     skipped both at /firmware/check and at the headless flash below.
+#   - check_and_flash_modules() no longer talks to module_flasher.ModuleFlasher
+#     directly (I2C-only). It now calls Conductor.update_all(manifest_fw, get_image,
+#     progress, logfn) from noknok.py — the bus-aware dispatcher Sam shipped
+#     (commit 774c115) that routes each outdated module to the right flasher
+#     (I2C ModuleFlasher / USB UsbModuleFlasher) and re-enumerates afterwards.
+#     get_image() is the one piece deliberately left WiFi-specific here — it
+#     downloads entry['url'] over the existing radio session — everything else
+#     lives in noknok.py so it stays bench-testable (see update_demo.py).
+#   - Progress is log-only for this pass (log.txt via the progress callback) —
+#     there's no live channel back to the phone during the headless flash (it's
+#     already off the noknok-setup AP by then). A future GET /status + mDNS
+#     endpoint (see poc-private/docs/firmware-change-for-sam.md) would be a
+#     separate task if live in-app progress is wanted later.
+#   - Outcomes logged to log.txt (verbose) + noknok_events.txt (durable audit).
 #
 # v0.10 changes (Sue): module-firmware version check + OTA (DEV-1 / PoC v2 Step 5).
 #   - POST /firmware/check (AP time): the app sends the manifest's module_firmware{};
@@ -7,11 +27,6 @@
 #     via noknok.py) and returns {update_needed, modules[]} so the app can show a
 #     "firmware update available" notice before /connect. No flashing here.
 #   - /connect now also accepts module_firmware (JSON) and persists it in wifi.json.
-#   - On the connected boot, BEFORE running product.py, check_and_flash_modules()
-#     downloads any outdated module .bin from its public raw URL and flashes it over
-#     I2C (module_flasher.ModuleFlasher), then re-verifies the version. Crash-safe:
-#     a failed flash leaves the module safe in its bootloader and never blocks boot.
-#   - Outcomes logged to log.txt (verbose) + noknok_events.txt (durable audit).
 #
 # v0.8 changes (Sam): app-driven role assignment ("PoC v1 Step 3"). Two new
 #   routes on the AP HTTP server let the noknok app assign roles to physical
@@ -185,15 +200,21 @@ _conductor = None
 def get_conductor():
     """Return a cached, enumerated Conductor, creating it on first use.
     The Conductor (noknok.py) self-configures its own I2C bus on the noknok
-    standard pins, so no pins are passed here. Returns None if noknok.py is
-    missing or the bus can't be brought up — callers degrade gracefully."""
+    standard pins, so no pins are passed here. Uses enumerate_all() (I2C + USB)
+    rather than enumerate() so USB-only products (e.g. the desk lamp's USB LEDs
+    module) are actually found for role detection AND firmware checks — with
+    I2C-only, a USB module's firmware_report() entry never existed, so its OTA
+    was silently skipped. enumerate_usb() no-ops cleanly if there's no USB host
+    support on the build, so this is a no-op cost for I2C-only products. Returns
+    None if noknok.py is missing or the I2C bus can't be brought up — callers
+    degrade gracefully."""
     global _conductor
     if _conductor is None:
         try:
             from noknok import Conductor
             log("[roles] Creating Conductor + enumerating modules (first use)...")
             c = Conductor()                 # self-configures I2C (GP8/GP9, 100 kHz)
-            found = c.enumerate()           # ~3 s — discovers all connected modules
+            found = c.enumerate_all()       # ~3 s — discovers I2C + USB modules
             log(f"[roles] Enumeration done — {found} module(s) found")
             _conductor = c
         except Exception as e:
@@ -679,79 +700,45 @@ def _release_conductor():
             pass
         _conductor = None
 
-def _flash_one_module(session, flasher, r):
-    """Download one module's .bin from its manifest URL and flash it over I2C.
-    Returns True if the flash completed (verification happens in the caller),
-    False on download/flash failure. Never raises."""
-    from module_flasher import FlashError
-    mtype, addr, url = r["type"], r["address"], r["url"]
-    frm, to = r["installed"], r["required"]
-
-    if not url:
-        log(f"[fw] {mtype}: no URL in manifest — skipping")
-        event(f"[FW]    {mtype:<11} uid={r['uid']}  {frm} -> {to}  SKIP (no url)")
-        return False
-
-    # 1) download the offset-linked application image (BINARY — not .text)
+def _download_image(session, url, timeout=30):
+    """Download one module's offset-linked app .bin over WiFi (BINARY, not .text).
+    Returns bytes. Raises on any connectivity/HTTP/size failure — update_all()
+    (noknok.py) catches it, marks that module FAILED and moves on to the rest."""
+    resp = session.get(url, timeout=timeout)
     try:
-        log(f"[fw] {mtype}: downloading {to} from {url}")
-        resp = session.get(url, timeout=30)
         if resp.status_code != 200:
-            log(f"[fw] {mtype}: HTTP {resp.status_code} — skipping")
-            resp.close()
-            event(f"[FW]    {mtype:<11} uid={r['uid']}  {frm} -> {to}  "
-                  f"FAIL (HTTP {resp.status_code})")
-            return False
+            raise ValueError("HTTP %d" % resp.status_code)
         image = resp.content
+    finally:
         resp.close()
-        log(f"[fw] {mtype}: downloaded {len(image)} bytes")
-    except Exception as e:
-        log(f"[fw] {mtype}: download error {e} — skipping")
-        event(f"[FW]    {mtype:<11} uid={r['uid']}  {frm} -> {to}  FAIL (download {e})")
-        return False
-
-    # 2) flash: 0xB0 drops the running module into its bootloader (0x7E), then
-    #    ERASE -> WRITE_CHUNK* -> VERIFY (CRC) -> BOOT. CRC-verified by the
-    #    bootloader; a failure leaves the module safe at 0x7E (never bricked).
-    def _progress(done, total):
-        if total and (done == total or done % 512 == 0):
-            log(f"[fw] {mtype}: flashing {done}/{total} ({100 * done // total}%)")
-    try:
-        flasher.flash(image, runtime_addr=addr, progress=_progress)
-    except FlashError as e:
-        log(f"[fw] {mtype}: FLASH FAILED {e} — module safe in bootloader 0x7E")
-        event(f"[FW]    {mtype:<11} uid={r['uid']}  {frm} -> {to}  "
-              f"FAIL ({e}; safe in bootloader)")
-        return False
-    except Exception as e:
-        log(f"[fw] {mtype}: unexpected flash error {e}")
-        event(f"[FW]    {mtype:<11} uid={r['uid']}  {frm} -> {to}  FAIL ({e})")
-        return False
-
-    log(f"[fw] {mtype}: flash complete, booted new app")
-    return True
+    if len(image) < 256:  # a real app image is KBs; this size means an error
+        raise ValueError("image too small (%d bytes) — not a firmware binary" % len(image))
+    return image
 
 def check_and_flash_modules(module_firmware):
-    """Compare installed module firmware against the manifest's module_firmware{}
-    and flash any outdated module over I2C, before product.py runs. Headless
-    (Pico already on WiFi). Best-effort + crash-safe: any failure is logged and
-    swallowed; a failed flash leaves the module safe in its bootloader at 0x7E."""
+    """Bring every connected module (I2C + USB) up to the manifest's
+    module_firmware{} versions before product.py runs. Headless (Pico already
+    on WiFi). Routes through the Conductor's bus-aware update_all() (noknok.py,
+    DEV-12) so both buses go through ONE call — update_module() inside it picks
+    module_flasher.ModuleFlasher (I2C) or noknok_usb.UsbModuleFlasher (USB), and
+    it re-enumerates afterwards so module instances/addresses are fresh. The only
+    WiFi-specific piece is get_image() below, injected per DEV-12's design so the
+    dispatcher itself stays network-agnostic and bench-testable (update_demo.py
+    injects a local-file get_image instead).
+
+    Best-effort + crash-safe: any failure is logged and swallowed. A failed I2C
+    flash leaves that module safe in its bootloader at 0x7E; a failed USB flash
+    leaves it enumerated as its bootloader PID (4E42) — neither can strand or
+    brick the module, and neither blocks the rest of the boot."""
     if not module_firmware:
         return   # older app / no manifest fw block -> nothing to do
 
-    try:
-        c = get_conductor()              # enumerates + reads versions (0xB1)
-        if c is None:
-            log("[fw] no Conductor available — skipping firmware check")
-            return
-        report = c.firmware_report(module_firmware)
-    except Exception as e:
-        log(f"[fw] firmware check failed: {e}")
+    c = get_conductor()               # enumerates both buses + reads versions
+    if c is None:
+        log("[fw] no Conductor available — skipping firmware check")
         return
 
-    for r in report:
-        log(f"[fw] {r['type']} 0x{r['address']:02X} "
-            f"installed={r['installed']} required={r['required']} — {r['reason']}")
+    report = c.log_firmware_report(module_firmware, logfn=log)
     todo = [r for r in report if r["needs_update"]]
     if not todo:
         log("[fw] all modules up to date")
@@ -760,50 +747,42 @@ def check_and_flash_modules(module_firmware):
 
     # HTTPS session (correct DNS/SSL for the radio) to download the bins.
     try:
-        from module_flasher import ModuleFlasher
         pool    = adafruit_connection_manager.get_radio_socketpool(wifi.radio)
         context = adafruit_connection_manager.get_radio_ssl_context(wifi.radio)
         session = adafruit_requests.Session(pool, context)
-        flasher = ModuleFlasher(c.i2c)
     except Exception as e:
         log(f"[fw] OTA setup failed: {e}")
         return
 
-    flashed_any = False
-    for r in todo:
-        if _flash_one_module(session, flasher, r):
-            flashed_any = True
+    def get_image(entry):
+        if not entry.get("url"):
+            raise ValueError("no URL in manifest")
+        log(f"[fw] {entry['type']}: downloading {entry['required']} from {entry['url']}")
+        image = _download_image(session, entry["url"])
+        log(f"[fw] {entry['type']}: downloaded {len(image)} bytes")
+        return image
 
-    if not flashed_any:
-        return
+    def progress(done, total):
+        if total and (done == total or done % 512 == 0):
+            log(f"[fw] flashing {done}/{total} ({100 * done // total}%)")
 
-    # A flashed module rebooted into its new app and is back at the staging
-    # address (0x7F); the modules we did NOT flash keep their runtime addresses.
-    # Re-enumerate WITHOUT wiping noknok_state.json: _restore_state pings the saved
-    # addresses — the re-staged module no longer answers its old one, so it's
-    # skipped and then rediscovered at 0x7F and reassigned, while the untouched
-    # modules restore normally. Wiping the state here would STRAND the non-flashed
-    # modules (they don't re-advertise at 0x7F once assigned), so the product would
-    # only see the flashed one. We re-enumerate just to read the new version(s) and
-    # log a definitive OK/FAIL per module (keyed by UID).
-    try:
-        c.enumerate()
-        verify = {v["uid"]: v for v in c.firmware_report(module_firmware)}
-    except Exception as e:
-        log(f"[fw] post-flash re-enumerate failed: {e}")
-        verify = {}
+    results = c.update_all(module_firmware, get_image, progress=progress, logfn=log)
 
-    for r in todo:
+    # update_all() already re-enumerated internally (both buses); pull a fresh
+    # report to log the DEFINITIVE per-module outcome to the durable audit log —
+    # the actually-confirmed installed version, not just "the flash call
+    # returned OK" (a flash can succeed but a module can still misreport).
+    verify = {v["uid"]: v for v in c.firmware_report(module_firmware)}
+    for r in results:
         v   = verify.get(r["uid"])
         now = v["installed"] if v else None
-        if now == r["required"]:
-            log(f"[fw] {r['type']}: verified {now}")
-            event(f"[FW]    {r['type']:<11} uid={r['uid']}  "
+        if r["updated"] and now == r["required"]:
+            event(f"[FW]    {r['type']:<11} uid={r['uid']} bus={r['bus']}  "
                   f"{r['installed']} -> {r['required']}  OK (verified {now})")
         else:
-            log(f"[fw] {r['type']}: post-flash version is {now}, expected {r['required']}")
-            event(f"[FW]    {r['type']:<11} uid={r['uid']}  "
-                  f"{r['installed']} -> {r['required']}  FAIL (reports {now})")
+            reason = r["error"] or ("reports %s" % now)
+            event(f"[FW]    {r['type']:<11} uid={r['uid']} bus={r['bus']}  "
+                  f"{r['installed']} -> {r['required']}  FAIL ({reason})")
 
 # ── Main flow ──────────────────────────────────────────────────────────────────
 
