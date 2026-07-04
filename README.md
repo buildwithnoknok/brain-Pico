@@ -34,6 +34,10 @@ it. Subsequent boots reconnect to WiFi and re-run the product directly.
 provisioning uses WiFi AP instead. Full process, test steps, and gotchas are documented in
 Confluence: *Software Development -> Pico W Provisioning — Process & Implementation*.
 
+**HTTP API reference:** the app ↔ brain endpoints (`/connect`, `/firmware/check`,
+`/roles/assign`, and the planned `/settings`) are documented in
+[docs/provisioning-http-api.md](docs/provisioning-http-api.md).
+
 ## Current versions & features (PoC v1)
 
 **`code.py` v0.10** — provisioning + launcher + module firmware OTA:
