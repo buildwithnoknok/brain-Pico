@@ -44,6 +44,34 @@ MODULES = {
 
 STATE_FILE = "noknok_state.json"   # enumerate()'s saved UID->address map
 
+# Every module type the Conductor can enumerate, as (label, Conductor attribute).
+#
+# ANY NEW MODULE TYPE MUST BE ADDED HERE, and kept in sync with noknok.py.
+# A missing type is NOT a harmless omission. On 23 Jul 2026 "display" was absent:
+# a display module sitting on the bus was therefore invisible to this script, the
+# only module it COULD see was a buzzer that was only present to lend its I2C
+# pull-ups, that buzzer looked like "the one module connected", and display
+# firmware was flashed straight into it. The missing entry did not just hide the
+# display — it made the "only one module on the bus" safety check pass falsely.
+KNOWN_TYPE_ATTRS = (
+    ("buzzer",     "buzzer"),
+    ("knob",       "knob"),
+    ("led_button", "ledbutton"),
+    ("display",    "display"),
+)
+
+
+def _bus_inventory(c):
+    """Every module the Conductor can currently see, as [(label, module)],
+    sorted by address. getattr with a default so an older noknok.py that lacks
+    a type list degrades to 'not found' rather than raising."""
+    out = []
+    for lbl, attr in KNOWN_TYPE_ATTRS:
+        for m in (getattr(c, attr, None) or []):
+            out.append((lbl, m))
+    out.sort(key=lambda pair: pair[1].address)
+    return out
+
 
 def _progress(done, total):
     print("    %3d%%   (%d / %d bytes)" % (100 * done // total, done, total))
@@ -93,30 +121,66 @@ def _flash_one(c, f):
         return True
     print("\nFlashing a %s with %s (%d bytes)." % (label, binfile, len(image)))
 
-    # ── 2. Find the module: blank (at 0x7E) or running an app? ────────────────
+    # ── 2. Survey the whole bus, THEN pick the flash target ───────────────────
+    # Always take a full inventory first and print it. Flashing the wrong module
+    # destroys a working one, so it is worth a couple of seconds to show exactly
+    # what is connected before anything is written.
+    bootloader_waiting = f.present()
+    c.enumerate()
+    inventory = _bus_inventory(c)
+
+    print("\n  Bus inventory:")
+    for lbl, m in inventory:
+        print("     0x%02X   %-11s UID %s"
+              % (m.address, lbl, getattr(m, "_uid_hex", "?")))
+    if bootloader_waiting:
+        print("     0x%02X   <blank / sitting in the bootloader>" % BL_ADDR)
+    if not inventory and not bootloader_waiting:
+        print("     (nothing found)")
+
     runtime_addr = None
-    if f.present():
-        # Bootloader is already waiting at 0x7E — this is the blank-board case.
-        print("  Bootloader present at 0x%02X — flashing directly." % BL_ADDR)
+
+    if bootloader_waiting:
+        # Blank-board case. A module in the bootloader has NO type identity —
+        # the bootloader is byte-identical on every CH32V003 module — so we
+        # cannot verify this really is a `label`. That check is on you.
+        print("\n  Flash target: the blank module at 0x%02X." % BL_ADDR)
+        if inventory:
+            print("  The %d module(s) listed above are NOT touched."
+                  % len(inventory))
+        print("  A blank module cannot report its type — make sure it really"
+              " is a %s." % label)
     else:
-        # No bootloader at 0x7E => a module is running an app. Enumerate to find
-        # it, then we'll send 0xB0 to drop it into the bootloader.
-        print("  No bootloader at 0x%02X — looking for a running module..." % BL_ADDR)
-        c.enumerate()
-        found = sorted(
-            [m for lst in (c.buzzer, c.knob, c.ledbutton) for m in lst],
-            key=lambda m: m.address,
-        )
-        if len(found) == 0:
-            print("  Nothing on the bus. Is exactly one module connected & powered?")
+        # A module is running an app. Now we CAN check the type, because
+        # enumeration told us what everything is.
+        if not inventory:
+            print("\n  Nothing on the bus. Is the module connected and powered?")
             return True
-        if len(found) > 1:
-            print("  %d modules on the bus — connect only ONE at a time for bench"
-                  " flashing." % len(found))
+
+        same_type = [m for lbl, m in inventory if lbl == label]
+
+        if len(same_type) == 0:
+            print("\n  REFUSING TO FLASH: no %s found on the bus." % label)
+            print("  Flashing %s firmware into any of the modules above would"
+                  " overwrite a working module." % label)
+            print("  If the %s is connected but missing from the list, this"
+                  " script may not know its type yet" % label)
+            print("  (see KNOWN_TYPE_ATTRS) — fix that rather than forcing it.")
             return True
-        runtime_addr = found[0].address
-        print("  Found a running module at 0x%02X — will send it into the"
-              " bootloader." % runtime_addr)
+
+        if len(same_type) > 1:
+            print("\n  %d %s modules on the bus — connect only one of a given"
+                  " type at a time." % (len(same_type), label))
+            return True
+
+        runtime_addr = same_type[0].address
+        print("\n  Flash target: %s at 0x%02X — sending it into the bootloader."
+              % (label, runtime_addr))
+        if len(inventory) > 1:
+            print("  The other %d module(s) above are left alone. (A buzzer or"
+                  " similar sitting on" % (len(inventory) - 1))
+            print("  the chain purely to provide I2C pull-ups is fine — it is"
+                  " matched by type, not by being alone.)")
 
     # ── 3. Flash ──────────────────────────────────────────────────────────────
     try:
