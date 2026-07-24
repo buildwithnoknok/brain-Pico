@@ -23,7 +23,16 @@
 #   display_firmware.bin     from module-I2C-1.42-display/firmware/bin/
 #
 # It also works on a module that is ALREADY running an app (it will send 0xB0 to
-# flip it into the bootloader first), so you can re-flash a module too.
+# flip it into the bootloader first), so you can re-flash a module too. In that
+# case the module's type IS known from enumeration, so the script matches the
+# flash target BY TYPE and will not touch a module of a different type.
+#
+# RECOVERY: if a module is running the WRONG firmware (e.g. a buzzer that got a
+# display image), it will never enumerate as its real type again, so the type
+# match can never succeed. For that case the script offers an explicit force
+# path — it shows you what the module currently reports as, and makes you type
+# the word FORCE. That is the supported way back; do not hand-drive
+# ModuleFlasher for it.
 
 import os
 import time
@@ -59,6 +68,54 @@ KNOWN_TYPE_ATTRS = (
     ("led_button", "ledbutton"),
     ("display",    "display"),
 )
+
+
+def _offer_force(inventory, label):
+    """Deliberate escape hatch for a module running the WRONG firmware.
+
+    This exists because refusing to flash, on its own, leaves you stuck: if a
+    buzzer accidentally receives a display image it will never again enumerate
+    as a buzzer, so the type check can never match and the normal path can never
+    recover it. (Exactly what happened on 23 Jul 2026.)
+
+    It overwrites a module that is working, just working as the wrong thing, so
+    it deliberately does NOT accept a casual y/n. You must name the address and
+    then type the word FORCE, having been shown what that module currently is.
+
+    Returns the runtime address to flash, or None to abort.
+    """
+    print("\n  RECOVERY OPTION")
+    print("  If one of the modules above is running the WRONG firmware, you can")
+    print("  force %s firmware onto it. This OVERWRITES it." % label)
+    print("  Enter its address in hex (e.g. 08), or press Enter to abort.")
+
+    ans = input("  Force-flash address: ").strip().lower()
+    if not ans:
+        print("  Aborted — nothing written.")
+        return None
+
+    try:
+        addr = int(ans, 16)
+    except ValueError:
+        print("  '%s' is not a hex address — aborted." % ans)
+        return None
+
+    match = [(lbl, m) for lbl, m in inventory if m.address == addr]
+    if not match:
+        print("  0x%02X is not on the bus — aborted." % addr)
+        return None
+
+    cur_label, m = match[0]
+    print("\n  0x%02X currently reports as: %s" % (addr, cur_label))
+    print("  UID: %s" % getattr(m, "_uid_hex", "?"))
+    print("  You are about to OVERWRITE it with %s firmware." % label)
+    if input("  Type FORCE (capitals) to confirm: ").strip() != "FORCE":
+        print("  Aborted — nothing written.")
+        return None
+
+    print("  Forcing: %s at 0x%02X will be re-flashed as %s."
+          % (cur_label, addr, label))
+    return addr
 
 
 def _bus_inventory(c):
@@ -160,27 +217,33 @@ def _flash_one(c, f):
         same_type = [m for lbl, m in inventory if lbl == label]
 
         if len(same_type) == 0:
-            print("\n  REFUSING TO FLASH: no %s found on the bus." % label)
-            print("  Flashing %s firmware into any of the modules above would"
-                  " overwrite a working module." % label)
-            print("  If the %s is connected but missing from the list, this"
-                  " script may not know its type yet" % label)
-            print("  (see KNOWN_TYPE_ATTRS) — fix that rather than forcing it.")
-            return True
+            print("\n  NOT FLASHING BY DEFAULT: no %s found on the bus." % label)
+            print("  Writing %s firmware into any module above would overwrite a"
+                  " working one." % label)
+            print("  If the %s IS connected but missing from the list, this script"
+                  " may not know" % label)
+            print("  its type yet (see KNOWN_TYPE_ATTRS) — fix that rather than"
+                  " forcing.")
+            runtime_addr = _offer_force(inventory, label)
+            if runtime_addr is None:
+                return True
 
-        if len(same_type) > 1:
+        elif len(same_type) > 1:
             print("\n  %d %s modules on the bus — connect only one of a given"
                   " type at a time." % (len(same_type), label))
             return True
 
-        runtime_addr = same_type[0].address
-        print("\n  Flash target: %s at 0x%02X — sending it into the bootloader."
-              % (label, runtime_addr))
-        if len(inventory) > 1:
-            print("  The other %d module(s) above are left alone. (A buzzer or"
-                  " similar sitting on" % (len(inventory) - 1))
-            print("  the chain purely to provide I2C pull-ups is fine — it is"
-                  " matched by type, not by being alone.)")
+        else:
+            # Exactly one module of the chosen type — the normal, safe path.
+            runtime_addr = same_type[0].address
+            print("\n  Flash target: %s at 0x%02X — sending it into the"
+                  " bootloader." % (label, runtime_addr))
+            if len(inventory) > 1:
+                print("  The other %d module(s) above are left alone. (A buzzer"
+                      " or similar sitting" % (len(inventory) - 1))
+                print("  on the chain purely to provide I2C pull-ups is fine —"
+                      " the target is matched")
+                print("  by type, not by being the only thing connected.)")
 
     # ── 3. Flash ──────────────────────────────────────────────────────────────
     try:
