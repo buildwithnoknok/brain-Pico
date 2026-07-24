@@ -211,7 +211,21 @@ def _flash_one(c, f):
         # A module is running an app. Now we CAN check the type, because
         # enumeration told us what everything is.
         if not inventory:
-            print("\n  Nothing on the bus. Is the module connected and powered?")
+            print("\n  Nothing on the bus.")
+            print("  Checks, in the order worth trying:")
+            print("   1. Is the module connected and powered?")
+            print("   2. Has it ALREADY been enumerated in an earlier session?")
+            print("      An assigned module stops answering at 0x%02X, so if the"
+                  " saved state" % 0x7F)
+            print("      file has been lost it becomes invisible. Unplug and"
+                  " replug the module")
+            print("      to make it re-enumerate, then try again. (A module that"
+                  " is visibly")
+            print("      running but not listed is almost always this.)")
+            print("   3. Are there I2C pull-ups on the bus? Most modules no"
+                  " longer carry them;")
+            print("      until the PicoHub exists you need one that does (a"
+                  " buzzer will do).")
             return True
 
         same_type = [m for lbl, m in inventory if lbl == label]
@@ -281,7 +295,18 @@ def main():
     print("Connect ONE module at a time (blank or running). Pick its type,")
     print("it gets flashed over I2C, then swap in the next module.")
 
-    _wipe_state()
+    # NOTE: deliberately NOT wiping the state file here.
+    #
+    # It used to be wiped at startup so a stale saved address could not confuse
+    # the post-flash confirmation. But that made already-assigned modules
+    # INVISIBLE: once a module has been given a runtime address it no longer
+    # answers at 0x7F, so enumerate() can only find it by restoring it from
+    # noknok_state.json — and we had just deleted that file. The symptom was a
+    # module sitting there visibly running while the bus inventory said
+    # "nothing found".
+    #
+    # The confirm step still wipes state before re-enumerating (see _flash_one),
+    # which is where staleness actually matters.
     c = Conductor()
     f = ModuleFlasher(c.i2c)
 
