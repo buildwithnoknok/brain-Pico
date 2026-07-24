@@ -20,6 +20,7 @@
 #   buzzer_firmware.bin      from module-I2C-buzzer/firmware/bin/
 #   knob_firmware.bin        from module-I2C-knob/firmware/bin/
 #   keyboard_firmware.bin    from module-I2C-ledbutton/firmware/bin/  (LED button)
+#   display_firmware.bin     from module-I2C-1.42-display/firmware/bin/
 #
 # It also works on a module that is ALREADY running an app (it will send 0xB0 to
 # flip it into the bootloader first), so you can re-flash a module too.
@@ -38,6 +39,7 @@ MODULES = {
     "1": ("buzzer",     "buzzer_firmware.bin",   "buzzer"),
     "2": ("knob",       "knob_firmware.bin",     "knob"),
     "3": ("led_button", "keyboard_firmware.bin", "ledbutton"),
+    "4": ("display",    "display_firmware.bin",  "display"),
 }
 
 STATE_FILE = "noknok_state.json"   # enumerate()'s saved UID->address map
@@ -130,7 +132,11 @@ def _flash_one(c, f):
     time.sleep(0.6)   # let the fresh app advertise at 0x7F
     _wipe_state()     # ignore any stale saved address before re-enumerating
     c.enumerate()
-    came_up = getattr(c, list_attr)
+    # getattr with a default: a newly-added module type may not have a Conductor
+    # list yet (the display does not, until noknok.py learns type 0x05). The
+    # flash itself is already verified by CRC at this point — this step only
+    # confirms the module re-enumerates as the expected type.
+    came_up = getattr(c, list_attr, None) or []
     if came_up:
         m = came_up[-1]
         print("  CONFIRMED: %s live at 0x%02X  UID: %s"
