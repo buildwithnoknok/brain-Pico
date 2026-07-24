@@ -1,4 +1,4 @@
-# noknok.py  v1.5
+# noknok.py  v1.6
 # CircuitPython library for the noknok modular ecosystem
 # Raspberry Pi Pico — I2C master ("Conductor")
 #
@@ -21,6 +21,10 @@
 #             LED buttons go amber (waiting) / green (assigned), a buzzer "ready"
 #             beep when a choice is requested, and a green flash + confirm beep on
 #             the module they pick. Best-effort; never breaks detection.
+# v1.6 (Sue): noknok Display support — TYPE_DISPLAY (0x05) threaded through
+#             enumeration / state / roles, plus the NoknokDisplay driver, RGB565
+#             colour helpers and a BUILT-IN 8x16 font, so text at ANY pixel size
+#             works with no extra font files on the Pico.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -30,6 +34,7 @@
 #   c.role["volume_knob"].value               # access by role name
 #   c.buzzer[0].play(440, 500)                # or by type + index
 #   c.ledbutton[0].set_color(255, 0, 0)       # red LED on LED button module
+#   c.display[0].text("Hello", size=24)       # text on the display module
 
 import busio
 import board
@@ -74,6 +79,7 @@ class Conductor:
     TYPE_BUZZER    = 0x01
     TYPE_KNOB      = 0x02
     TYPE_LEDBUTTON = 0x03
+    TYPE_DISPLAY   = 0x05
 
     # Standard system commands — reserved ecosystem range 0xB0-0xBF, honoured by
     # every noknok module (see DEV-1 / the bootloader doc). 0xB0 = ENTER_BOOTLOADER.
@@ -87,6 +93,7 @@ class Conductor:
         self.buzzer    = []    # NoknokBuzzer instances, indexed by discovery order
         self.knob      = []    # NoknokKnob instances
         self.ledbutton = []    # NoknokLedButton instances
+        self.display   = []    # NoknokDisplay instances
         self.leds      = []    # NoknokLEDs (USB) instances, populated by enumerate_usb()
         self.role      = {}    # role_name → module object, populated by load_roles()
         self._registry = {}    # identity (I2C uid_hex / USB serial) → module object
@@ -169,7 +176,8 @@ class Conductor:
 
     # module list attribute -> manifest module_firmware{} key
     # I2C modules carry a runtime address; USB modules are identified by serial.
-    _FW_GROUPS     = (("buzzer", "buzzer"), ("knob", "knob"), ("ledbutton", "led_button"))
+    _FW_GROUPS     = (("buzzer", "buzzer"), ("knob", "knob"), ("ledbutton", "led_button"),
+                      ("display", "display"))
     _USB_FW_GROUPS = (("leds", "usb_leds"),)
 
     @staticmethod
@@ -339,6 +347,7 @@ class Conductor:
         self.buzzer    = []
         self.knob      = []
         self.ledbutton = []
+        self.display   = []
         self._registry = {}
         self.role      = {}
 
@@ -404,6 +413,10 @@ class Conductor:
                 module    = NoknokLedButton(self.i2c, address=addr)
                 type_name = "noknokledbutton"
                 self.ledbutton.append(module)
+            elif module_type == self.TYPE_DISPLAY:
+                module    = NoknokDisplay(self.i2c, address=addr)
+                type_name = "noknokdisplay"
+                self.display.append(module)
             else:
                 module    = None
                 type_name = f"unknown(0x{module_type:02X})"
@@ -422,7 +435,8 @@ class Conductor:
         self._save_state()
 
         # ── Summary ───────────────────────────────────────────────────────────
-        total = sum([len(self.buzzer), len(self.knob), len(self.ledbutton)])
+        total = sum([len(self.buzzer), len(self.knob), len(self.ledbutton),
+                     len(self.display)])
         if new_found == 0 and restored > 0:
             print(f"No new modules. {restored} module(s) already assigned:")
             for uid, m in self._registry.items():
@@ -494,6 +508,8 @@ class Conductor:
                     t = self.TYPE_KNOB
                 elif isinstance(module, NoknokLedButton):
                     t = self.TYPE_LEDBUTTON
+                elif isinstance(module, NoknokDisplay):
+                    t = self.TYPE_DISPLAY
                 else:
                     t = 0
                 data[uid_hex] = {"address": module.address, "type": t}
@@ -534,6 +550,10 @@ class Conductor:
                 module = NoknokLedButton(self.i2c, address=addr)
                 module._uid_hex = uid_hex
                 self.ledbutton.append(module)
+            elif type_code == self.TYPE_DISPLAY:
+                module = NoknokDisplay(self.i2c, address=addr)
+                module._uid_hex = uid_hex
+                self.display.append(module)
             else:
                 module = None
 
@@ -649,6 +669,11 @@ class Conductor:
                 module.set_color(40, 40, 40)
                 time.sleep(1.0)
                 module.led_off()
+            elif isinstance(module, NoknokDisplay):
+                print("  → Lighting up the display so you can identify it...")
+                module.role_cue(True)
+                time.sleep(1.5)
+                module.role_cue(False)
 
             role = input("  Role name (or Enter to skip): ").strip()
 
@@ -691,6 +716,7 @@ class Conductor:
         "led_button": "ledbutton",
         "buzzer":     "buzzer",
         "leds":       "leds",
+        "display":    "display",
     }
 
     # Role-assignment method per module type: "input" = the customer interacts
@@ -703,6 +729,7 @@ class Conductor:
         "led_button": "input",
         "buzzer":     "output",
         "leds":       "output",
+        "display":    "output",   # a display can't be "pressed" — cue-and-confirm
     }
 
     def _modules_for_type(self, module_type):
@@ -1374,6 +1401,805 @@ class LedButtonStatus:
                 f"press_event={self.press_event}, "
                 f"release_event={self.release_event}, "
                 f"count={self.count})")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# COLOURS — shared by the display driver (and anything else that needs RGB565)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Everywhere a colour is accepted you may pass EITHER form — whichever you find
+# easier to read:
+#     0xFF8800            a 24-bit 0xRRGGBB int (same as CSS / HTML hex)
+#     (255, 136, 0)       an (r, g, b) tuple, 0-255 each
+# rgb565() converts to the 16-bit format the panel actually wants.
+
+# Named colours (0xRRGGBB) — import them: from noknok import WHITE, RED, ...
+BLACK      = 0x000000
+WHITE      = 0xFFFFFF
+RED        = 0xFF0000
+GREEN      = 0x00FF00
+BLUE       = 0x0000FF
+YELLOW     = 0xFFFF00
+CYAN       = 0x00FFFF
+MAGENTA    = 0xFF00FF
+ORANGE     = 0xFF8000
+PURPLE     = 0x8000FF
+PINK       = 0xFF4080
+LIME       = 0x80FF00
+GREY       = 0x808080
+GRAY       = GREY          # both spellings, so neither one is "wrong"
+DARK_GREY  = 0x303030
+DARK_GRAY  = DARK_GREY
+NOKNOK     = 0x0097FF      # noknok brand blue
+
+# Handy lookup so a UI (or the test script) can offer colours by name.
+COLORS = {
+    "black": BLACK, "white": WHITE, "red": RED, "green": GREEN, "blue": BLUE,
+    "yellow": YELLOW, "cyan": CYAN, "magenta": MAGENTA, "orange": ORANGE,
+    "purple": PURPLE, "pink": PINK, "lime": LIME, "grey": GREY, "gray": GREY,
+    "darkgrey": DARK_GREY, "darkgray": DARK_GREY, "noknok": NOKNOK,
+}
+
+
+def rgb565(color):
+    """
+    Convert a colour to the panel's 16-bit RGB565 value.
+
+    Accepts:
+        0xRRGGBB        24-bit int, e.g. 0xFF8800
+        (r, g, b)       tuple/list, 0-255 each
+        "red"           a name from COLORS
+        already-565     ints are treated as 0xRRGGBB, so if you already have a
+                        565 value pass it through rgb565_raw() instead.
+    """
+    if isinstance(color, str):
+        c = COLORS.get(color.strip().lower().replace(" ", "").replace("_", ""))
+        if c is None:
+            raise ValueError("unknown colour name: %r" % color)
+        color = c
+    if isinstance(color, (tuple, list)):
+        r, g, b = color[0], color[1], color[2]
+    else:
+        color = int(color)
+        r = (color >> 16) & 0xFF
+        g = (color >> 8) & 0xFF
+        b = color & 0xFF
+    r = 0 if r < 0 else (255 if r > 255 else int(r))
+    g = 0 if g < 0 else (255 if g > 255 else int(g))
+    b = 0 if b < 0 else (255 if b > 255 else int(b))
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+
+
+def rgb565_raw(value):
+    """Pass a colour through that is ALREADY a 16-bit RGB565 value."""
+    return int(value) & 0xFFFF
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BUILT-IN 8x16 FONT
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# A complete 8x16 pixel font (ASCII 32-126 + Latin-1 160-255, so umlauts and
+# accents work) shipped INSIDE this library as base64. That is deliberate: the
+# display module only stores a couple of small fonts in its own tiny flash, so
+# when you ask for a text size the module can't do natively, the Pico scales
+# THIS font and sends the finished pixels. No font file ever has to be copied
+# onto the Pico — text at any pixel size just works, out of the box.
+#
+# Layout: 16 bytes per glyph, one byte per pixel row, MSB = leftmost pixel.
+
+_FONT8X16_B64 = (
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAYGBgYGBgYABgYAAAAAAAAfn5+AAAAAAAAAAAAAAAAADY2"
+    "Nv88LP9sbGwAAAAAAAw+aPh4eB4fHxb8MDAAAAAA897e/BgYP39vzwAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAYGBgAAAAAAAAAAAAAAAAGDBg4MDAwMDAwOBgMAAAAIDAYHAwMDAwMDBwYMAAA"
+    "AAAYfjw8fhgAAAAAAAAAAAAAAAAAGBgY/xgYGAAAAAAAAAAAAAAAAAAAGBwcGAAAAAAAAAAA"
+    "AAA+AAAAAAAAAAAAAAAAAAAAAAA4OAAAAAAAAAYGDgwMGBgwMDBgYAAAAAA8ZmfH3/vj5mY8"
+    "AAAAAAAAGHhYGBgYGBgYfwAAAAAAADxmBgYGDBw4cH8AAAAAAAB8BgYOPAYGBgZ8AAAAAAAA"
+    "Dh4eNmZmxv8GBgAAAAAAAH5gYGB8BgYGDnwAAAAAAAAeMGBgfuZjY2Y8AAAAAAAA/wcGDgwM"
+    "GBgwMAAAAAAAAD5mZnY8fmfnZjwAAAAAAAA8ZsbHZ38GBgx4AAAAAAAAAAAAGBgAAAAYGAAA"
+    "AAAAAAAAABgYAAAAGBwcGAAAAAAAAAYMOHBwOAwGAAAAAAAAAAAAAH8AfwAAAAAAAAAAAAAA"
+    "YDgcDg4cOGAAAAAAAAA4DAYGBjwwADg4AAAAAAAAPndjw9///+///sDmAAAAABw8PD5mZmb/"
+    "w8MAAAAAAAB8ZmZmfGZnZ2Z8AAAAAAAAPnJg4MDA4GByPgAAAAAAAPzGx8PDw8PHzvwAAAAA"
+    "AAB+YGBgfmBgYGB+AAAAAAAAfmBgYGB+YGBgYAAAAAAAAD5zYMDAz8Pjcz8AAAAAAADDw8PD"
+    "/8PDw8PDAAAAAAAAfhgYGBgYGBgYfgAAAAAAAH4ODg4ODg4OTHgAAAAAAABnbmx4cHB4bGZn"
+    "AAAAAAAAYGBgYGBgYGBgfwAAAAAAAOfn5///29vDw8MAAAAAAADn9/f3///v7+/nAAAAAAAA"
+    "PGbjw8PDw8NmPAAAAAAAAHxmZ2dmfGBgYGAAAAAAAAA8ZuPDw8PD52Y8GB0AAAAAfGZmZnxs"
+    "bGZmZwAAAAAAAD5g4GB4HgYHBvwAAAAAAAD/GBgYGBgYGBgYAAAAAAAAw8PDw8PDw+dmPAAA"
+    "AAAAAMPD42ZmZjw8PBgAAAAAAADDw8Pb29///+dnAAAAAAAA42Z+PBw8PH5mxwAAAAAAAMPn"
+    "Zj48GBgYGBgAAAAAAAB/Bg4MGBgwMGB/AAAAAAA8MDAwMDAwMDAwMDAwAAAAAGBgMDAYGAwM"
+    "DAYGAwAAADwMDAwMDAwMDAwMDAwAAAAAGDw8ZmYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AABwGAAAAAAAAAAAAAAAAAAAAAAAPGYGfmZmfgAAAAAAAGBgYH52Y2NnZnwAAAAAAAAAAAA+"
+    "cGBgYHA+AAAAAAAABgYGPmbmxuZufgAAAAAAAAAAADxmZ//gYD4AAAAAAAAfGBgY/hgYGBgY"
+    "AAAAAAAAAAAAP2ZmZnxgfuPnAAAAAGBgYH52ZmZmZmYAAAAAAAAYGAB4GBgYGBh/AAAAAAAA"
+    "DAwAfAwMDAwMDAxMAAAAAGBgYGdseHh8bmcAAAAAAAB4GBgYGBgYGBh/AAAAAAAAAAAA///b"
+    "29vb2wAAAAAAAAAAAH52ZmZmZmYAAAAAAAAAAAA8ZsPDw2Y8AAAAAAAAAAAAfnZjY2dmfGBg"
+    "AAAAAAAAAD5m5sbmbn4GBgAAAAAAAAB+d2NgYGBgAAAAAAAAAAAAPmBwPAYGfAAAAAAAAAAw"
+    "MP8wMDAwOB8AAAAAAAAAAABmZmZmZm5+AAAAAAAAAAAAw2ZmZjw8GAAAAAAAAAAAAMPD29v/"
+    "fmYAAAAAAAAAAADndjwYPGbnAAAAAAAAAAAAw2ZmbDw8GBgwAAAAAAAAAH4GDBgwMH8AAAAA"
+    "AA4YGBgYGGA4GBgYGBgAABgYGBgYGBgYGBgYGBgYAAAAcBgYGBgcBhwYGBgYGAAAAAAAAAAA"
+    "c9vOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgYABgYGBgYGAAAAAwMPnxsbGh4eD4Y"
+    "GBgAAAAAHjIwcHD+cHBw/gAAAAAAAADnfmZmZmZ+5wAAAAAAAADjZnY8PBh+GH4YAAAAABgY"
+    "GBgYGAAAABgYGBgYAAAAAD5wcDh8Zmc+HAYGfAAAAAB+fgAAAAAAAAAAAAAAAAAAPGbD//Pz"
+    "/8NmPAAAAAAAADwMPGw8AH4AAAAAAAAAAAAAAAAzNmxsNjMAAAAAAAAAAAAAAAAA/gYGAAAA"
+    "AAAAAAAAAAAAAD4AAAAAAAAAAAA8Zv//ZjwAAAAAAAAAAAAAPAAAAAAAAAAAAAAAAAAAADxm"
+    "ZmY8AAAAAAAAAAAAAAAAGBgY/xgYGAD/AAAAAAAAPCwMHDh+AAAAAAAAAAAAADwMPA4MPAAA"
+    "AAAAAAAAAAAOHAAAAAAAAAAAAAAAAAAAAAAAZmZmZmZuf2BgAAAAAD9///9/PwcHBwZmPAAA"
+    "AAAAAAAAABwYAAAAAAAAAAAAAAAAAAAAAAAAABgYAAAAADh4GBgYfgAAAAAAAAAAAAA8ZmZm"
+    "PAB+AAAAAAAAAAAAAAAA7Gw2Nm7sAAAAAAAAAGPmZmwYGDdvb8MAAAAAAABj5mZsGBg/Y2bP"
+    "AAAAAAAA4zb2PPgYN29vwwAAAAAAAAAAABwcAAw8YGBgMABwGAAcPDw+ZmZm/8PDAAAADhgA"
+    "HDw8PmZmZv/DwwAAABh8ABw8PD5mZmb/w8MAAAB+bgAcPDw+ZmZm/8PDAAAAbm4AHDw8PmZm"
+    "Zv/DwwAAADw8HBw8PD5mZmb/w8MAAAAAAAAfHDw8b2xs/MzPAAAAAAAAPnNg4MDA4GBzPhgY"
+    "AHAYAH5gYGB+YGBgYH4AAAAOGAB+YGBgfmBgYGB+AAAAGHwAfmBgYH5gYGBgfgAAAG5uAH5g"
+    "YGB+YGBgYH4AAABwGAB+GBgYGBgYGBh+AAAADhgAfhgYGBgYGBgYfgAAABh8AH4YGBgYGBgY"
+    "GH4AAABubgB+GBgYGBgYGBh+AAAAAAAAfGZnY/NjY2ZufAAAAH5uAOf39/f//+/v7+cAAABw"
+    "GAA8ZuPDw8PDw2Y8AAAADhgAPGbjw8PDw8NmPAAAABh8ADxm48PDw8PDZjwAAAB+bgA8ZuPD"
+    "w8PDw2Y8AAAAbm4APGbjw8PDw8NmPAAAAAAAAAAAAGZ+PBw+ZwAAAAAABgQ8bu/L29vb93Y8"
+    "MGAAcBgAw8PDw8PDw+dmPAAAAA4YAMPDw8PDw8PnZjwAAAAYfADDw8PDw8PD52Y8AAAAbm4A"
+    "w8PDw8PDw+dmPAAAAA4YAMPnZj48GBgYGBgAAAAAAABgfGZnY2dmfGBgAAAAAAAAPGZmbHh8"
+    "bmdnfgAAAAAAAHAYADxmBn5mZn4AAAAAAAAOHAA8ZgZ+ZmZ+AAAAAAAAGHwAPGYGfmZmfgAA"
+    "AAAAAH5uADxmBn5mZn4AAAAAAAB+fgA8ZgZ+ZmZ+AAAAAAA8PDwAPGYGfmZmfgAAAAAAAAAA"
+    "AH7bG//Y2P8AAAAAAAAAAAA+cGBgYHA+GBgAAAAAcBgAPGZn/+BgPgAAAAAAAA4cADxmZ//g"
+    "YD4AAAAAAAAYfAA8Zmf/4GA+AAAAAAAAfn4APGZn/+BgPgAAAAAAAHAYAHgYGBgYGH8AAAAA"
+    "AAAOHAB4GBgYGBh/AAAAAAAAGHwAeBgYGBgYfwAAAAAAAH5+AHgYGBgYGH8AAAAAAAA+fAw+"
+    "ZubH5mY8AAAAAAAAfm4AfnZmZmZmZgAAAAAAAHAYADxmw8PDZjwAAAAAAAAOHAA8ZsPDw2Y8"
+    "AAAAAAAAGHwAPGbDw8NmPAAAAAAAAH5uADxmw8PDZjwAAAAAAAB+fgA8ZsPDw2Y8AAAAAAAA"
+    "AAAAGBgA/wAYGAAAAAAAAAAGDDxu29vbdjwwIAAAAABwGABmZmZmZm5+AAAAAAAADhwAZmZm"
+    "ZmZufgAAAAAAABh8AGZmZmZmbn4AAAAAAAB+fgBmZmZmZm5+AAAAAAAADhwAw2ZmbDw8GBgw"
+    "AAAAAGBgYH52Y2NnZnxgYAAAAAB+fgDDZmZsPDwYGDA="
+)
+
+_FONT8X16 = None          # decoded lazily on first use, then cached
+
+
+def _b64decode(s):
+    """Decode base64 -> bytes. Uses binascii when available (every normal
+    CircuitPython build has it) and falls back to a tiny pure-Python decoder."""
+    try:
+        import binascii
+        return binascii.a2b_base64(s)
+    except Exception:
+        pass
+    alphabet = ("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                "abcdefghijklmnopqrstuvwxyz0123456789+/")
+    lut = {}
+    for i, ch in enumerate(alphabet):
+        lut[ch] = i
+    out, acc, bits = bytearray(), 0, 0
+    for ch in s:
+        if ch == "=":
+            break
+        v = lut.get(ch)
+        if v is None:
+            continue
+        acc = (acc << 6) | v
+        bits += 6
+        if bits >= 8:
+            bits -= 8
+            out.append((acc >> bits) & 0xFF)
+    return bytes(out)
+
+
+def _font8x16():
+    """Return the built-in 8x16 font as bytes (decoded once, then cached)."""
+    global _FONT8X16
+    if _FONT8X16 is None:
+        _FONT8X16 = _b64decode(_FONT8X16_B64)
+    return _FONT8X16
+
+
+def _glyph_index(ch):
+    """Map a character to its slot in the built-in font.
+    ASCII 32-126 -> 0..94, Latin-1 160-255 -> 95..190, anything else -> '?'."""
+    c = ord(ch)
+    if 32 <= c <= 126:
+        return c - 32
+    if 160 <= c <= 255:
+        return 95 + (c - 160)
+    return ord("?") - 32
+
+
+class BdfFont:
+    """
+    Minimal BDF (bitmap font) reader, so a maker can use their OWN font:
+
+        from noknok import BdfFont
+        f = BdfFont("/fonts/myfont.bdf")
+        d.text("Hello", size=28, font=f)
+
+    Only what we need is parsed: per-glyph bitmaps keyed by character code.
+    Glyphs are normalised into a fixed cell (the font's bounding box), then the
+    display driver scales that cell to whatever pixel height you asked for.
+    A .bdf PATH may also be passed straight to text(font="/fonts/myfont.bdf").
+    """
+
+    def __init__(self, path):
+        self.path   = path
+        self.width  = 8
+        self.height = 16
+        self.glyphs = {}      # char code -> list of ints, one per row (MSB left)
+        self._parse(path)
+
+    def _parse(self, path):
+        code, bbw, bbh, bbx, bby = None, 0, 0, 0, 0
+        rows, in_bitmap = [], False
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if in_bitmap:
+                    if line.startswith("ENDCHAR"):
+                        in_bitmap = False
+                        if code is not None:
+                            self.glyphs[code] = self._place(rows, bbw, bbh, bbx, bby)
+                        rows, code = [], None
+                    else:
+                        try:
+                            rows.append(int(line, 16))
+                        except ValueError:
+                            pass
+                    continue
+                if line.startswith("FONTBOUNDINGBOX"):
+                    p = line.split()
+                    self.width, self.height = int(p[1]), int(p[2])
+                    self._base_x, self._base_y = int(p[3]), int(p[4])
+                elif line.startswith("ENCODING"):
+                    code = int(line.split()[1])
+                elif line.startswith("BBX"):
+                    p = line.split()
+                    bbw, bbh, bbx, bby = int(p[1]), int(p[2]), int(p[3]), int(p[4])
+                elif line.startswith("BITMAP"):
+                    in_bitmap, rows = True, []
+        if not self.glyphs:
+            raise ValueError("no glyphs found in %s — is it a real .bdf?" % path)
+
+    def _place(self, rows, bbw, bbh, bbx, bby):
+        """Drop a glyph's own bounding box into the font's full cell, so every
+        glyph ends up the same width/height and scaling stays simple."""
+        cell = [0] * self.height
+        src_bytes = (bbw + 7) // 8
+        # BDF rows are top-to-bottom; the glyph sits bby pixels above the baseline.
+        top = self.height + getattr(self, "_base_y", 0) - bby - bbh
+        for i, raw in enumerate(rows[:bbh]):
+            y = top + i
+            if y < 0 or y >= self.height:
+                continue
+            # left-align the glyph row inside the cell, honouring its x offset
+            shift = (src_bytes * 8) - bbw
+            val   = (raw >> shift) if shift > 0 else raw
+            xoff  = bbx - getattr(self, "_base_x", 0)
+            row   = 0
+            for bit in range(bbw):
+                if val & (1 << (bbw - 1 - bit)):
+                    px = xoff + bit
+                    if 0 <= px < self.width:
+                        row |= 1 << (self.width - 1 - px)
+            cell[y] = row
+        return cell
+
+    def rows_for(self, ch):
+        """Rows (ints, MSB = leftmost) for a character, or the blank cell."""
+        g = self.glyphs.get(ord(ch))
+        if g is None:
+            g = self.glyphs.get(ord("?"))
+        return g or [0] * self.height
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+class NoknokDisplay:
+    """
+    Driver for the noknok Display Module (noknokdisplay, MODULE_TYPE 0x05).
+
+    The module is a little GPU: the Pico sends drawing COMMANDS over I2C and the
+    module's CH32V003 paints the panel. There is no frame buffer anywhere — the
+    module draws straight into the panel — so anything you draw stays until you
+    draw over it.
+
+    Normally obtained via Conductor.enumerate():
+        c = Conductor()
+        c.enumerate()
+        d = c.display[0]              # by discovery index
+        d = c.role["screen"]          # by role name (after load_roles)
+
+    Everyday use:
+        d.clear(BLACK)                        # wipe the screen
+        d.text("Hello", size=16)              # text, any pixel size you like
+        d.text("22.5 C", size=32, x=4, y=40, color=YELLOW)
+        d.fill_rect(0, 0, 80, 10, RED)        # a bar
+        d.backlight(0.8)                      # 80 % brightness
+        d.off() / d.on() / d.sleep()
+        print(d.info())                       # 80x160, RGB565, ...
+
+    About `size`
+    ------------
+    `size` is the PIXEL HEIGHT of the text and it is ALWAYS exact — ask for 27
+    and you get 27 pixels tall. Behind the scenes the library picks the fastest
+    of three routes automatically; you never have to think about it:
+      1. sizes the module can draw itself (8, 16, 24, 32, 48, 64) -> one small
+         command, the module renders it (~2 ms).
+      2. any other size -> the Pico scales its BUILT-IN 8x16 font and sends the
+         finished pixels as a 1-bit-per-pixel blit. No font file needed.
+      3. font="/fonts/mine.bdf" -> the Pico uses YOUR font, same blit path.
+
+    About backgrounds
+    -----------------
+    By default text is drawn on an OPAQUE box in the last colour you cleared to.
+    That is what lets a clock tick over cleanly on a panel with no frame buffer:
+    the old digits are covered as the new ones are drawn, so there is no flicker.
+    Pass bg=None for transparent text, or bg=<colour> to pick the box colour.
+
+    Colours
+    -------
+    Anywhere a colour is wanted, pass 0xRRGGBB, an (r, g, b) tuple or a name:
+        d.text("Hi", color=0xFF8800)
+        d.text("Hi", color=(255, 136, 0))
+        d.text("Hi", color="orange")
+    """
+
+    ROLE_SELECT = "output"   # you can't press a screen — the app cues it instead
+
+    # ── Command bytes (see the firmware header in module-I2C-1.42-display) ────
+    _CMD_CLEAR         = 0x01   # [0x01, colHi, colLo]
+    _CMD_FILL_RECT     = 0x02   # [0x02, x, y, w, h, colHi, colLo]
+    _CMD_DRAW_TEXT     = 0x03   # [0x03, x, y, style, fgHi, fgLo, bgHi, bgLo, chars...]
+    _CMD_DRAW_ICON     = 0x04   # [0x04, x, y, iconId, scale, fgHi, fgLo, bgHi, bgLo]
+    _CMD_BLIT_BEGIN    = 0x05   # [0x05, x, y, w, h, fgHi, fgLo, bgHi, bgLo, flags]
+    _CMD_BLIT_DATA     = 0x06   # [0x06, <=64 bytes of 1bpp rows]
+    _CMD_SET_BACKLIGHT = 0x10   # [0x10, level 0-255]
+    _CMD_DISPLAY       = 0x12   # [0x12, 0=off 1=on 2=sleep]
+    _CMD_GET_INFO      = 0x15   # [0x15] then read 5 bytes
+
+    # The module's I2C receive buffer is 72 bytes, so one command must fit in it.
+    _MAX_BLIT_CHUNK = 64
+    _MAX_TEXT_CHARS = 60
+
+    # Module-side fonts: index -> (cell width, cell height). Index 0 = the small
+    # 6x8 font, index 1 = the 8x16 font. Scale is an integer 1-4.
+    _MODULE_FONTS = {0: (6, 8), 1: (8, 16)}
+
+    # Pixel heights the MODULE can render on its own: height -> (font index, scale).
+    # Anything not in here is rendered on the Pico and blitted instead.
+    _NATIVE_SIZES = {
+        8:  (0, 1),
+        16: (1, 1),
+        24: (0, 3),
+        32: (1, 2),
+        48: (1, 3),
+        64: (1, 4),
+    }
+
+    # Used only if GET_INFO never answers (very old firmware / bus trouble), so
+    # nothing crashes. Real geometry always comes from the module itself.
+    _FALLBACK_W = 80
+    _FALLBACK_H = 160
+
+    def __init__(self, i2c, address=0x08):
+        self.i2c        = i2c
+        self.address    = address
+        self._uid_hex   = None    # set by Conductor.enumerate()
+        self._info      = None    # cached DisplayInfo from GET_INFO
+        self._bg        = BLACK   # last clear() colour = default text background
+        self._backlight = None    # last level we set (0-255), for role_cue()
+        self.auto_wait  = True    # wait for the module to finish before each draw
+        # Filled in by Conductor.enumerate() via GET_VERSION; safe defaults here
+        # so a hand-built instance never raises AttributeError.
+        self.protocol_version = None
+        self.firmware_version = None
+
+    # ── Low-level I2C (same try_lock/OSError pattern as the other drivers) ────
+
+    def _send(self, data):
+        """Send bytes to the module. Returns True on success, False on I2C error."""
+        while not self.i2c.try_lock():
+            pass
+        try:
+            self.i2c.writeto(self.address, bytes(data))
+            return True
+        except OSError:
+            return False
+        finally:
+            self.i2c.unlock()
+
+    def _read_raw(self, n=2):
+        """Read n bytes from the module. Returns bytearray or None on I2C error."""
+        buf = bytearray(n)
+        while not self.i2c.try_lock():
+            pass
+        try:
+            self.i2c.readfrom_into(self.address, buf)
+            return buf
+        except OSError:
+            return None
+        finally:
+            self.i2c.unlock()
+
+    def _draw(self, data):
+        """Send a drawing command, first waiting for any previous draw to finish
+        (the module paints over SPI and can't take a new command mid-draw)."""
+        if self.auto_wait:
+            self.wait_ready()
+        return self._send(data)
+
+    # ── Status ────────────────────────────────────────────────────────────────
+
+    def status(self):
+        """Return (busy, last_error) from the module, or (False, None) on error."""
+        buf = self._read_raw(2)
+        if buf is None:
+            return (False, None)
+        return (bool(buf[0] & 0x01), buf[1])
+
+    def wait_ready(self, timeout=1.0):
+        """Block until the module has finished drawing. Returns True if it is
+        idle, False on timeout or I2C error. Best-effort — never raises."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            buf = self._read_raw(2)
+            if buf is None:
+                return False
+            if not (buf[0] & 0x01):
+                return True
+            time.sleep(0.002)
+        return False
+
+    def info(self, refresh=False):
+        """
+        Ask the module what it is: size, colour depth, how many built-in fonts
+        and icons it has. Returns a DisplayInfo (cached after the first call),
+        or None if the module didn't answer.
+
+        This is why one driver can serve every noknok display — geometry is
+        asked for, never hard-coded.
+        """
+        if self._info is not None and not refresh:
+            return self._info
+        if not self._send([self._CMD_GET_INFO]):
+            return None
+        time.sleep(0.003)                     # let the module load its reply
+        buf = self._read_raw(5)
+        if buf is None or buf[0] == 0 or buf[1] == 0:
+            return None                       # no / invalid answer, keep fallbacks
+        self._info = DisplayInfo(buf)
+        return self._info
+
+    @property
+    def width(self):
+        """Panel width in pixels (from the module; falls back to 80)."""
+        i = self.info()
+        return i.width if i else self._FALLBACK_W
+
+    @property
+    def height(self):
+        """Panel height in pixels (from the module; falls back to 160)."""
+        i = self.info()
+        return i.height if i else self._FALLBACK_H
+
+    # ── Screen control ────────────────────────────────────────────────────────
+
+    def backlight(self, level):
+        """
+        Set backlight brightness.
+            d.backlight(0.8)    # 80 %  (0.0 - 1.0 — the normal way)
+            d.backlight(200)    # raw 0-255, if you prefer
+        """
+        level = float(level)
+        raw = int(round(level * 255)) if level <= 1.0 else int(round(level))
+        raw = 0 if raw < 0 else (255 if raw > 255 else raw)
+        self._backlight = raw
+        return self._send([self._CMD_SET_BACKLIGHT, raw])
+
+    def display(self, mode):
+        """Low-level power state: 0 = off, 1 = on, 2 = sleep. Prefer on/off/sleep."""
+        return self._send([self._CMD_DISPLAY, int(mode) & 0xFF])
+
+    def on(self):
+        """Turn the panel on."""
+        return self.display(1)
+
+    def off(self):
+        """Turn the panel off (backlight and panel dark)."""
+        return self.display(0)
+
+    def sleep(self):
+        """Put the panel into its low-power sleep state."""
+        return self.display(2)
+
+    # ── Drawing ───────────────────────────────────────────────────────────────
+
+    def clear(self, color=BLACK):
+        """
+        Fill the whole screen with one colour and remember it as the default
+        text background (so text() can cover its own footprint cleanly).
+        """
+        self._bg = color
+        c = rgb565(color)
+        return self._draw([self._CMD_CLEAR, (c >> 8) & 0xFF, c & 0xFF])
+
+    def fill_rect(self, x, y, w, h, color):
+        """Fill a rectangle. Coordinates and sizes are pixels, clipped to the panel."""
+        x, y, w, h = self._clip(x, y, w, h)
+        if w <= 0 or h <= 0:
+            return True
+        c = rgb565(color)
+        return self._draw([self._CMD_FILL_RECT, x, y, w, h,
+                           (c >> 8) & 0xFF, c & 0xFF])
+
+    def _clip(self, x, y, w, h):
+        """Clamp a rectangle to the panel (and to the 0-255 byte range)."""
+        dw, dh = self.width, self.height
+        x, y, w, h = int(x), int(y), int(w), int(h)
+        if x < 0:
+            w += x
+            x = 0
+        if y < 0:
+            h += y
+            y = 0
+        if x >= dw or y >= dh:
+            return (0, 0, 0, 0)
+        w = min(w, dw - x, 255)
+        h = min(h, dh - y, 255)
+        return (x, y, max(0, w), max(0, h))
+
+    def icon(self, icon_id, x=0, y=0, scale=1, color=WHITE, bg="auto"):
+        """
+        Draw one of the module's built-in icons.
+            d.icon(3, x=10, y=10, scale=2, color=GREEN)
+        `bg="auto"` = the last clear() colour, None = transparent.
+        (Needs display firmware with the icon set — see info().n_icons.)
+        """
+        fg = rgb565(color)
+        bgc, _ = self._bg_value(bg)
+        return self._draw([self._CMD_DRAW_ICON, int(x) & 0xFF, int(y) & 0xFF,
+                           int(icon_id) & 0xFF, max(1, min(4, int(scale))),
+                           (fg >> 8) & 0xFF, fg & 0xFF,
+                           (bgc >> 8) & 0xFF, bgc & 0xFF])
+
+    # ── Text ──────────────────────────────────────────────────────────────────
+
+    def _bg_value(self, bg):
+        """Work out the background colour to send. Returns (rgb565, transparent).
+        bg="auto" -> last clear() colour; bg=None -> transparent; else that colour."""
+        if bg is None:
+            return (rgb565(self._bg), True)
+        if isinstance(bg, str) and bg == "auto":
+            return (rgb565(self._bg), False)
+        return (rgb565(bg), False)
+
+    @staticmethod
+    def _pack_style(font_index, scale, transparent):
+        """
+        Build the DRAW_TEXT style byte:
+            bits 0-1  font index   (0 = 6x8, 1 = 8x16)
+            bits 2-4  scale - 1    (so 1-8; the module supports 1-4)
+            bit  7    1 = transparent background (don't paint the box)
+        Must match the firmware's decoding — keep the two in step.
+        """
+        return ((font_index & 0x03)
+                | ((max(1, min(8, scale)) - 1) << 2)
+                | (0x80 if transparent else 0x00))
+
+    def text(self, s, size=16, color=WHITE, bg="auto", x=0, y=0,
+             font=None, wrap=True, line_gap=None):
+        """
+        Draw text. `size` is the exact PIXEL HEIGHT — any size works.
+
+            d.text("Hello World")                        # 16 px, white, from 0,0
+            d.text("22.5", size=32, x=4, y=40, color=YELLOW)
+            d.text("tiny", size=11)                      # non-native -> blitted
+            d.text("mine", size=28, font="/fonts/a.bdf") # your own font
+            d.text("ghost", bg=None)                     # transparent background
+
+        Arguments:
+            s        — the text. "\\n" starts a new line.
+            size     — pixel height (default 16). Always exact.
+            color    — text colour: 0xRRGGBB, (r,g,b) or a name.
+            bg       — "auto" (default) = an opaque box in the last clear()
+                       colour; None = transparent; or any colour.
+            x, y     — top-left corner in pixels.
+            font     — None = built-in font; or a BdfFont, or a path to a .bdf.
+            wrap     — True (default) wraps to the panel width; False clips.
+            line_gap — extra pixels between wrapped lines (default size // 8).
+
+        Returns the y coordinate just BELOW the last line drawn, so you can
+        stack text:
+            y = d.text("Title", size=24)
+            d.text("subtitle", size=12, y=y)
+        """
+        s = str(s)
+        size = int(size)
+        if size < 1:
+            raise ValueError("size must be at least 1 pixel tall")
+
+        fg = rgb565(color)
+        bgc, transparent = self._bg_value(bg)
+
+        # Load a .bdf if a path was passed instead of a BdfFont object.
+        if isinstance(font, str):
+            font = BdfFont(font)
+
+        # Pick the render route (see the class docstring).
+        native = None
+        if font is None and size in self._NATIVE_SIZES \
+                and self._is_ascii(s.replace("\n", "")):
+            native = self._NATIVE_SIZES[size]
+
+        if native is not None:
+            font_index, scale = native
+            cell_w = self._MODULE_FONTS[font_index][0] * scale
+        elif font is not None:
+            cell_w = max(1, int(round(font.width * size / float(font.height))))
+        else:
+            cell_w = max(1, (size + 1) // 2)      # built-in font is 8 wide x 16 high
+
+        # Split into lines that fit the panel.
+        avail = max(1, self.width - int(x))
+        lines = self._layout(s, cell_w, avail, wrap)
+
+        gap    = (size // 8) if line_gap is None else int(line_gap)
+        line_h = size + max(0, gap)
+        cur_y  = int(y)
+
+        for line in lines:
+            if cur_y >= self.height:
+                break                              # off the bottom — stop
+            if line:
+                if native is not None:
+                    self._text_native(int(x), cur_y, line, fg, bgc, transparent,
+                                      native[0], native[1])
+                else:
+                    self._text_blit(int(x), cur_y, line, size, cell_w,
+                                    fg, bgc, transparent, font)
+            cur_y += line_h
+        return cur_y
+
+    @staticmethod
+    def _is_ascii(s):
+        """True if every character is in the module's own ASCII font range."""
+        for ch in s:
+            if not (32 <= ord(ch) <= 126):
+                return False
+        return True
+
+    @staticmethod
+    def _layout(s, cell_w, avail_px, wrap):
+        """Break text into display lines. Honours "\\n"; wraps on spaces when it
+        can and hard-breaks a too-long word when it can't."""
+        max_chars = max(1, avail_px // cell_w)
+        out = []
+        for para in s.split("\n"):
+            if not wrap:
+                out.append(para[:max_chars])
+                continue
+            if not para:
+                out.append("")
+                continue
+            while len(para) > max_chars:
+                cut = para.rfind(" ", 0, max_chars + 1)
+                if cut <= 0:
+                    cut = max_chars           # one long word — break it
+                out.append(para[:cut].rstrip())
+                para = para[cut:].lstrip()
+            out.append(para)
+        return out
+
+    def _text_native(self, x, y, line, fg, bg, transparent, font_index, scale):
+        """Route 1: let the module render with its own font (fastest path)."""
+        line  = line[:self._MAX_TEXT_CHARS]
+        style = self._pack_style(font_index, scale, transparent)
+        payload = [self._CMD_DRAW_TEXT, x & 0xFF, y & 0xFF, style,
+                   (fg >> 8) & 0xFF, fg & 0xFF, (bg >> 8) & 0xFF, bg & 0xFF]
+        payload.extend([ord(ch) & 0xFF for ch in line])
+        return self._draw(payload)
+
+    def _text_blit(self, x, y, line, size, cell_w, fg, bg, transparent, font):
+        """Routes 2 and 3: render on the Pico, send the pixels.
+
+        The glyphs are scaled with nearest-neighbour sampling so ANY pixel height
+        is possible, packed 1 bit per pixel (rows padded to whole bytes) and sent
+        as BLIT_BEGIN + as many BLIT_DATA chunks as it takes."""
+        w = min(cell_w * len(line), max(0, self.width - x), 255)
+        h = min(size, max(0, self.height - y), 255)
+        if w <= 0 or h <= 0:
+            return True
+
+        # Source glyph cell dimensions (built-in font is 8x16).
+        src_w  = font.width if font is not None else 8
+        src_h  = font.height if font is not None else 16
+        table  = None if font is not None else _font8x16()
+
+        row_bytes = (w + 7) // 8
+        buf = bytearray(row_bytes * h)
+
+        for i, ch in enumerate(line):
+            base_x = i * cell_w
+            if base_x >= w:
+                break
+            if font is not None:
+                rows = font.rows_for(ch)
+            else:
+                gi   = _glyph_index(ch)
+                rows = None                       # read from `table` directly
+                off  = gi * 16
+            for dy in range(h):
+                sy = (dy * src_h) // size
+                if sy >= src_h:
+                    sy = src_h - 1
+                src = rows[sy] if font is not None else table[off + sy]
+                if not src:
+                    continue
+                row_base = dy * row_bytes
+                for dx in range(cell_w):
+                    px = base_x + dx
+                    if px >= w:
+                        break
+                    sx = (dx * src_w) // cell_w
+                    if src & (1 << (src_w - 1 - sx)):
+                        buf[row_base + (px >> 3)] |= 0x80 >> (px & 7)
+
+        return self._blit(x, y, w, h, fg, bg, transparent, buf)
+
+    def _blit(self, x, y, w, h, fg, bg, transparent, data):
+        """Send a 1bpp bitmap to the module: BLIT_BEGIN then BLIT_DATA chunks."""
+        ok = self._draw([self._CMD_BLIT_BEGIN, x & 0xFF, y & 0xFF,
+                         w & 0xFF, h & 0xFF,
+                         (fg >> 8) & 0xFF, fg & 0xFF,
+                         (bg >> 8) & 0xFF, bg & 0xFF,
+                         0x01 if transparent else 0x00])
+        if not ok:
+            return False
+        step = self._MAX_BLIT_CHUNK
+        for i in range(0, len(data), step):
+            chunk = data[i:i + step]
+            if not self._send(bytes([self._CMD_BLIT_DATA]) + bytes(chunk)):
+                return False
+        return True
+
+    # ── Role assignment cue (the app's "which screen is this?" step) ──────────
+
+    def role_cue(self, on=True):
+        """
+        Make THIS display obviously identifiable while the app assigns roles.
+        Uses only the always-available primitives (backlight + clear), so it
+        works on any display firmware.
+        """
+        if on:
+            self.backlight(1.0)
+            self.clear(NOKNOK)
+        else:
+            self.clear(BLACK)
+        return True
+
+    def __repr__(self):
+        i = self._info
+        geo = ("%dx%d" % (i.width, i.height)) if i else "?"
+        return "NoknokDisplay(addr=0x%02X, %s)" % (self.address, geo)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class DisplayInfo:
+    """
+    Result of NoknokDisplay.info() — what the module says about itself.
+
+    Attributes:
+        width, height (int)  — panel size in pixels
+        depth_code    (int)  — colour format code (0x10 = RGB565)
+        depth         (str)  — human-readable colour format
+        n_fonts       (int)  — built-in fonts the module can render itself
+        n_icons       (int)  — built-in icons
+    """
+    __slots__ = ("width", "height", "depth_code", "depth", "n_fonts", "n_icons")
+
+    _DEPTHS = {0x10: "RGB565", 0x08: "8-bit", 0x01: "1-bit"}
+
+    def __init__(self, buf):
+        self.width      = buf[0]
+        self.height     = buf[1]
+        self.depth_code = buf[2]
+        self.depth      = self._DEPTHS.get(buf[2], "0x%02X" % buf[2])
+        self.n_fonts    = buf[3]
+        self.n_icons    = buf[4]
+
+    def __repr__(self):
+        return ("DisplayInfo(%dx%d, %s, fonts=%d, icons=%d)"
+                % (self.width, self.height, self.depth, self.n_fonts, self.n_icons))
+
 
 # ============================================================================
 # USB modules (noknok LEDs, future USB modules) live in noknok_usb.py and are
