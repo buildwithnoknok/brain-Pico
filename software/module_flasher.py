@@ -3,9 +3,10 @@
 # Re-flashes a CH32V003 noknok module's APPLICATION over the I2C bus, talking to
 # the shared noknok bootloader (module-I2C-bootloader). No SWDIO cable needed.
 #
-# The .bin you pass is the OFFSET-LINKED application image (linked at 0x1000 via
+# The .bin you pass is the OFFSET-LINKED application image (linked at the app base via
 # app.ld) — i.e. exactly what `make build` produces in a module's firmware/src.
-# It is flashed at app-relative offset 0 (the bootloader adds the 0x1000 base).
+# It is flashed at app-relative offset 0 — the bootloader adds the base, so the host never
+# knows it (0x1000 under the legacy monolithic bootloader, 0x1400 under stage-0/stage-1).
 #
 # Bootloader protocol @ 0x7E:
 #   write [0x01]                          ERASE app region + metadata

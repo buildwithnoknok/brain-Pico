@@ -14,17 +14,17 @@
 #
 # What it proves, in order:
 #   1. GET_VERSION (0xB1) answers at 0x7E   -> stage-1 is up and speaks the new command
-#   2. Reported version is 1.0.0            -> the SWD-flashed build is what is running
-#   3. ERASE -> WRITE_CHUNK xN of the v1.0.1 image into the staging area
+#   2. Reported version is the base build   -> the SWD-flashed build is what is running
+#   3. ERASE -> WRITE_CHUNK xN of the PATCH+1 image into the staging area
 #   4. VERIFY_STAGE1 (0x06) returns READY   -> CRC matched, control block written
 #   5. BOOT -> module vanishes -> comes back at 0x7E
-#   6. GET_VERSION now reports 1.0.1        -> stage-0 installed the new stage-1
+#   6. GET_VERSION now reports PATCH+1       -> stage-0 installed the new stage-1
 #
 # Step 6 is the authoritative proof. Same bytes before and after would prove
 # nothing; a CHANGED version can only mean the copy happened.
 #
 # Afterwards, verify over SWD from the Pi (see the walkthrough): stage-1 region
-# == v1.0.1 image, control block cleared, staging copy still in the app region.
+# == the pushed image, control block cleared, staging copy still in the app region.
 
 import time
 import board
@@ -33,8 +33,8 @@ from module_flasher import ModuleFlasher, PAGE, crc32
 
 
 STAGE1_IMAGE = "noknok_stage1_v101.bin"
-EXPECT_BEFORE = (1, 0, 0)
-EXPECT_AFTER  = (1, 0, 1)
+# The runner builds the payload as the running version with PATCH+1, so the
+# proof is relative: the version must change, by exactly one patch step.
 
 
 def banner(s):
@@ -59,12 +59,10 @@ def main():
     print("   0x7E answers 0xB1:", fmt(v))
     if v is None:
         raise SystemExit("FAIL: stage-1 did not answer GET_VERSION")
-    if v[1:] != EXPECT_BEFORE:
-        raise SystemExit("FAIL: expected v%d.%d.%d before update" % EXPECT_BEFORE)
-    print("   PASS — stage-1 v1.0.0 is running and speaks 0xB1")
+    print("   PASS — stage-1 v%d.%d.%d is running and speaks 0xB1" % tuple(v[1:]))
 
     # ── 3. stage the v1.0.1 image into the app region ─────────────────────────
-    banner("2. Stage the v1.0.1 image (ERASE + WRITE_CHUNK)")
+    banner("2. Stage the new image (ERASE + WRITE_CHUNK)")
     with open(STAGE1_IMAGE, "rb") as fh:
         img = fh.read()
     n_pages = (len(img) + PAGE - 1) // PAGE
@@ -97,11 +95,11 @@ def main():
     print("   0x7E answers 0xB1:", fmt(v2))
     if v2 is None:
         raise SystemExit("FAIL: new stage-1 did not answer GET_VERSION")
-    if v2[1:] != EXPECT_AFTER:
+    if tuple(v2[1:]) != (v[1], v[2], v[3] + 1):
         raise SystemExit("FAIL: expected v%d.%d.%d after update, got v%d.%d.%d"
-                         % (EXPECT_AFTER + v2[1:]))
+                         % (v[1], v[2], v[3] + 1, v2[1], v2[2], v2[3]))
 
-    banner("ALL PASS — stage-1 updated itself over I2C: v1.0.0 -> v1.0.1")
+    banner("ALL PASS — stage-1 updated itself over I2C: v%d.%d.%d -> v%d.%d.%d" % (tuple(v[1:]) + tuple(v2[1:])))
     print("Now verify over SWD from the Pi (stage-1 region, control block, staging).")
 
 
