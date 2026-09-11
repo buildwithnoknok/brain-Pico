@@ -1,7 +1,28 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.12 (DEV-31 — parked-module rescue + atomic OTA ordering)
+# Version: 0.12 (DEV-31 — parked-module rescue, atomic OTA, firmware index)
 #
 # v0.12 changes (Sue): DEV-31 app-side hardening.
+#   - Firmware resolution via the module registry. Manifests no longer pin a
+#     version + .bin URL; they declare a floor ({"buzzer": {"min": "3.3.1"}}).
+#     _resolve_module_firmware() fetches Ecosystem/software/modules.json to map
+#     each module type to its repo, then that module's firmware/index.json for
+#     the current {version, url, requires_bootloader}. Firmware is backwards
+#     compatible, so we install what is current rather than what the product was
+#     written against; the floor only catches a product published against an
+#     unreleased firmware. The version lives in the same commit as the binary,
+#     which is what stops the two drifting apart (they did — see DEV-31).
+#     Every failure path is a safe no-op: an unresolvable type is left out, so
+#     firmware_report() sees no required version and flashes nothing.
+#   - _bootloader_gate() refuses an image the module cannot run. Backwards
+#     compatibility is a promise about the PROTOCOL, not about installability:
+#     the Sep 2026 relink to app base 0x1400 is wire-compatible and still
+#     hard-faults a module on the legacy bootloader, and nothing downstream
+#     would catch it (the flasher writes at an offset the bootloader picks, and
+#     the CRC is over image bytes, not the link address). Resolved against
+#     Conductor.bootloader_version(), where silence = legacy.
+#   - POST /firmware/check now reports resolved:false. It runs at AP time with
+#     no internet, so it cannot reach the registry and can only say what is
+#     installed. The real check is the headless post-WiFi pass.
 #   - Parked-module rescue (Sam's hardening D). A module stuck in its bootloader
 #     at 0x7E does not answer the enumeration sweep, so before this it was simply
 #     invisible: the product started with a module missing and nothing said why.
@@ -503,14 +524,22 @@ def register_routes(server):
             log(f"[fw] /firmware/check error: {e}")
             report = []
 
+        # NOTE: this runs while the phone is on the noknok-setup AP, so the Pico
+        # has NO internet and cannot reach the module registry to find out what
+        # the current firmware is. It can only report what is installed. So
+        # update_needed is always False here and `resolved` says why — the real
+        # check runs headlessly after the WiFi join, in check_and_flash_modules().
+        # (Manifests carry a floor, not a version, so firmware_report() finds no
+        # required version and reports nothing pending — the same answer.)
         update_needed = any(r["needs_update"] for r in report)
         slim = [{"type": r["type"], "installed": r["installed"],
                  "required": r["required"], "needs_update": r["needs_update"]}
                 for r in report]
-        log(f"[fw] /firmware/check — update_needed={update_needed} "
-            f"({len(slim)} module(s))")
+        log(f"[fw] /firmware/check — {len(slim)} module(s) present; version "
+            f"resolution needs internet, deferred to the post-WiFi pass")
         return Response(request,
                         json.dumps({"update_needed": update_needed,
+                                    "resolved": False,
                                     "modules": slim}),
                         content_type="application/json")
 
@@ -752,6 +781,121 @@ def _release_conductor():
             pass
         _conductor = None
 
+# Official module registry: module type -> where that module publishes its
+# firmware index. One fetch, and the only place a module repo's location is
+# written down — adding a module type is a line in that file, not a Pico update.
+MODULE_REGISTRY_URL = ("https://raw.githubusercontent.com/buildwithnoknok/"
+                       "Ecosystem/main/software/modules.json")
+
+
+def _download_json(session, url, timeout=20):
+    """Fetch and parse a small JSON document. Raises on anything unexpected."""
+    resp = session.get(url, timeout=timeout)
+    try:
+        if resp.status_code != 200:
+            raise ValueError("HTTP %d" % resp.status_code)
+        return resp.json()
+    finally:
+        resp.close()
+
+
+def _resolve_module_firmware(session, module_firmware):
+    """Turn the manifest's floors into concrete firmware to install.
+
+    In:  {"buzzer": {"min": "3.3.1"}}                    (the product manifest)
+    Out: {"buzzer": {"version": "3.5.0", "url": "...",
+                     "requires_bootloader": "stage1"}}   (what to actually flash)
+
+    Module firmware is backwards compatible, so a product does not pin a version
+    — it states the oldest it works against and takes whatever the module
+    currently publishes. The current version lives in the module's own repo next
+    to the binary (firmware/index.json), which is what stops the version and the
+    bytes drifting apart. See Ecosystem/software/firmware-index.md.
+
+    Every failure here is a safe no-op: a type we cannot resolve is simply left
+    out, so firmware_report() sees no required version and flashes nothing."""
+    try:
+        registry = (_download_json(session, MODULE_REGISTRY_URL) or {}).get("modules", {})
+    except Exception as e:
+        log(f"[fw] module registry unavailable ({e!r}) — no firmware will be installed")
+        return {}
+
+    resolved = {}
+    for mtype, spec in (module_firmware or {}).items():
+        minimum = spec.get("min") if isinstance(spec, dict) else None
+        entry   = registry.get(mtype)
+        if not entry or not entry.get("index"):
+            log(f"[fw] {mtype}: not in the module registry — skipping")
+            continue
+        try:
+            index = _download_json(session, entry["index"]) or {}
+        except Exception as e:
+            log(f"[fw] {mtype}: index fetch failed ({e!r}) — skipping")
+            continue
+
+        version = index.get("version")
+        url     = index.get("url")
+        if not version or not url:
+            log(f"[fw] {mtype}: index is missing version/url — skipping")
+            continue
+
+        # The floor guards one case: a product published against a firmware
+        # feature that has not actually shipped. It should never fire.
+        if minimum and _semver_lt(version, minimum):
+            log(f"[fw] {mtype}: published {version} is older than the product's "
+                f"minimum {minimum} — skipping")
+            continue
+
+        resolved[mtype] = {"version": version, "url": url,
+                           "requires_bootloader": index.get("requires_bootloader", "any")}
+        log(f"[fw] {mtype}: current is {version} (min {minimum or 'none'})")
+    return resolved
+
+
+def _semver_lt(a, b):
+    """True if semver string `a` is older than `b`. Unparseable sorts as older,
+    which keeps the caller on the cautious side."""
+    def parts(s):
+        try:
+            return tuple(int(x) for x in str(s).split("."))
+        except (ValueError, AttributeError):
+            return None
+    pa, pb = parts(a), parts(b)
+    if pa is None:
+        return True
+    if pb is None:
+        return False
+    return pa < pb
+
+
+def _bootloader_gate(c, entries, requires):
+    """DEV-31: refuse an image the module's bootloader cannot actually run.
+
+    Backwards compatibility is a promise about the PROTOCOL, not about
+    installability. The Sep 2026 relink to app base 0x1400 (bootloader layout 2)
+    is wire-compatible and still hard-faults a module on the legacy bootloader —
+    the flasher writes at an offset the bootloader chooses, and the CRC is over
+    image bytes, not the link address, so nothing downstream would catch it.
+
+    Returns (ok, reason). Checks every module of the type and fails the whole
+    type if any one of them disagrees: refusing is recoverable, flashing an
+    unrunnable image costs an SWD session."""
+    if requires in (None, "any"):
+        return True, "no bootloader requirement"
+    for e in entries:
+        if e.get("bus") != "i2c":
+            continue          # USB modules: no stage-0 port yet (V203 pending)
+        try:
+            ver = c.bootloader_version(e)
+        except Exception as ex:
+            return False, "could not read bootloader of %s: %r" % (e.get("uid"), ex)
+        actual = "legacy" if ver is None else "stage1"
+        if actual != requires:
+            return False, ("module %s has the %s bootloader, image needs %s"
+                           % (e.get("uid"), actual, requires))
+    return True, "bootloader is %s" % requires
+
+
 def _download_image(session, url, timeout=30):
     """Download one module's offset-linked app .bin over WiFi (BINARY, not .text).
     Returns bytes. Raises on any connectivity/HTTP/size failure — update_all()
@@ -800,8 +944,16 @@ def check_and_flash_modules(module_firmware):
         log(f"[fw] OTA setup failed: {e}")
         return
 
+    # Resolve the manifest's floors into concrete versions + URLs via the module
+    # registry. Two small JSON fetches; everything downstream then works on the
+    # {version, url} shape firmware_report() has always taken.
+    resolved = _resolve_module_firmware(session, module_firmware)
+    if not resolved:
+        log("[fw] nothing resolved — skipping firmware check")
+        return
+
     def _url_for(mtype):
-        spec = module_firmware.get(mtype)
+        spec = resolved.get(mtype)
         return spec.get("url") if isinstance(spec, dict) else None
 
     def rescue_image(entry):
@@ -809,30 +961,46 @@ def check_and_flash_modules(module_firmware):
         until we have asked it, and a parked module is the rare case."""
         url = _url_for(entry["type"])
         if not url:
-            raise ValueError("manifest has no url for %r" % entry["type"])
+            raise ValueError("no resolved firmware for %r" % entry["type"])
         return _download_image(session, url)
 
-    # ── Pass 1: decide. No network, no filesystem writes. ─────────────────────
+    # ── Pass 1: decide. No image downloads, no filesystem writes. ─────────────
     # The overwhelmingly common boot is "everything already current", and that
     # path must not write to flash at all: per-boot writes against the rw-
     # remounted CircuitPython filesystem are what corrupts it on power loss
     # (DEV-18). So we ask the modules their versions first and, in the normal
-    # case, stop right here having touched nothing.
+    # case, stop right here having written nothing.
     c = get_conductor(rescue_get_image=rescue_image)
     if c is None:
         log("[fw] no Conductor available — skipping firmware check")
         return
 
-    todo = [r for r in c.log_firmware_report(module_firmware, logfn=log)
+    todo = [r for r in c.log_firmware_report(resolved, logfn=log)
             if r["needs_update"]]
     if not todo:
         log("[fw] all modules up to date")
         return
 
+    # Gate each type on whether its modules can actually run the new image, and
+    # drop the ones that can't from `resolved` — update_all() recomputes its own
+    # report, so removing the type is what stops it flashing anyway.
     types = []
     for r in todo:
         if r["type"] not in types:
             types.append(r["type"])
+    for mtype in list(types):
+        ok, why = _bootloader_gate(c, [r for r in todo if r["type"] == mtype],
+                                   resolved[mtype].get("requires_bootloader"))
+        if not ok:
+            log(f"[fw] {mtype}: REFUSED — {why}")
+            event(f"[FW]    {mtype:<11} refused: {why}")
+            types.remove(mtype)
+            resolved.pop(mtype, None)
+
+    todo = [r for r in todo if r["type"] in types]
+    if not todo:
+        log("[fw] every pending update was refused — nothing flashed")
+        return
     log(f"[fw] {len(todo)} module(s) need an update — fetching {len(types)} image(s) first")
 
     # ── Pass 2: fetch everything BEFORE touching a single module. ─────────────
@@ -883,13 +1051,13 @@ def check_and_flash_modules(module_firmware):
             if total and (done == total or done % 512 == 0):
                 log(f"[fw] flashing {done}/{total} ({100 * done // total}%)")
 
-        results = c.update_all(module_firmware, get_image, progress=progress, logfn=log)
+        results = c.update_all(resolved, get_image, progress=progress, logfn=log)
 
         # update_all() already re-enumerated internally (both buses); pull a fresh
         # report to log the DEFINITIVE per-module outcome to the durable audit log —
         # the actually-confirmed installed version, not just "the flash call
         # returned OK" (a flash can succeed but a module can still misreport).
-        verify = {v["uid"]: v for v in c.firmware_report(module_firmware)}
+        verify = {v["uid"]: v for v in c.firmware_report(resolved)}
         for r in results:
             v   = verify.get(r["uid"])
             now = v["installed"] if v else None
