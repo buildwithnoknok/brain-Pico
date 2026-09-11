@@ -1,5 +1,28 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.11 (PoC v2 Step 5 — DEV-12: OTA wired to the bus-aware dispatcher)
+# Version: 0.12 (DEV-31 — parked-module rescue + atomic OTA ordering)
+#
+# v0.12 changes (Sue): DEV-31 app-side hardening.
+#   - Parked-module rescue (Sam's hardening D). A module stuck in its bootloader
+#     at 0x7E does not answer the enumeration sweep, so before this it was simply
+#     invisible: the product started with a module missing and nothing said why.
+#     get_conductor() now takes an optional rescue_get_image and runs
+#     Conductor.rescue_parked_module() between Conductor() and enumerate_all() —
+#     the order Sam specifies, because a rescue after enumeration would be too
+#     late to put the module back in the registry. Outcomes go to the durable
+#     audit log as [RESCUE]. The AP-time role endpoints pass no image source and
+#     skip it; only the post-WiFi path can actually fetch an image.
+#   - check_and_flash_modules() reordered into decide / fetch / flash:
+#       1. version check only — no network, no filesystem writes. The common
+#          boot ("all modules up to date") now ends here having touched nothing.
+#          It previously downloaded every manifest image on EVERY boot and wrote
+#          them to flash before asking whether anything was out of date, which
+#          is the per-boot-write pattern behind the FS corruption in DEV-18.
+#       2. release the Conductor, then fetch every needed image to the FS.
+#       3. flash from those files, then delete them.
+#     The point of fetching everything first is atomicity: once the first module
+#     is erased no later step needs the radio, so a WiFi drop mid-run can no
+#     longer leave one module half-written and the rest untouched. Releasing the
+#     Conductor first also means the downloads run with RAM and the I2C bus free.
 #
 # v0.11 changes (Sue): DEV-12 — wire update_all() into provisioning, both buses.
 #   - get_conductor() now calls enumerate_all() (I2C + USB) instead of enumerate()
@@ -197,7 +220,7 @@ pending = {"ssid": None, "password": None, "script_url": None,
 # takes a few seconds, so we create + enumerate it once on first use and reuse it.
 _conductor = None
 
-def get_conductor():
+def get_conductor(rescue_get_image=None):
     """Return a cached, enumerated Conductor, creating it on first use.
     The Conductor (noknok.py) self-configures its own I2C bus on the noknok
     standard pins, so no pins are passed here. Uses enumerate_all() (I2C + USB)
@@ -207,13 +230,20 @@ def get_conductor():
     was silently skipped. enumerate_usb() no-ops cleanly if there's no USB host
     support on the build, so this is a no-op cost for I2C-only products. Returns
     None if noknok.py is missing or the I2C bus can't be brought up — callers
-    degrade gracefully."""
+    degrade gracefully.
+
+    `rescue_get_image(entry) -> bytes`, when given, enables the DEV-31 parked-
+    module rescue below. It is optional because only the post-WiFi boot path can
+    actually fetch an image; the AP-time role endpoints call this with no network
+    to GitHub and simply skip the rescue."""
     global _conductor
     if _conductor is None:
         try:
             from noknok import Conductor
             log("[roles] Creating Conductor + enumerating modules (first use)...")
             c = Conductor()                 # self-configures I2C (GP8/GP9, 100 kHz)
+            if rescue_get_image is not None:
+                _rescue_parked(c, rescue_get_image)
             found = c.enumerate_all()       # ~3 s — discovers I2C + USB modules
             log(f"[roles] Enumeration done — {found} module(s) found")
             _conductor = c
@@ -221,6 +251,28 @@ def get_conductor():
             log(f"[roles] Conductor init failed: {e}")
             return None
     return _conductor
+
+
+def _rescue_parked(c, get_image):
+    """DEV-31 hardening D — recover a module stuck in its bootloader at 0x7E.
+
+    Must run BEFORE enumerate(): a parked module never answers the enumeration
+    sweep, so if we skip this nothing downstream can see it and the module looks
+    simply absent. Two things park one — an update that lost power part-way, or
+    stage-1 refusing an app that crashed three times running (error 7).
+
+    Best-effort by design: a module we cannot identify is logged for a human and
+    the boot continues. Never let this stop a product from starting."""
+    try:
+        res = c.rescue_parked_module(get_image, logfn=log)
+    except Exception as e:
+        log(f"[rescue] check failed (ignored): {e!r}")
+        return
+    if not res:
+        return                                  # nothing parked — the normal case
+    event(f"[RESCUE] uid={res.get('uid')} type={res.get('type')} "
+          f"reason={res.get('reason')} action={res.get('action')} "
+          f"detail={res.get('detail')}")
 
 # ── HTML pages ─────────────────────────────────────────────────────────────────
 
@@ -726,26 +778,20 @@ def check_and_flash_modules(module_firmware):
     dispatcher itself stays network-agnostic and bench-testable (update_demo.py
     injects a local-file get_image instead).
 
+    Runs in three passes — decide, fetch, flash — so that the common boot costs
+    nothing and an interrupted one cannot leave the bus half-updated. See the
+    comments at each pass for why that order matters.
+
     Best-effort + crash-safe: any failure is logged and swallowed. A failed I2C
     flash leaves that module safe in its bootloader at 0x7E; a failed USB flash
     leaves it enumerated as its bootloader PID (4E42) — neither can strand or
-    brick the module, and neither blocks the rest of the boot."""
+    brick the module, and neither blocks the rest of the boot. A module left
+    parked at 0x7E is picked up by the rescue pass on the next boot (DEV-31)."""
     if not module_firmware:
         return   # older app / no manifest fw block -> nothing to do
 
-    c = get_conductor()               # enumerates both buses + reads versions
-    if c is None:
-        log("[fw] no Conductor available — skipping firmware check")
-        return
-
-    report = c.log_firmware_report(module_firmware, logfn=log)
-    todo = [r for r in report if r["needs_update"]]
-    if not todo:
-        log("[fw] all modules up to date")
-        return
-    log(f"[fw] {len(todo)} module(s) need an update — starting OTA")
-
-    # HTTPS session (correct DNS/SSL for the radio) to download the bins.
+    # HTTPS session (correct DNS/SSL for the radio), used for both the rescue
+    # image and the pre-flash fetch below.
     try:
         pool    = adafruit_connection_manager.get_radio_socketpool(wifi.radio)
         context = adafruit_connection_manager.get_radio_ssl_context(wifi.radio)
@@ -754,35 +800,114 @@ def check_and_flash_modules(module_firmware):
         log(f"[fw] OTA setup failed: {e}")
         return
 
-    def get_image(entry):
-        if not entry.get("url"):
-            raise ValueError("no URL in manifest")
-        log(f"[fw] {entry['type']}: downloading {entry['required']} from {entry['url']}")
-        image = _download_image(session, entry["url"])
-        log(f"[fw] {entry['type']}: downloaded {len(image)} bytes")
-        return image
+    def _url_for(mtype):
+        spec = module_firmware.get(mtype)
+        return spec.get("url") if isinstance(spec, dict) else None
 
-    def progress(done, total):
-        if total and (done == total or done % 512 == 0):
-            log(f"[fw] flashing {done}/{total} ({100 * done // total}%)")
+    def rescue_image(entry):
+        """One image, fetched on demand — we cannot know which module is parked
+        until we have asked it, and a parked module is the rare case."""
+        url = _url_for(entry["type"])
+        if not url:
+            raise ValueError("manifest has no url for %r" % entry["type"])
+        return _download_image(session, url)
 
-    results = c.update_all(module_firmware, get_image, progress=progress, logfn=log)
+    # ── Pass 1: decide. No network, no filesystem writes. ─────────────────────
+    # The overwhelmingly common boot is "everything already current", and that
+    # path must not write to flash at all: per-boot writes against the rw-
+    # remounted CircuitPython filesystem are what corrupts it on power loss
+    # (DEV-18). So we ask the modules their versions first and, in the normal
+    # case, stop right here having touched nothing.
+    c = get_conductor(rescue_get_image=rescue_image)
+    if c is None:
+        log("[fw] no Conductor available — skipping firmware check")
+        return
 
-    # update_all() already re-enumerated internally (both buses); pull a fresh
-    # report to log the DEFINITIVE per-module outcome to the durable audit log —
-    # the actually-confirmed installed version, not just "the flash call
-    # returned OK" (a flash can succeed but a module can still misreport).
-    verify = {v["uid"]: v for v in c.firmware_report(module_firmware)}
-    for r in results:
-        v   = verify.get(r["uid"])
-        now = v["installed"] if v else None
-        if r["updated"] and now == r["required"]:
-            event(f"[FW]    {r['type']:<11} uid={r['uid']} bus={r['bus']}  "
-                  f"{r['installed']} -> {r['required']}  OK (verified {now})")
-        else:
-            reason = r["error"] or ("reports %s" % now)
-            event(f"[FW]    {r['type']:<11} uid={r['uid']} bus={r['bus']}  "
-                  f"{r['installed']} -> {r['required']}  FAIL ({reason})")
+    todo = [r for r in c.log_firmware_report(module_firmware, logfn=log)
+            if r["needs_update"]]
+    if not todo:
+        log("[fw] all modules up to date")
+        return
+
+    types = []
+    for r in todo:
+        if r["type"] not in types:
+            types.append(r["type"])
+    log(f"[fw] {len(todo)} module(s) need an update — fetching {len(types)} image(s) first")
+
+    # ── Pass 2: fetch everything BEFORE touching a single module. ─────────────
+    # A flash that starts is a flash that can finish. Once the first module is
+    # erased, no remaining step needs the radio, so a WiFi drop mid-run cannot
+    # leave one module half-written and the rest untouched. The Conductor is
+    # released first so the downloads run with the RAM and the I2C bus free —
+    # which is also the condition under which the product-script download has
+    # always been reliable.
+    _release_conductor()
+    local_bins = {}                      # module type -> file on the Pico FS
+    for mtype in types:
+        url = _url_for(mtype)
+        if not url:
+            log(f"[fw] {mtype}: manifest has no url — skipping")
+            continue
+        fname = "/fw_%s.bin" % mtype
+        try:
+            image = _download_image(session, url)
+            with open(fname, "wb") as fh:
+                fh.write(image)
+            local_bins[mtype] = fname
+            log(f"[fw] fetched {mtype}: {len(image)} bytes -> {fname}")
+        except Exception as e:
+            log(f"[fw] fetch FAILED {mtype}: {e!r}")
+
+    if not local_bins:
+        log("[fw] no images could be fetched — nothing flashed")
+        return
+
+    # ── Pass 3: flash from local files. Network is no longer involved. ────────
+    try:
+        c = get_conductor()
+        if c is None:
+            log("[fw] Conductor unavailable after fetch — nothing flashed")
+            return
+
+        def get_image(entry):
+            fname = local_bins.get(entry["type"])
+            if not fname:
+                raise ValueError("no local image for %r" % entry["type"])
+            with open(fname, "rb") as fh:
+                image = fh.read()
+            log(f"[fw] {entry['type']}: flashing {len(image)} bytes from {fname}")
+            return image
+
+        def progress(done, total):
+            if total and (done == total or done % 512 == 0):
+                log(f"[fw] flashing {done}/{total} ({100 * done // total}%)")
+
+        results = c.update_all(module_firmware, get_image, progress=progress, logfn=log)
+
+        # update_all() already re-enumerated internally (both buses); pull a fresh
+        # report to log the DEFINITIVE per-module outcome to the durable audit log —
+        # the actually-confirmed installed version, not just "the flash call
+        # returned OK" (a flash can succeed but a module can still misreport).
+        verify = {v["uid"]: v for v in c.firmware_report(module_firmware)}
+        for r in results:
+            v   = verify.get(r["uid"])
+            now = v["installed"] if v else None
+            if r["updated"] and now == r["required"]:
+                event(f"[FW]    {r['type']:<11} uid={r['uid']} bus={r['bus']}  "
+                      f"{r['installed']} -> {r['required']}  OK (verified {now})")
+            else:
+                reason = r["error"] or ("reports %s" % now)
+                event(f"[FW]    {r['type']:<11} uid={r['uid']} bus={r['bus']}  "
+                      f"{r['installed']} -> {r['required']}  FAIL ({reason})")
+    finally:
+        # Don't leave images on the filesystem: they are stale the moment the
+        # flash succeeds, and the next boot re-fetches if it genuinely needs to.
+        for fname in local_bins.values():
+            try:
+                os.remove(fname)
+            except OSError:
+                pass
 
 # ── Main flow ──────────────────────────────────────────────────────────────────
 
