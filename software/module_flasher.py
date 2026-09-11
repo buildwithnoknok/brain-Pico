@@ -44,6 +44,7 @@ CMD_VERIFY         = 0x04
 CMD_BOOT           = 0x05
 CMD_VERIFY_STAGE1  = 0x06   # DEV-31
 CMD_GET_VERSION    = 0xB1   # DEV-31 (same shape as the app's GET_VERSION)
+CMD_GET_UID        = 0xB3   # DEV-31 hardening D: 8-byte chip UID
 
 ST_IDLE, ST_BUSY, ST_READY, ST_ERROR = 0, 1, 2, 3
 
@@ -58,6 +59,8 @@ _ERRMSG = {
     4: "verify length invalid",
     5: "CRC mismatch",
     6: "BOOT with no valid app",
+    7: "app unhealthy - stage-1 stopped booting it after 3 failed attempts",
+    8: "VERIFY_STAGE1: staged image is not a stage-1 for this layout (bad header)",
 }
 
 
@@ -197,6 +200,25 @@ class ModuleFlasher:
         try:
             self.i2c.readfrom_into(BL_ADDR, buf)
             return tuple(buf)
+        except OSError:
+            return None
+        finally:
+            self.i2c.unlock()
+
+    def get_uid(self):
+        """Chip UID of the module in the bootloader: write 0xB3, read 8 bytes.
+        Returns the lower-case hex string — the SAME format the app reports
+        during enumeration and the Conductor keys its registry by — so a module
+        parked at 0x7E can be matched to the type it enumerated as. None if the
+        bootloader doesn't answer (legacy, no 0xB3)."""
+        if not self._write(BL_ADDR, [CMD_GET_UID]):
+            return None
+        buf = bytearray(8)
+        while not self.i2c.try_lock():
+            pass
+        try:
+            self.i2c.readfrom_into(BL_ADDR, buf)
+            return bytes(buf).hex()
         except OSError:
             return None
         finally:

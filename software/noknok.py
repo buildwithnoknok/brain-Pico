@@ -360,6 +360,88 @@ class Conductor:
         self.enumerate()
         return {"before": before, "after": after, "app_restored": restored}
 
+    # Type code (as saved in noknok_state.json) -> manifest module_firmware key.
+    _TYPE_TO_MF_KEY = {TYPE_BUZZER: "buzzer", TYPE_KNOB: "knob",
+                       TYPE_LEDBUTTON: "led_button", TYPE_DISPLAY: "display"}
+
+    def rescue_parked_module(self, get_image, logfn=print, state_file="noknok_state.json"):
+        """
+        DEV-31 hardening D. Call BEFORE enumerate() at start-up.
+
+        A module parked in the bootloader at 0x7E does not enumerate, so nothing
+        else in the Conductor will ever see it. Two things put a module there:
+          - a bootloader or app update that lost power part-way (stage-0 finished
+            the install; the app region now holds staging junk), or
+          - stage-1 refusing to boot an app that crashed three times in a row
+            (hardening C, last_error = 7).
+        In both cases the fix is the same: push a good application. The module
+        cannot say what TYPE it is, but it can say its chip UID (0xB3), and we
+        remember UID -> type from the last successful enumeration.
+
+        `get_image(entry) -> bytes` is injected, as for update_all(). The entry
+        passed has 'type' (manifest key), 'bus', 'uid', 'address': None and a
+        'reason' string.
+
+        Returns None if nothing is parked, else a dict {uid, type, reason,
+        action, detail}. Never raises on the "cannot help" paths — a parked
+        module we cannot identify is logged and left for a human.
+
+        Also the reason to do this FIRST: with a module already at 0x7E, starting
+        another update would put two modules there and neither could be reached.
+        """
+        if self.i2c is None:
+            return None
+        from module_flasher import ModuleFlasher, ST_ERROR, _ERRMSG
+        f = ModuleFlasher(self.i2c)
+        st = f._read_status()
+        if st is None:
+            return None                                   # nothing at 0x7E — normal
+        state, err = st
+        reason = ("app unhealthy (stage-1 refused to boot it)"
+                  if (state == ST_ERROR and err == 7) else
+                  "interrupted update (no valid app)")
+        logfn("Module parked in bootloader at 0x7E: %s" % reason)
+
+        ver = f.get_version()
+        if ver is None:
+            logfn("  legacy bootloader (no 0xB1): cannot identify it - needs a manual flash")
+            return {"uid": None, "type": None, "reason": reason,
+                    "action": "none", "detail": "legacy bootloader, unidentifiable"}
+        uid = f.get_uid()
+        if not uid:
+            logfn("  bootloader v%d.%d.%d answered but gave no UID" % ver[1:])
+            return {"uid": None, "type": None, "reason": reason,
+                    "action": "none", "detail": "no UID"}
+
+        try:
+            with open(state_file, "r") as fh:
+                saved = json.load(fh)
+        except (OSError, ValueError):
+            saved = {}
+        info = saved.get(uid)
+        mf_key = self._TYPE_TO_MF_KEY.get(info.get("type", 0)) if info else None
+        if not mf_key:
+            logfn("  UID %s is not in %s - cannot tell what app to push" % (uid, state_file))
+            return {"uid": uid, "type": None, "reason": reason,
+                    "action": "none", "detail": "unknown UID"}
+
+        entry = {"type": mf_key, "bus": "i2c", "uid": uid, "address": None,
+                 "reason": reason}
+        logfn("  UID %s was a %s (bootloader v%d.%d.%d) - fetching its app..."
+              % (uid, mf_key, ver[1], ver[2], ver[3]))
+        try:
+            image = get_image(entry)
+            if not image:
+                raise ValueError("no image available for %s" % mf_key)
+            f.flash(image, runtime_addr=None)             # already in the bootloader
+            logfn("  app pushed and booted")
+            return {"uid": uid, "type": mf_key, "reason": reason,
+                    "action": "reflashed", "detail": "%d bytes" % len(image)}
+        except Exception as e:
+            logfn("  FAILED: %s" % e)
+            return {"uid": uid, "type": mf_key, "reason": reason,
+                    "action": "failed", "detail": str(e)}
+
     def update_all(self, manifest_fw, get_image, progress=None, logfn=print):
         """
         Flash every module that firmware_report() flags needs_update.
@@ -560,8 +642,23 @@ class Conductor:
     # ── State persistence ─────────────────────────────────────────────────────
 
     def _save_state(self, filename="noknok_state.json"):
-        """Save current module assignments to JSON so next run can restore them."""
-        data = {}
+        """Save current module assignments to JSON so next run can restore them.
+
+        MERGES into the existing file rather than replacing it. A module that
+        did not answer this time — parked in its bootloader after an interrupted
+        update, refused by stage-1 as unhealthy (DEV-31), or simply unplugged —
+        must NOT be forgotten: its UID -> type entry is the only way
+        rescue_parked_module() can tell what app to push. Found on the bench
+        11 Sep 2026: one enumeration with the module parked wiped the file and
+        the rescue reported 'unknown UID'. Stale addresses are harmless —
+        _restore_state() pings each one and skips those that don't answer."""
+        try:
+            with open(filename, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
         for uid_hex, module in self._registry.items():
             if module is not None:
                 if isinstance(module, NoknokBuzzer):
