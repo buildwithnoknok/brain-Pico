@@ -40,7 +40,7 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
 
 ## Current versions & features (PoC v1)
 
-**`code.py` v0.10** — provisioning + launcher + module firmware OTA:
+**`code.py` v0.12** — provisioning + launcher + module firmware OTA:
 - The app POSTs `ssid`, `password` and **`script_url`** to `192.168.4.1/connect`. The Pico
   downloads whatever product `script_url` points to, so the brain is **product-agnostic** —
   a new product is just a new manifest + script, no firmware change. (`SCRIPT_URL` remains a
@@ -56,17 +56,46 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
   `/roles/detect` + `/roles/save` endpoints are kept too.) A `Conductor` is created and
   enumerated lazily on first use and cached. Handlers are transport-agnostic (reusable for a
   future home-WiFi settings page).
-- **Module firmware OTA (PoC v2 Step 5):** `POST /firmware/check` (AP time) compares each
-  module's installed version (read over I2C via `noknok.py` `read_version()` / GET_VERSION
-  `0xB1`) against the manifest's `module_firmware{}` and tells the app whether an update is
-  available. On the connected boot, before `product.py` runs, `check_and_flash_modules()`
-  downloads any outdated module `.bin` from its public raw URL and flashes it over I2C via
-  `module_flasher.py`, then re-verifies the version. Crash-safe — a failed flash leaves the
-  module safe in its bootloader (`0x7E`). Outcomes are logged to `log.txt` (verbose) and
-  `noknok_events.txt` (durable `[FW]` audit trail). The post-flash re-enumerate deliberately
-  does **not** wipe `noknok_state.json`, so modules that weren't flashed keep their addresses.
+- **Module firmware OTA.** A manifest declares only a **floor** per module type
+  (`{"buzzer":{"min":"3.3.1"}}`), not a version or a `.bin` URL. On the connected boot, before
+  `product.py` runs, `check_and_flash_modules()` resolves that floor into concrete firmware:
+  it fetches the [module registry](https://github.com/buildwithnoknok/Ecosystem/blob/main/software/modules.json)
+  to map each type to its repo, then that repo's `firmware/index.json` for the current
+  `{version, url, requires_bootloader}`. Firmware is backwards compatible, so the brain
+  installs what is **current**, not what the product was written against — and because the
+  version lives in the same commit as the binary, the two cannot drift apart. See
+  [firmware-index.md](https://github.com/buildwithnoknok/Ecosystem/blob/main/software/firmware-index.md).
+- **The OTA runs in three passes — decide, fetch, flash.** The version check comes first and
+  costs nothing, so the common boot ("all up to date") touches neither radio nor filesystem.
+  Only when an update is due does it fetch **every** image before erasing the first module:
+  past that point no step needs the radio, so a WiFi drop cannot leave one module half-written
+  and the rest untouched. Images are deleted afterwards.
+- **`_bootloader_gate()` refuses an image the module cannot run.** Backwards compatibility is a
+  promise about the *protocol*, not about *installability* — an app relinked to a new base
+  address is wire-compatible and still hard-faults a module on the older bootloader. Checked
+  against `Conductor.bootloader_version()` (silence = legacy bootloader).
+- **Parked-module rescue (DEV-31).** A module stuck in its bootloader at `0x7E` never answers
+  the enumeration sweep, so it would otherwise be invisible — the product would simply start a
+  module short. `get_conductor()` runs `rescue_parked_module()` **between** `Conductor()` and
+  `enumerate_all()` and pushes a good app back onto it. Logged as `[RESCUE]`.
+- `POST /firmware/check` (AP time) reports installed versions only and returns
+  `resolved:false` — on the setup AP the Pico has no internet and cannot reach the registry.
+- Crash-safe throughout — a failed flash leaves the module safe in its bootloader (`0x7E`).
+  Outcomes go to `log.txt` (verbose) and `noknok_events.txt` (durable `[FW]` audit trail). The
+  post-flash re-enumerate deliberately does **not** wipe `noknok_state.json`, so modules that
+  weren't flashed keep their addresses.
 
-**`noknok.py` v1.5** — Conductor library:
+**`noknok.py` v1.6** — Conductor library.
+
+DEV-31 additions (Sam), all bench-proven over I2C:
+`bootloader_version(entry)` — the fleet discriminator; `None` means the legacy monolithic
+bootloader, which cannot self-update and needs SWD. `stage1_update(entry, image, app_image)` —
+replace a module's bootloader over the bus, then restore its app.
+`rescue_parked_module(get_image)` — recover a module stuck at `0x7E`; **call it before
+`enumerate()`**, since a parked module never answers the enumeration sweep. Bootloader error
+codes to know: **7** = app unhealthy, module parked, rescue it; **8** = wrong file.
+
+Core:
 - Dynamic I2C addressing: modules boot at staging address `0x7F` and are assigned runtime
   addresses; `noknok_state.json` caches the UID→address map so reboots re-find modules without
   re-enumerating (and self-heals if hardware changed).

@@ -28,19 +28,31 @@ Serves the HTML WiFi-setup page. Captive-portal probe paths
 return this page so the OS shows a "Sign in to network" prompt.
 
 ### `POST /firmware/check`
-Compare each connected module's installed firmware against the product manifest.
-Read-only — **no flashing** happens here (that runs headless once the Pico is on WiFi).
+Report each connected module's **installed** firmware. Read-only — **no flashing**
+happens here (that runs headless once the Pico is on WiFi).
 
 | Field | Value |
 |-------|-------|
-| `module_firmware` | JSON string: the manifest's `module_firmware{}` block, e.g. `{"buzzer":{"version":"3.3.1","url":"..."}}` |
+| `module_firmware` | JSON string: the manifest's `module_firmware{}` block, e.g. `{"buzzer":{"min":"3.3.1"}}` |
 
 **Response** `application/json`:
 ```json
-{ "update_needed": true,
-  "modules": [ {"type":"buzzer","installed":"3.3.0","required":"3.3.1","needs_update":true} ] }
+{ "update_needed": false,
+  "resolved": false,
+  "modules": [ {"type":"buzzer","installed":"3.3.0","required":null,"needs_update":false} ] }
 ```
-Degrades gracefully (returns `update_needed:false, modules:[]`) if no Conductor/bus.
+
+> **`resolved` is always `false` here, and `update_needed` with it.** This endpoint
+> runs while the phone is on the `noknok-setup` AP, so the Pico has **no internet**
+> and cannot reach the module registry to find out what the current firmware
+> version is. It can only report what is installed. Manifests carry a floor
+> (`min`), not a version to install, so there is nothing to compare against
+> offline. The real check — resolve, gate, download, flash — runs after the WiFi
+> join in `check_and_flash_modules()`. See
+> [Module Firmware Index](https://github.com/buildwithnoknok/Ecosystem/blob/main/software/firmware-index.md).
+
+The `modules[]` list is still useful to the app as a "what did the brain actually
+see" confirmation. Degrades gracefully (`modules:[]`) if there is no Conductor/bus.
 
 ### `POST /roles/assign`  (preferred)
 Detect which module the customer interacts with **and** save the role in one round
@@ -71,10 +83,29 @@ and continues headless (download `product.py`, OTA-update modules, run the produ
 | `ssid` | home WiFi name (required) |
 | `password` | home WiFi password |
 | `script_url` | raw URL of the product's `product.py` (from the manifest's `files[]`) |
-| `module_firmware` | optional JSON string: the manifest's `module_firmware{}` block, persisted for the headless OTA check |
+| `module_firmware` | optional JSON string: the manifest's `module_firmware{}` block (floors, e.g. `{"buzzer":{"min":"3.3.1"}}`), persisted to `wifi.json` for the headless OTA check |
 
 **Response:** the "Connected!" HTML page. (The Pico acts on the credentials after
 the page is delivered.)
+
+**What happens after the reset**, in order — this is where firmware is actually
+handled, because it is the first point at which the Pico has internet:
+
+1. Join home WiFi, download `product.py` if missing.
+2. Resolve `module_firmware` floors into concrete versions: fetch
+   `Ecosystem/software/modules.json`, then each module's `firmware/index.json`.
+3. Rescue any module parked in its bootloader at `0x7E` (DEV-31), **before**
+   enumerating — a parked module never answers the enumeration sweep.
+4. Compare installed versus published; if nothing is outdated, stop here having
+   written nothing to flash.
+5. Otherwise check `requires_bootloader` per module type and drop any type whose
+   modules cannot run the image; fetch every remaining image **before** touching
+   a module; flash from local files; delete them.
+6. Run `product.py`.
+
+Every step degrades to a no-op rather than failing the boot. Progress is
+log-only (`log.txt` + `noknok_events.txt`) — there is no live channel back to the
+phone by this point, since it is long off the setup AP.
 
 ## Planned
 
