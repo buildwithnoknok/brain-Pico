@@ -8,6 +8,10 @@
 # the module already SWD-flashed with stage-0 + stage-1 (bench_i2c_start.bin).
 # Put noknok_stage1_v101.bin on CIRCUITPY alongside this file.
 #
+# The three DEV-31 commands (get_version, verify_stage1, wait_for_bootloader_gone)
+# live in ModuleFlasher itself; this script drives them step by step so each one
+# is visible. For the product-shaped flow see bench_conductor_stage1.py.
+#
 # What it proves, in order:
 #   1. GET_VERSION (0xB1) answers at 0x7E   -> stage-1 is up and speaks the new command
 #   2. Reported version is 1.0.0            -> the SWD-flashed build is what is running
@@ -25,58 +29,12 @@
 import time
 import board
 import busio
-from module_flasher import ModuleFlasher, FlashError, BL_ADDR, PAGE, crc32
+from module_flasher import ModuleFlasher, PAGE, crc32
 
-CMD_VERIFY_STAGE1 = 0x06
-CMD_GET_VERSION   = 0xB1
 
 STAGE1_IMAGE = "noknok_stage1_v101.bin"
 EXPECT_BEFORE = (1, 0, 0)
 EXPECT_AFTER  = (1, 0, 1)
-
-
-class Stage1Flasher(ModuleFlasher):
-    """ModuleFlasher plus the two DEV-31 commands."""
-
-    def get_version(self):
-        """Write 0xB1, then read 4 bytes: [proto, major, minor, patch].
-        Returns the tuple, or None if the bootloader isn't answering."""
-        if not self._write(BL_ADDR, [CMD_GET_VERSION]):
-            return None
-        buf = bytearray(4)
-        while not self.i2c.try_lock():
-            pass
-        try:
-            self.i2c.readfrom_into(BL_ADDR, buf)
-            return tuple(buf)
-        except OSError:
-            return None
-        finally:
-            self.i2c.unlock()
-
-    def verify_stage1(self, length, crc):
-        """Same payload as VERIFY, different opcode. READY means the control
-        block is now written and stage-0 will install on the next reset."""
-        pkt = bytes([CMD_VERIFY_STAGE1,
-                     length & 0xFF, (length >> 8) & 0xFF,
-                     (length >> 16) & 0xFF, (length >> 24) & 0xFF,
-                     crc & 0xFF, (crc >> 8) & 0xFF,
-                     (crc >> 16) & 0xFF, (crc >> 24) & 0xFF])
-        if not self._write(BL_ADDR, pkt):
-            raise FlashError("VERIFY_STAGE1 not acknowledged")
-        self._wait_ready(timeout=2.0)
-
-    def wait_for_bootloader_gone(self, timeout=2.0):
-        """Block until 0x7E STOPS answering — the module has reset into stage-0.
-        This matters: after BOOT the bootloader is still at 0x7E for a moment,
-        so a plain wait_for_bootloader() would return immediately with the OLD
-        stage-1 and the test would be blind."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self._read_status() is None:
-                return True
-            time.sleep(0.01)
-        raise FlashError("bootloader never went away after BOOT")
 
 
 def banner(s):
@@ -92,7 +50,7 @@ def fmt(v):
 def main():
     # Same pins + speed as the Conductor (noknok.py): SCL=GP9, SDA=GP8, 100 kHz.
     i2c = busio.I2C(board.GP9, board.GP8, frequency=100_000)
-    f = Stage1Flasher(i2c)
+    f = ModuleFlasher(i2c)          # get_version / verify_stage1 / wait_for_bootloader_gone live here now
 
     # ── 1-2. is stage-1 up, and is it the version we flashed? ─────────────────
     banner("1. GET_VERSION on the freshly SWD-flashed stage-1")

@@ -11,10 +11,25 @@
 #   write [0x01]                          ERASE app region + metadata
 #   write [0x02, offHi, offLo, <64 B>]    WRITE_CHUNK (one 64-byte page)
 #   write [0x04, len(4 LE), crc32(4 LE)]  VERIFY  -> writes validity marker
-#   write [0x05]                          BOOT (jump to app if valid)
+#   write [0x05]                          BOOT (jump to app if valid; or, if a
+#                                         stage-1 update is armed, reset so
+#                                         stage-0 installs it)
+#   write [0x06, len(4 LE), crc32(4 LE)]  VERIFY_STAGE1 -> arms a bootloader
+#                                         self-update (stage-0/stage-1 only)
+#   write [0xB1], then read 4 bytes       GET_VERSION -> [proto, major, minor,
+#                                         patch] (stage-0/stage-1 only)
 #   read  2 bytes -> [state, last_error]  state: 0 IDLE 1 BUSY 2 READY 3 ERROR
 #
 # A running app is flipped into the bootloader with app command 0xB0.
+#
+# Bootloader self-update (DEV-31): the transfer is IDENTICAL to an app update —
+# same ERASE / WRITE_CHUNK into the same staging area — only the closing command
+# differs (VERIFY_STAGE1 instead of VERIFY). The app is destroyed in the process
+# (staging IS the app region) and must be re-pushed afterwards; flash_stage1()
+# does not do that for you.
+#
+# GET_VERSION is also the fleet discriminator: the legacy monolithic bootloader
+# does not implement 0xB1, so "no answer" means old world / not self-updatable.
 #
 # CRC32 = zlib (poly 0xEDB88320, init/final 0xFFFFFFFF) to match the bootloader.
 
@@ -23,10 +38,12 @@ import time
 BL_ADDR        = 0x7E    # bootloader flash-mode address
 APP_CMD_ENTER  = 0xB0    # app command: reset into bootloader
 
-CMD_ERASE      = 0x01
-CMD_WRITE      = 0x02
-CMD_VERIFY     = 0x04
-CMD_BOOT       = 0x05
+CMD_ERASE          = 0x01
+CMD_WRITE          = 0x02
+CMD_VERIFY         = 0x04
+CMD_BOOT           = 0x05
+CMD_VERIFY_STAGE1  = 0x06   # DEV-31
+CMD_GET_VERSION    = 0xB1   # DEV-31 (same shape as the app's GET_VERSION)
 
 ST_IDLE, ST_BUSY, ST_READY, ST_ERROR = 0, 1, 2, 3
 
@@ -165,6 +182,94 @@ class ModuleFlasher:
     def boot(self):
         """Jump to the freshly-flashed app. No status afterwards (module re-enumerates)."""
         self._write(BL_ADDR, [CMD_BOOT])
+
+    # ── DEV-31: bootloader self-update ───────────────────────────────────────
+    def get_version(self):
+        """Bootloader version: write 0xB1, read [proto, major, minor, patch].
+        Returns the 4-tuple, or None if the bootloader doesn't answer — which is
+        how you tell a legacy monolithic bootloader (not self-updatable) from a
+        stage-0/stage-1 one."""
+        if not self._write(BL_ADDR, [CMD_GET_VERSION]):
+            return None
+        buf = bytearray(4)
+        while not self.i2c.try_lock():
+            pass
+        try:
+            self.i2c.readfrom_into(BL_ADDR, buf)
+            return tuple(buf)
+        except OSError:
+            return None
+        finally:
+            self.i2c.unlock()
+
+    def verify_stage1(self, length, crc):
+        """Same payload as VERIFY, different opcode. READY means the staged image
+        passed its CRC and the control block is written: stage-0 will install it
+        on the next reset (which boot() triggers)."""
+        pkt = bytes([CMD_VERIFY_STAGE1,
+                     length & 0xFF, (length >> 8) & 0xFF,
+                     (length >> 16) & 0xFF, (length >> 24) & 0xFF,
+                     crc & 0xFF, (crc >> 8) & 0xFF,
+                     (crc >> 16) & 0xFF, (crc >> 24) & 0xFF])
+        if not self._write(BL_ADDR, pkt):
+            raise FlashError("VERIFY_STAGE1 not acknowledged")
+        self._wait_ready(timeout=2.0)
+
+    def wait_for_bootloader_gone(self, timeout=2.0):
+        """Block until 0x7E STOPS answering — the module has reset into stage-0.
+        Essential after boot() on a stage-1 update: the OLD stage-1 is still at
+        0x7E for a moment, so wait_for_bootloader() alone would return at once
+        with the old one and the caller would never see the new version."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._read_status() is None:
+                return True
+            time.sleep(0.01)
+        raise FlashError("bootloader never went away after BOOT")
+
+    def flash_stage1(self, data, runtime_addr=None, progress=None):
+        """
+        Replace the module's stage-1 bootloader over I2C (DEV-31).
+
+        Same transfer as flash(), closed with VERIFY_STAGE1 instead of VERIFY;
+        then BOOT hands off to stage-0, which installs the new stage-1 and reboots
+        into it. Returns (version_before, version_after) as 4-tuples.
+
+        The module is left in the bootloader with NO valid app — the staging area
+        is the app region. Re-push the application with flash(app, runtime_addr=None).
+
+        Raises FlashError if the module has no stage-0/stage-1 (legacy bootloader,
+        no 0xB1) — such modules cannot self-update and need SWD.
+        """
+        total = len(data)
+        if total == 0:
+            raise FlashError("empty stage-1 image")
+
+        if runtime_addr is not None:
+            self.enter_bootloader(runtime_addr)
+        self.wait_for_bootloader()
+
+        before = self.get_version()
+        if before is None:
+            raise FlashError("legacy bootloader (no GET_VERSION) — cannot self-update, needs SWD")
+
+        self.erase()
+        off = 0
+        while off < total:
+            self.write_chunk(off, data[off:off + PAGE])
+            off += PAGE
+            if progress:
+                progress(min(off, total), total)
+
+        self.verify_stage1(total, crc32(data))
+        self.boot()
+        self.wait_for_bootloader_gone(timeout=2.0)
+        self.wait_for_bootloader(timeout=5.0)
+
+        after = self.get_version()
+        if after is None:
+            raise FlashError("new stage-1 did not answer GET_VERSION after install")
+        return before, after
 
     # ── orchestration ────────────────────────────────────────────────────────
     def flash(self, data, runtime_addr=None, progress=None):

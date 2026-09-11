@@ -298,6 +298,68 @@ class Conductor:
             return True
         raise ValueError("update_module: unknown bus %r" % bus)
 
+    # ── Bootloader self-update (DEV-31) ────────────────────────────────────────
+    # A second, separate update type: same transport, different payload, and it
+    # always destroys the application (the staging area IS the app region), so the
+    # app is re-pushed straight afterwards. I2C only until the CH32V203 port lands.
+
+    def bootloader_version(self, entry):
+        """
+        Read a module's bootloader version — the fleet discriminator.
+
+        Drops the running app into the bootloader (0xB0), asks 0xB1, then BOOTs
+        the app again and re-enumerates. Returns (proto, major, minor, patch) for a
+        stage-0/stage-1 module, or None for the legacy monolithic bootloader,
+        which does not implement 0xB1 and cannot self-update (needs SWD).
+
+        Heavier than it sounds — the module has to be in the bootloader to answer —
+        so call it once per module when deciding whether a stage-1 update applies,
+        not on every enumeration.
+        """
+        if entry.get("bus") != "i2c":
+            raise NotImplementedError("bootloader_version: USB modules not yet (V203 port pending)")
+        from module_flasher import ModuleFlasher
+        f = ModuleFlasher(self.i2c)
+        f.enter_bootloader(entry["address"])
+        f.wait_for_bootloader()
+        v = f.get_version()
+        f.boot()                        # app is still valid — jump straight back
+        self.enumerate()
+        return v
+
+    def stage1_update(self, entry, stage1_image, app_image=None, progress=None):
+        """
+        Replace one module's stage-1 bootloader over the bus, then (optionally)
+        restore its application.
+
+        `entry`        a firmware_report() dict (needs 'bus' + 'address')
+        `stage1_image` the stage-1 .bin (linked at 0x0400)
+        `app_image`    the module's offset-linked app .bin; if given it is pushed
+                       straight after the bootloader install so the module comes
+                       back running. If None the module is left in the bootloader
+                       with no app — you must flash one before it is usable.
+
+        Returns {'before': (proto,maj,min,pat), 'after': (...), 'app_restored': bool}.
+        Raises on a legacy module (no 0xB1) — those need SWD.
+
+        Re-enumerates at the end, same as update_module(). Sequence per the
+        module-I2C-bootloader spec §5: ERASE -> WRITE_CHUNK xN -> VERIFY_STAGE1 ->
+        BOOT -> (module vanishes while stage-0 copies, ~300 ms) -> new stage-1
+        answers -> version read back -> app re-pushed.
+        """
+        if entry.get("bus") != "i2c":
+            raise NotImplementedError("stage1_update: USB modules not yet (V203 port pending)")
+        from module_flasher import ModuleFlasher
+        f = ModuleFlasher(self.i2c)
+        before, after = f.flash_stage1(stage1_image, runtime_addr=entry.get("address"),
+                                       progress=progress)
+        restored = False
+        if app_image:
+            f.flash(app_image, runtime_addr=None, progress=progress)   # already in BL
+            restored = True
+        self.enumerate()
+        return {"before": before, "after": after, "app_restored": restored}
+
     def update_all(self, manifest_fw, get_image, progress=None, logfn=print):
         """
         Flash every module that firmware_report() flags needs_update.
