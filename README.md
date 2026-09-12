@@ -40,7 +40,14 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
 
 ## Current versions & features (PoC v1)
 
-**`code.py` v0.13** — provisioning + launcher + module firmware OTA. Field-hardened 12 Sep 2026:
+**`code.py` v0.14** — provisioning + launcher + module firmware OTA. Field-hardened 12 Sep 2026:
+- **Cache-first, once a day.** On a connected boot the OTA pass first refreshes an on-device
+  image cache (one download per type per published version) — **before any Conductor exists**,
+  the one condition under which downloads on this board are reliable — then creates the
+  Conductor and flashes from the cache. It does so at most once per 24 h (last-check time in
+  `microcontroller.nvm`); other boots make no requests and still rescue a parked module from
+  the cache. The gate refuses per module, not per type. Any refused/failed update or rescue
+  plays the buzzer error motif and flashes the LED Buttons red before the product starts.
 - **Runs offline.** A failed WiFi join never deletes `wifi.json` any more; if `product.py`
   exists the product runs without updates and the credentials are retried next boot. Only the
   factory-reset gesture removes them. (It used to wipe them after three attempts and fall into

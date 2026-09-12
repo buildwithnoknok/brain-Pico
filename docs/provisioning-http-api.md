@@ -92,17 +92,28 @@ the page is delivered.)
 handled, because it is the first point at which the Pico has internet:
 
 1. Join home WiFi, download `product.py` if missing.
-2. Resolve `module_firmware` floors into concrete versions: fetch
-   `Ecosystem/software/modules.json`, then each module's `firmware/index.json`.
-3. Rescue any module parked in its bootloader at `0x7E` (DEV-31), **before**
-   enumerating — a parked module never answers the enumeration sweep.
-4. Compare installed versus published; if nothing is outdated, stop here having
-   written nothing to flash.
-5. Otherwise check the index's `layout` against each module's actual bootloader
-   layout (byte 5 of the bootloader's `0xB1` reply) — exact match — and drop any
-   type whose modules cannot run the image; fetch every remaining image
-   **before** touching a module; flash from local files; delete them.
-6. Run `product.py` under three-strikes crash recovery (restart with backoff;
+2. If a firmware check completed less than 24 h ago (time kept in
+   `microcontroller.nvm`), skip to step 4 with the cache as the only image
+   source — no GitHub requests this boot.
+3. Otherwise resolve `module_firmware` floors: fetch
+   `Ecosystem/software/modules.json`, then each module's `firmware/index.json`;
+   then refresh the on-device image cache (`/fw_<type>.bin` + `.json` sidecar)
+   for every type whose cached version/crc differs from current — **before any
+   Conductor exists** (downloads after one has existed can hang). Each download
+   is verified against the index's `size`/`crc32`.
+4. Rescue any module parked in its bootloader at `0x7E` (DEV-31), **before**
+   enumerating — a parked module never answers the enumeration sweep. Image
+   comes from the cache, layout-checked against the module's own bootloader.
+5. Compare installed versus published; if nothing is outdated, stop here having
+   written nothing further to flash.
+6. Check the index's `layout` against each outdated module's actual bootloader
+   layout (byte 5 of the bootloader's `0xB1` reply) — exact match, **per
+   module** — and exclude the ones that cannot run the image; flash the rest
+   from the cache. The radio is not involved from here on.
+7. If anything was refused or failed (update, fetch, rescue): buzzer error
+   motif + LED Buttons red for a moment — the customer's only signal until the
+   app can show device status.
+8. Run `product.py` under three-strikes crash recovery (restart with backoff;
    after three, a safe idle that still answers the factory-reset gesture and
    re-fetches `product.py` once if online).
 
