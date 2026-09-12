@@ -158,7 +158,8 @@ monolithic all-products document.
 | `noknok_roles.json` | `/roles/*` | `role_id → module UID` map |
 | `noknok_state.json` | `enumerate()` | last-known module addresses (fast reconnect) |
 | `product_settings.json` | the product (+ future `/settings`) | product runtime settings |
-| `log.txt` / `noknok_events.txt` | `code.py` + products | boot log / durable `[FW]` audit |
+| `log.txt` / `noknok_events.txt` | `code.py` + products | verbose boot log (written only with the `/debug_log` marker, or once on a crash) / durable `[FW]` `[RESCUE]` `[CRASH]` audit (always) |
+| `fw_<type>.bin` + `fw_<type>.json` | OTA pass | on-device image cache: last fetched app per module type + sidecar (version, layout, size, crc32). Flash source and offline rescue source. |
 
 ## See also
 - Implementation: `software/code.py` (route handlers) and `software/noknok.py`

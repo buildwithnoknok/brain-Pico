@@ -72,8 +72,8 @@ Earlier features:
 - **URL-decodes** the form fields (the app sends `application/x-www-form-urlencoded`).
 - **Retries the WiFi join 3×** on both the provisioning and direct-boot paths — the Pico W
   radio often fails the first join after AP mode with "Unknown failure 205", then succeeds.
-- **Timestamped logging** to `log.txt` (uptime, plus UTC wall-clock once `adafruit_ntp` syncs).
-- Crash-safe: a failing `product.py` is caught and the board enters a safe idle, not a reboot loop.
+- **Timestamped logging** (uptime, plus UTC wall-clock once `adafruit_ntp` syncs) to the serial
+  console and a RAM ring; to `log.txt` only with the `/debug_log` marker (see above).
 - **Role assignment over the AP** (PoC v1 Step 3): `POST /roles/assign` (form `role_id`,
   `module_type`, `exclude`) detects which module the customer touches **and** saves the
   `role → UID` in one request → `{"uid","saved":true}` or `{"timeout":true}`. (Older
@@ -89,11 +89,13 @@ Earlier features:
   installs what is **current**, not what the product was written against — and because the
   version lives in the same commit as the binary, the two cannot drift apart. See
   [firmware-index.md](https://github.com/buildwithnoknok/Ecosystem/blob/main/software/firmware-index.md).
-- **The OTA runs in three passes — decide, fetch, flash.** The version check comes first and
-  costs nothing, so the common boot ("all up to date") touches neither radio nor filesystem.
-  Only when an update is due does it fetch **every** image before erasing the first module:
-  past that point no step needs the radio, so a WiFi drop cannot leave one module half-written
-  and the rest untouched. Images are deleted afterwards.
+- **Cache-first.** When a check is due (once per 24 h), the pass refreshes the on-device cache
+  (`/fw_<type>.bin` + `.json` sidecar) for every type whose cached version/crc differs from
+  current — **before any Conductor exists** — then creates the Conductor, compares versions,
+  gates per module, and flashes from the cache. Past the Conductor no step needs the radio, so
+  a WiFi drop cannot leave one module half-written and the rest untouched. The cache stays: it
+  is the offline rescue source. (A download made after a Conductor has existed in the process
+  can hang without timing out — reproduced 12 Sep 2026 — which is why the order is fixed.)
 - **`_bootloader_gate()` refuses an image the module cannot run.** Backwards compatibility is a
   promise about the *protocol*, not about *installability* — an app relinked to a new base
   address is wire-compatible and still hangs a module whose bootloader writes elsewhere, and
@@ -111,9 +113,9 @@ Earlier features:
 - `POST /firmware/check` (AP time) reports installed versions only and returns
   `resolved:false` — on the setup AP the Pico has no internet and cannot reach the registry.
 - Crash-safe throughout — a failed flash leaves the module safe in its bootloader (`0x7E`).
-  Outcomes go to `log.txt` (verbose) and `noknok_events.txt` (durable `[FW]` audit trail). The
-  post-flash re-enumerate deliberately does **not** wipe `noknok_state.json`, so modules that
-  weren't flashed keep their addresses.
+  Outcomes go to the serial console and `noknok_events.txt` (durable `[FW]`/`[RESCUE]`/`[CRASH]`
+  audit trail). The post-flash re-enumerate deliberately does **not** wipe `noknok_state.json`,
+  so modules that weren't flashed keep their addresses.
 
 **`noknok.py` v1.6** — Conductor library.
 
@@ -152,8 +154,10 @@ Core:
 2. **Power-cycle** the Pico (the radio is not reset by a soft reboot; a power cycle also returns
    the I2C modules to their `0x7F` staging address).
 3. Join `noknok-setup`, open the setup page (or use the noknok app), enter WiFi credentials.
-4. Review `log.txt` on the Pico for the boot/provisioning log (or watch the live serial console
-   in Thonny — the host drive view of `log.txt` can be stale while the device owns the filesystem).
+4. Watch the live serial console, or — to have `log.txt` written on the Pico — first create an
+   empty file named `debug_log` in its root (that marker is the only thing that turns on flash
+   logging; the field default is off). The host drive view of `log.txt` can be stale while the
+   device owns the filesystem. `noknok_events.txt` is always written.
 
 ## Bench-flashing modules (bring-up)
 
