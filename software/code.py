@@ -1,5 +1,37 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.12 (DEV-31 — parked-module rescue, atomic OTA, firmware index)
+# Version: 0.13 (field hardening pass 1 — survive a customer's house)
+#
+# v0.13 changes (Sue): the four failure modes from the 12 Sep field review
+#   that turn "works on the bench" into "keeps working at home".
+#   - WiFi credentials are never deleted by a failed join. A router hiccup used
+#     to wipe wifi.json after three attempts and drop into AP mode, forcing a
+#     full re-setup — and the product would not run until then. Now: offline,
+#     the product runs anyway (no OTA, no NTP); credentials are retried on the
+#     next boot; only the factory-reset gesture deletes them. Boot-time budget
+#     on the OTA pass (registry 6 s, index 8 s): a slow uplink costs seconds,
+#     not the sum of every timeout, and the product starts either way.
+#   - product.py crash recovery, three strikes. It used to run bare: an
+#     exception ended code.py at CircuitPython's "Code done running" prompt —
+#     dead until a power cycle, deterministic crash = dead forever, and the
+#     factory-reset gesture unreachable (DEV-7). Now: reload with backoff,
+#     strike count in microcontroller.nvm (not the FAT filesystem), cleared on
+#     a power-on start (supervisor.runtime.run_reason); on the third strike a
+#     clean boot parks in a safe idle that still answers the knob-hold reset and
+#     tries a freshly published product.py once if online.
+#   - Flash writes cut to what earns them. log() used to append to log.txt on
+#     every line — "waiting for setup" every 5 s — the single largest write load
+#     on an unjournaled FAT filesystem that corrupts on power loss (DEV-18).
+#     Now: RAM ring + serial; log.txt only with the bench marker /debug_log
+#     present, or one flush on a crash. _save_state() (noknok.py) skips the
+#     write when nothing changed. Events file unchanged (rare, audit).
+#   - Downloaded images are integrity-checked against index.json size + crc32
+#     before touching a module. The bootloader's own CRC cannot catch a short
+#     download — it is computed over whatever we send. Checked if present in
+#     the index; warned about if absent.
+#   - Fetched images are kept as an on-device cache (/fw_<type>.bin + .json
+#     sidecar with version/layout/size/crc32) instead of deleted, so a module
+#     parked after a power cut is rescued with no internet, from the Pico
+#     itself. Same layout check; sidecar integrity re-checked on read.
 #
 # v0.12 changes (Sue): DEV-31 app-side hardening.
 #   - Firmware resolution via the module registry. Manifests no longer pin a
@@ -160,16 +192,54 @@ def _timestamp():
     except Exception:
         return "[ ?.??] "
 
+# Flash-write policy for the verbose log. CircuitPython's FAT filesystem is not
+# journaled; a power cut during a write can corrupt it, and a corrupt filesystem
+# means the customer's Pico needs a USB reflash (DEV-18). The verbose log used to
+# append to flash on EVERY line — including "waiting for setup" every 5 s — which
+# made it the single largest write load on the device. Now: every line goes to
+# the serial console and a RAM ring; it reaches log.txt only if the bench has
+# created the marker file below, or once, on a crash, so the last lines before
+# a failure survive a power cycle. The events file (rare, audit) still writes.
+DEBUG_LOG_MARKER = "/debug_log"        # bench: `pico.py put` an empty file of this name
+LOG_RING_LINES   = 80
+_log_ring        = []
+_log_to_flash    = None                # decided on first log() call
+
+def _flash_logging_enabled():
+    global _log_to_flash
+    if _log_to_flash is None:
+        try:
+            os.stat(DEBUG_LOG_MARKER)
+            _log_to_flash = True
+        except OSError:
+            _log_to_flash = False
+    return _log_to_flash
+
 def log(msg):
-    """Print to the serial console AND append to log.txt on the Pico.
-    Every line is timestamped (uptime, plus wall-clock once NTP has synced).
-    Lets us read what happened after a power-cycle (when serial output is missed).
-    Open log.txt in Thonny's file browser to review."""
+    """Print to the serial console and keep the last LOG_RING_LINES lines in
+    RAM. Appends to log.txt on the Pico only when the bench debug marker exists
+    (see above). Every line is timestamped (uptime, plus wall-clock once NTP
+    has synced)."""
     line = _timestamp() + str(msg)
     sys.stdout.write(line + "\n")          # console output
+    _log_ring.append(line)
+    if len(_log_ring) > LOG_RING_LINES:
+        del _log_ring[0]
+    if _flash_logging_enabled():
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+def flush_log_ring(reason):
+    """One-shot: write the RAM ring to log.txt. Used on a crash so the lines
+    leading up to it survive the reload — one write, not one per line."""
     try:
         with open(LOG_FILE, "a") as f:
-            f.write(line + "\n")
+            f.write("\n" + _timestamp() + "===== RING FLUSH (%s) =====\n" % reason)
+            for line in _log_ring:
+                f.write(line + "\n")
     except Exception:
         pass
 
@@ -210,7 +280,11 @@ LOG_MAX_BYTES = 32000  # cap so the log can't fill the Pico flash (~32 KB)
 
 def log_new_boot():
     """Append a boot separator to the log (history accumulates across boots).
-    If the file has grown past LOG_MAX_BYTES, clear it first so it stays bounded."""
+    If the file has grown past LOG_MAX_BYTES, clear it first so it stays bounded.
+    Only touches flash when flash logging is enabled (bench marker present)."""
+    _log_ring.append(_timestamp() + "===== BOOT =====")
+    if not _flash_logging_enabled():
+        return
     try:
         try:
             if os.stat(LOG_FILE)[6] > LOG_MAX_BYTES:   # index 6 = file size
@@ -820,8 +894,13 @@ def _resolve_module_firmware(session, module_firmware):
 
     Every failure here is a safe no-op: a type we cannot resolve is simply left
     out, so firmware_report() sees no required version and flashes nothing."""
+    # Boot-time budget. This runs on every connected boot, before the product
+    # starts, so a slow or absent uplink must cost seconds, not the sum of every
+    # timeout. If the registry itself is not reachable quickly, the whole pass is
+    # skipped and the product starts; the next boot tries again.
     try:
-        registry = (_download_json(session, MODULE_REGISTRY_URL) or {}).get("modules", {})
+        registry = (_download_json(session, MODULE_REGISTRY_URL, timeout=REGISTRY_TIMEOUT_S)
+                    or {}).get("modules", {})
     except Exception as e:
         log(f"[fw] module registry unavailable ({e!r}) — no firmware will be installed")
         return {}
@@ -834,7 +913,7 @@ def _resolve_module_firmware(session, module_firmware):
             log(f"[fw] {mtype}: not in the module registry — skipping")
             continue
         try:
-            index = _download_json(session, entry["index"]) or {}
+            index = _download_json(session, entry["index"], timeout=INDEX_TIMEOUT_S) or {}
         except Exception as e:
             log(f"[fw] {mtype}: index fetch failed ({e!r}) — skipping")
             continue
@@ -853,7 +932,12 @@ def _resolve_module_firmware(session, module_firmware):
             continue
 
         resolved[mtype] = {"version": version, "url": url,
-                           "layout": index.get("layout")}
+                           "layout": index.get("layout"),
+                           "size":   index.get("size"),
+                           "crc32":  index.get("crc32")}
+        if index.get("size") is None or index.get("crc32") is None:
+            log(f"[fw] {mtype}: index has no size/crc32 — download will not be "
+                f"integrity-checked (add them to firmware/index.json)")
         log(f"[fw] {mtype}: current is {version} (min {minimum or 'none'}, "
             f"layout {index.get('layout', '-')})")
     return resolved
@@ -913,10 +997,115 @@ def _bootloader_gate(c, entries, layout):
     return True, "layout %s" % layout
 
 
-def _download_image(session, url, timeout=30):
+# Boot-time budget for the OTA pass (see _resolve_module_firmware). The registry
+# is the first fetch: if it is not back in this many seconds the uplink is not
+# usable for updates right now and the product should just start.
+REGISTRY_TIMEOUT_S = 6
+INDEX_TIMEOUT_S    = 8
+
+# ── On-device firmware cache ────────────────────────────────────────────────────
+# Every image the OTA pass downloads is kept (one per module type, overwritten
+# by the next fetch of that type) with a sidecar describing it. That is the
+# rescue source when there is no internet: a module parked after a power cut
+# gets its last-known-good app back from the Pico itself. Costs nothing extra —
+# the fetch already wrote the file; we just stop deleting it. The sidecar's own
+# size/crc32 are re-checked on read, so a cache file left half-written by a
+# power cut during the fetch is rejected rather than flashed.
+
+def _cache_paths(mtype):
+    return "/fw_%s.bin" % mtype, "/fw_%s.json" % mtype
+
+def _cache_image(mtype, image, spec):
+    """Store a verified image + sidecar. Returns the .bin path. Sidecar carries
+    what rescue needs to trust it later: version, layout, size, crc32."""
+    from module_flasher import crc32 as _crc
+    bin_path, meta_path = _cache_paths(mtype)
+    meta = {"version": spec.get("version"), "layout": spec.get("layout"),
+            "size": len(image), "crc32": "%08x" % _crc(image)}
+    with open(bin_path, "wb") as fh:
+        fh.write(image)
+    with open(meta_path, "w") as fh:
+        json.dump(meta, fh)
+    return bin_path
+
+def _cached_image(entry):
+    """Rescue image from the on-device cache for entry['type'], layout-checked
+    against the parked module's own bootloader layout and integrity-checked
+    against the sidecar. Raises with a clear reason if it cannot be used."""
+    bin_path, meta_path = _cache_paths(entry["type"])
+    try:
+        with open(meta_path, "r") as fh:
+            meta = json.load(fh)
+        with open(bin_path, "rb") as fh:
+            image = fh.read()
+    except (OSError, ValueError):
+        raise ValueError("no cached image for %r" % entry["type"])
+    have, need = entry.get("bootloader_layout"), meta.get("layout")
+    if need is None or have is None or have != need:
+        raise ValueError("cached image layout %s != module layout %s" % (need, have))
+    _verify_image(image, meta.get("size"), meta.get("crc32"))
+    log(f"[rescue] using cached {entry['type']} {meta.get('version')} ({len(image)} B)")
+    return image
+
+def rescue_offline():
+    """Recover a parked module with no internet: run the rescue with the cache
+    as the only image source. Used on the offline boot path (A1). Releases the
+    Conductor afterwards so product.py can create its own."""
+    try:
+        get_conductor(rescue_get_image=_cached_image)
+    except Exception as e:
+        log(f"[rescue] offline rescue error (ignored): {e!r}")
+    _release_conductor()
+
+
+# ── Product crash recovery ──────────────────────────────────────────────────────
+# Three strikes, mirroring stage-1's rule for a module app. A crashing
+# product.py is restarted by a soft reload (which also releases the I2C pins it
+# held); the strike count lives in microcontroller.nvm — a tiny flash region
+# separate from the FAT filesystem, so it involves none of the DEV-18 risk —
+# and it is cleared on a power-on / hard reset, so a power cycle always grants
+# a fresh three tries. On the third strike the device reloads once more and
+# the clean boot goes straight to a safe idle that still answers the factory-
+# reset gesture (DEV-7), rather than a dead "Code done running" prompt the
+# customer cannot see.
+CRASH_NVM_INDEX  = 0            # one byte
+CRASH_MAX        = 3
+CRASH_MAGIC      = 0xC0         # high bits mark "this byte is ours"
+
+def _crash_count():
+    try:
+        b = microcontroller.nvm[CRASH_NVM_INDEX]
+        return (b & 0x0F) if (b & 0xF0) == CRASH_MAGIC else 0
+    except Exception:
+        return 0
+
+def _set_crash_count(n):
+    try:
+        microcontroller.nvm[CRASH_NVM_INDEX] = CRASH_MAGIC | (n & 0x0F)
+    except Exception:
+        pass
+
+def _is_fresh_start():
+    """True on a power-on / hard reset, False after supervisor.reload().
+    supervisor.runtime.run_reason is the right signal: microcontroller.cpu.
+    reset_reason does not change across a VM reload, so keying on it would clear
+    the strike count on every restart and the counter would never reach three."""
+    try:
+        return supervisor.runtime.run_reason == supervisor.RunReason.STARTUP
+    except Exception:
+        return False
+
+
+def _download_image(session, url, timeout=30, size=None, crc32=None):
     """Download one module's offset-linked app .bin over WiFi (BINARY, not .text).
     Returns bytes. Raises on any connectivity/HTTP/size failure — update_all()
-    (noknok.py) catches it, marks that module FAILED and moves on to the rest."""
+    (noknok.py) catches it, marks that module FAILED and moves on to the rest.
+
+    `size` / `crc32` come from the module's index.json and are checked before
+    the bytes go anywhere near a module. The bootloader's own CRC cannot catch
+    a truncated or corrupted download — it is computed over whatever we send —
+    so without this a short download would be flashed, pass verification, hang
+    the module, get parked, and be downloaded again."""
     resp = session.get(url, timeout=timeout)
     try:
         if resp.status_code != 200:
@@ -926,7 +1115,21 @@ def _download_image(session, url, timeout=30):
         resp.close()
     if len(image) < 256:  # a real app image is KBs; this size means an error
         raise ValueError("image too small (%d bytes) — not a firmware binary" % len(image))
+    _verify_image(image, size, crc32)
     return image
+
+
+def _verify_image(image, size, crc32):
+    """Raise unless `image` matches the declared size and CRC32 (zlib). Either
+    may be None (older index.json) — then that check is skipped."""
+    if size is not None and len(image) != int(size):
+        raise ValueError("image size %d != declared %d" % (len(image), int(size)))
+    if crc32 is not None:
+        from module_flasher import crc32 as _crc
+        got = _crc(image)
+        want = int(crc32, 16) if isinstance(crc32, str) else int(crc32)
+        if got != want:
+            raise ValueError("image crc32 %08x != declared %08x" % (got, want))
 
 def check_and_flash_modules(module_firmware):
     """Bring every connected module (I2C + USB) up to the manifest's
@@ -978,16 +1181,22 @@ def check_and_flash_modules(module_firmware):
         until we have asked it, and a parked module is the rare case. Same
         layout rule as the gate: a parked module is already in its bootloader,
         so its layout is known for free, and pushing a wrong-layout image would
-        just hang it again."""
+        just hang it again. Falls back to the on-device cache if the download
+        fails — a rescue should not depend on GitHub answering right now."""
         spec = resolved.get(entry["type"]) or {}
         url  = spec.get("url")
         if not url:
-            raise ValueError("no resolved firmware for %r" % entry["type"])
+            return _cached_image(entry)
         have, need = entry.get("bootloader_layout"), spec.get("layout")
         if need is None or have is None or have != need:
             raise ValueError("layout mismatch: module is %s, image is %s"
                              % (have, need))
-        return _download_image(session, url)
+        try:
+            return _download_image(session, url, size=spec.get("size"),
+                                   crc32=spec.get("crc32"))
+        except Exception as e:
+            log(f"[rescue] download failed ({e!r}) — trying the on-device cache")
+            return _cached_image(entry)
 
     # ── Pass 1: decide. No image downloads, no filesystem writes. ─────────────
     # The overwhelmingly common boot is "everything already current", and that
@@ -1038,17 +1247,16 @@ def check_and_flash_modules(module_firmware):
     _release_conductor()
     local_bins = {}                      # module type -> file on the Pico FS
     for mtype in types:
-        url = _url_for(mtype)
+        spec = resolved[mtype]
+        url  = spec.get("url")
         if not url:
             log(f"[fw] {mtype}: manifest has no url — skipping")
             continue
-        fname = "/fw_%s.bin" % mtype
         try:
-            image = _download_image(session, url)
-            with open(fname, "wb") as fh:
-                fh.write(image)
-            local_bins[mtype] = fname
-            log(f"[fw] fetched {mtype}: {len(image)} bytes -> {fname}")
+            image = _download_image(session, url, size=spec.get("size"),
+                                    crc32=spec.get("crc32"))
+            local_bins[mtype] = _cache_image(mtype, image, spec)
+            log(f"[fw] fetched {mtype}: {len(image)} bytes -> {local_bins[mtype]}")
         except Exception as e:
             log(f"[fw] fetch FAILED {mtype}: {e!r}")
 
@@ -1057,114 +1265,191 @@ def check_and_flash_modules(module_firmware):
         return
 
     # ── Pass 3: flash from local files. Network is no longer involved. ────────
-    try:
-        c = get_conductor()
-        if c is None:
-            log("[fw] Conductor unavailable after fetch — nothing flashed")
-            return
+    # The files stay afterwards: they are the on-device rescue cache (see
+    # _cache_image), overwritten by the next fetch of that type.
+    c = get_conductor()
+    if c is None:
+        log("[fw] Conductor unavailable after fetch — nothing flashed")
+        return
 
-        def get_image(entry):
-            fname = local_bins.get(entry["type"])
-            if not fname:
-                raise ValueError("no local image for %r" % entry["type"])
-            with open(fname, "rb") as fh:
-                image = fh.read()
-            log(f"[fw] {entry['type']}: flashing {len(image)} bytes from {fname}")
-            return image
+    def get_image(entry):
+        fname = local_bins.get(entry["type"])
+        if not fname:
+            raise ValueError("no local image for %r" % entry["type"])
+        with open(fname, "rb") as fh:
+            image = fh.read()
+        log(f"[fw] {entry['type']}: flashing {len(image)} bytes from {fname}")
+        return image
 
-        def progress(done, total):
-            if total and (done == total or done % 512 == 0):
-                log(f"[fw] flashing {done}/{total} ({100 * done // total}%)")
+    def progress(done, total):
+        if total and (done == total or done % 512 == 0):
+            log(f"[fw] flashing {done}/{total} ({100 * done // total}%)")
 
-        results = c.update_all(resolved, get_image, progress=progress, logfn=log)
+    results = c.update_all(resolved, get_image, progress=progress, logfn=log)
 
-        # update_all() already re-enumerated internally (both buses); pull a fresh
-        # report to log the DEFINITIVE per-module outcome to the durable audit log —
-        # the actually-confirmed installed version, not just "the flash call
-        # returned OK" (a flash can succeed but a module can still misreport).
-        verify = {v["uid"]: v for v in c.firmware_report(resolved)}
-        for r in results:
-            v   = verify.get(r["uid"])
-            now = v["installed"] if v else None
-            if r["updated"] and now == r["required"]:
-                event(f"[FW]    {r['type']:<11} uid={r['uid']} bus={r['bus']}  "
-                      f"{r['installed']} -> {r['required']}  OK (verified {now})")
-            else:
-                reason = r["error"] or ("reports %s" % now)
-                event(f"[FW]    {r['type']:<11} uid={r['uid']} bus={r['bus']}  "
-                      f"{r['installed']} -> {r['required']}  FAIL ({reason})")
-    finally:
-        # Don't leave images on the filesystem: they are stale the moment the
-        # flash succeeds, and the next boot re-fetches if it genuinely needs to.
-        for fname in local_bins.values():
-            try:
-                os.remove(fname)
-            except OSError:
-                pass
+    # update_all() already re-enumerated internally (both buses); pull a fresh
+    # report to log the DEFINITIVE per-module outcome to the durable audit log —
+    # the actually-confirmed installed version, not just "the flash call
+    # returned OK" (a flash can succeed but a module can still misreport).
+    verify = {v["uid"]: v for v in c.firmware_report(resolved)}
+    for r in results:
+        v   = verify.get(r["uid"])
+        now = v["installed"] if v else None
+        if r["updated"] and now == r["required"]:
+            event(f"[FW]    {r['type']:<11} uid={r['uid']} bus={r['bus']}  "
+                  f"{r['installed']} -> {r['required']}  OK (verified {now})")
+        else:
+            reason = r["error"] or ("reports %s" % now)
+            event(f"[FW]    {r['type']:<11} uid={r['uid']} bus={r['bus']}  "
+                  f"{r['installed']} -> {r['required']}  FAIL ({reason})")
 
 # ── Main flow ──────────────────────────────────────────────────────────────────
+
+def run_product(connected):
+    """Run product.py with three-strikes crash recovery (see the crash-recovery
+    block above). Never returns on the happy path — a product loops forever."""
+    strikes = _crash_count()
+    log(f"[boot] product.py present — running {PRODUCT_SCRIPT_FILE}"
+        + (f" (strike {strikes}/{CRASH_MAX})" if strikes else ""))
+    try:
+        exec(open(PRODUCT_SCRIPT_FILE).read(), {"__name__": "__main__"})
+        # A product that returns is a product that stopped: treat like a crash
+        # so a script that falls off the end gets the same three tries.
+        raise RuntimeError("product.py returned")
+    except KeyboardInterrupt:
+        raise                                   # bench Ctrl-C: not a crash
+    except (Exception, SystemExit) as e:
+        strikes += 1
+        _set_crash_count(strikes)
+        log(f"[crash] product.py {type(e).__name__}: {e}  (strike {strikes}/{CRASH_MAX})")
+        try:
+            import traceback
+            traceback.print_exception(e)     # full trace to the serial console
+        except Exception:
+            pass
+        event(f"[CRASH] product.py {type(e).__name__}: {str(e)[:120]}  "
+              f"strike {strikes}/{CRASH_MAX}")
+        flush_log_ring("product crash")      # the one write that earns its place
+        # Always reload — a clean VM releases the I2C pins the product held. If
+        # this was the third strike, main() sees the count and parks instead of
+        # running the product again.
+        log(f"[crash] restarting in {2 * strikes} s")
+        time.sleep(2 * strikes)
+        supervisor.reload()
+
+
+def safe_idle(connected):
+    """Parked after CRASH_MAX crashes. Two ways out, neither needing a laptop:
+    hold the knob for the factory-reset gesture (DEV-7 — this used to be dead
+    here), or a newer product.py published upstream — fetched once if we are
+    online, and only acted on if it actually differs from the one that crashes.
+    A power cycle also resets the strike count for three more tries."""
+    log(f"[crash] product parked after {CRASH_MAX} crashes — safe idle. "
+        f"Hold the knob to factory-reset.")
+    event(f"[CRASH] parked after {CRASH_MAX} crashes")
+
+    if connected:
+        try:
+            creds = load_wifi_credentials() or {}
+            with open(PRODUCT_SCRIPT_FILE, "r") as fh:
+                current = fh.read()
+            if download_and_save_script(creds.get("script_url")):
+                with open(PRODUCT_SCRIPT_FILE, "r") as fh:
+                    fresh = fh.read()
+                if fresh != current:
+                    log("[crash] a different product.py was published — trying it")
+                    event("[CRASH] fresh product.py fetched, strikes reset")
+                    _set_crash_count(0)
+                    supervisor.reload()
+                log("[crash] published product.py is identical — staying parked")
+        except Exception as e:
+            log(f"[crash] re-fetch skipped: {e!r}")
+
+    c = get_conductor()
+    knob = c.knob[0] if (c is not None and c.knob) else None
+    if knob is None:
+        log("[crash] no knob on the bus — power-cycle to retry")
+    while True:
+        if knob is not None:
+            try:
+                c.check_factory_reset(knob.read())
+            except Exception:
+                pass
+        time.sleep(0.1)
+
 
 def main():
     log_new_boot()
     log("[boot] noknok Pico W — starting")
+    if _is_fresh_start():
+        _set_crash_count(0)                  # a power cycle always grants three fresh tries
 
     creds = load_wifi_credentials()
-
-    if creds:
-        log("[boot] Found wifi.json — connecting directly")
-        log(f"[boot] wifi.json ssid='{creds.get('ssid')}' "
-            f"script_url={'present' if creds.get('script_url') else 'MISSING'}")
-
-        # Direct-boot WiFi join can be flaky right after a hardware reset (the
-        # radio/AP may need a moment). Try a few times before giving up to AP.
-        connected = False
-        for attempt in range(1, 4):  # up to 3 attempts
-            log(f"[boot] WiFi join attempt {attempt}/3")
-            if connect_wifi(creds["ssid"], creds["password"]):
-                connected = True
-                break
-            if attempt < 3:
-                time.sleep(3)  # brief pause before retry
-
-        # Explicit post-connect marker so the log never goes silent here.
-        log(f"[boot] connect_wifi result: {'CONNECTED' if connected else 'FAILED'}")
-
-        if connected:
-            # One-time NTP sync so subsequent log lines carry wall-clock time.
-            # Best-effort — wrapped internally, never blocks the boot.
-            try:
-                sync_time_ntp(socketpool.SocketPool(wifi.radio))
-            except Exception as e:
-                log(f"[ntp] setup error (ignored): {e}")
-
-            if product_script_exists():
-                # PoC v2 OTA: bring connected modules up to the manifest's
-                # required firmware BEFORE handing off to the product. Best-effort;
-                # frees the I2C bus afterwards so product.py can create its own.
-                try:
-                    check_and_flash_modules(creds.get("module_firmware"))
-                except Exception as e:
-                    log(f"[fw] check_and_flash_modules error (ignored): {e}")
-                _release_conductor()
-
-                log(f"[boot] product.py present — running {PRODUCT_SCRIPT_FILE}")
-                exec(open(PRODUCT_SCRIPT_FILE).read(), {"__name__": "__main__"})
-            else:
-                log("[boot] product.py missing — will download")
-                if download_and_save_script(creds.get("script_url")):
-                    log("[boot] download OK — reloading to run product.py")
-                    supervisor.reload()
-                else:
-                    log("[boot] Download failed — starting AP provisioning")
-                    delete_wifi_credentials()
-                    run_ap_provisioning()
-        else:
-            log("[boot] WiFi failed after 3 tries — clearing credentials, starting AP provisioning")
-            delete_wifi_credentials()
-            run_ap_provisioning()
-    else:
+    if not creds:
         log("[boot] No credentials — starting AP provisioning")
         run_ap_provisioning()
+        return
+
+    log(f"[boot] wifi.json ssid='{creds.get('ssid')}' "
+        f"script_url={'present' if creds.get('script_url') else 'MISSING'}")
+
+    # Direct-boot WiFi join can be flaky right after a hardware reset (the
+    # radio/AP may need a moment). Try a few times.
+    connected = False
+    for attempt in range(1, 4):
+        log(f"[boot] WiFi join attempt {attempt}/3")
+        if connect_wifi(creds["ssid"], creds["password"]):
+            connected = True
+            break
+        if attempt < 3:
+            time.sleep(3)
+    log(f"[boot] connect_wifi result: {'CONNECTED' if connected else 'FAILED'}")
+
+    if product_script_exists() and _crash_count() >= CRASH_MAX:
+        safe_idle(connected)                 # never returns
+
+    # The WiFi credentials are NEVER deleted here. A failed join means the
+    # router is down, or out of range, or rebooting — not that the customer
+    # wants to set the product up again. This used to wipe wifi.json after three
+    # failed attempts and drop into AP mode, so a router hiccup at the wrong
+    # moment forced a full re-setup in the app and, worse, the product would not
+    # run at all until then. Only the factory-reset gesture deletes credentials.
+
+    if connected:
+        try:
+            sync_time_ntp(socketpool.SocketPool(wifi.radio))
+        except Exception as e:
+            log(f"[ntp] setup error (ignored): {e}")
+
+        if product_script_exists():
+            # Bring connected modules up to current firmware BEFORE handing off
+            # to the product (includes the parked-module rescue). Best-effort;
+            # the bus is released afterwards so product.py can own it.
+            try:
+                check_and_flash_modules(creds.get("module_firmware"))
+            except Exception as e:
+                log(f"[fw] check_and_flash_modules error (ignored): {e!r}")
+            _release_conductor()
+            run_product(connected=True)
+        else:
+            log("[boot] product.py missing — will download")
+            if download_and_save_script(creds.get("script_url")):
+                log("[boot] download OK — reloading to run product.py")
+                supervisor.reload()
+            log("[boot] download failed — no product to run; offering setup "
+                "(credentials kept, retried on next boot)")
+            run_ap_provisioning()
+    else:
+        if product_script_exists():
+            # Offline: the product runs anyway. No OTA, no NTP; a module parked
+            # after a power cut is still rescued, from the on-device cache.
+            log("[boot] offline — running the product without updates")
+            rescue_offline()
+            run_product(connected=False)
+        else:
+            log("[boot] offline and no product.py — offering setup "
+                "(credentials kept, retried on next boot)")
+            run_ap_provisioning()
 
 main()
 

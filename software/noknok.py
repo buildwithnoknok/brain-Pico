@@ -690,11 +690,13 @@ class Conductor:
         needs), and _restore_state() skips None."""
         try:
             with open(filename, "r") as f:
-                data = json.load(f)
+                raw = f.read()
+            data = json.loads(raw)
             if not isinstance(data, dict):
-                data = {}
+                data, raw = {}, None
         except (OSError, ValueError):
-            data = {}
+            data, raw = {}, None
+        before = json.dumps(data) if raw is not None else None
         live_addrs = set()
         for uid_hex, module in self._registry.items():
             if module is not None:
@@ -715,6 +717,11 @@ class Conductor:
                 continue
             if info.get("address") in live_addrs:
                 info["address"] = None
+        # This runs on every enumeration, i.e. every boot. Writing an unchanged
+        # file is a pointless flash write on an unjournaled FAT filesystem
+        # (DEV-18): compare first, write only on a real change.
+        if before is not None and json.dumps(data) == before:
+            return
         try:
             with open(filename, "w") as f:
                 json.dump(data, f)
