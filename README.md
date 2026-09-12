@@ -40,7 +40,15 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
 
 ## Current versions & features (PoC v1)
 
-**`code.py` v0.14** — provisioning + launcher + module firmware OTA. Field-hardened 12 Sep 2026:
+**`code.py` v0.15** — provisioning + launcher + module firmware OTA. Field-hardened 12 Sep 2026:
+- **Bootloader updates over the air (DEV-31).** The registry names the current stage-1
+  (`module-I2C-bootloader/firmware/index.json`); it is cached like any image, and before the
+  app pass every I²C module below the published stage-1 gets it — and its current app back —
+  in one `stage1_update()` transaction from the cache. Same flash layout only (the module
+  refuses a cross-layout stage-1 itself, error 8, so the brain refuses first); a legacy
+  monolithic bootloader is logged once and left for SWD. Each module's stage-1 version is
+  read **once** (a bootloader round-trip) and remembered in `noknok_state.json` (`"bl"`), so
+  later checks and the layout gate are a free comparison.
 - **Cache-first, once a day.** On a connected boot the OTA pass first refreshes an on-device
   image cache (one download per type per published version) — **before any Conductor exists**,
   the one condition under which downloads on this board are reliable — then creates the
