@@ -98,9 +98,10 @@ handled, because it is the first point at which the Pico has internet:
    enumerating — a parked module never answers the enumeration sweep.
 4. Compare installed versus published; if nothing is outdated, stop here having
    written nothing to flash.
-5. Otherwise check `requires_bootloader` per module type and drop any type whose
-   modules cannot run the image; fetch every remaining image **before** touching
-   a module; flash from local files; delete them.
+5. Otherwise check the index's `layout` against each module's actual bootloader
+   layout (byte 5 of the bootloader's `0xB1` reply) — exact match — and drop any
+   type whose modules cannot run the image; fetch every remaining image
+   **before** touching a module; flash from local files; delete them.
 6. Run `product.py`.
 
 Every step degrades to a no-op rather than failing the boot. Progress is

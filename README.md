@@ -61,7 +61,7 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
   `product.py` runs, `check_and_flash_modules()` resolves that floor into concrete firmware:
   it fetches the [module registry](https://github.com/buildwithnoknok/Ecosystem/blob/main/software/modules.json)
   to map each type to its repo, then that repo's `firmware/index.json` for the current
-  `{version, url, requires_bootloader}`. Firmware is backwards compatible, so the brain
+  `{version, url, layout}`. Firmware is backwards compatible, so the brain
   installs what is **current**, not what the product was written against — and because the
   version lives in the same commit as the binary, the two cannot drift apart. See
   [firmware-index.md](https://github.com/buildwithnoknok/Ecosystem/blob/main/software/firmware-index.md).
@@ -72,12 +72,18 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
   and the rest untouched. Images are deleted afterwards.
 - **`_bootloader_gate()` refuses an image the module cannot run.** Backwards compatibility is a
   promise about the *protocol*, not about *installability* — an app relinked to a new base
-  address is wire-compatible and still hard-faults a module on the older bootloader. Checked
-  against `Conductor.bootloader_version()` (silence = legacy bootloader).
+  address is wire-compatible and still hangs a module whose bootloader writes elsewhere, and
+  the CRC cannot catch it (image bytes, not link address). The index declares a numeric flash
+  `layout`; the bootloader **states its own** as byte 5 of its `0xB1` reply (stage-1 1.2.0+);
+  `Conductor.bootloader_layout()` compares them and the match is **exact**. Fails closed: a
+  legacy bootloader (no `0xB1`), a stage-1 too old to say (byte 5 = 0), or an index with no
+  layout is refused, never guessed at. Nothing host-side infers a layout from a version.
 - **Parked-module rescue (DEV-31).** A module stuck in its bootloader at `0x7E` never answers
   the enumeration sweep, so it would otherwise be invisible — the product would simply start a
   module short. `get_conductor()` runs `rescue_parked_module()` **between** `Conductor()` and
-  `enumerate_all()` and pushes a good app back onto it. Logged as `[RESCUE]`.
+  `enumerate_all()`, applies the same layout check, and pushes a good app back onto it. Logged
+  as `[RESCUE]`. Proven 12 Sep 2026: an app that never armed its watchdog was parked by stage-1
+  1.2.0 and rescued over the bus by the ordinary boot path in 2 s — no SWD.
 - `POST /firmware/check` (AP time) reports installed versions only and returns
   `resolved:false` — on the setup AP the Pico has no internet and cannot reach the registry.
 - Crash-safe throughout — a failed flash leaves the module safe in its bootloader (`0x7E`).
