@@ -470,7 +470,8 @@ class Conductor:
             return {"uid": uid, "type": mf_key, "reason": reason,
                     "action": "failed", "detail": str(e)}
 
-    def update_all(self, manifest_fw, get_image, progress=None, logfn=print):
+    def update_all(self, manifest_fw, get_image, progress=None, logfn=print,
+                   exclude_uids=None):
         """
         Flash every module that firmware_report() flags needs_update.
 
@@ -479,11 +480,18 @@ class Conductor:
         entry['url'] in provisioning. (Keeps this method network-agnostic and
         bench-testable.)
 
+        `exclude_uids` — modules to leave alone even though they are outdated.
+        The provisioning layer uses it for modules whose bootloader cannot run
+        the new image (wrong flash layout): one such module must not stop the
+        others of its type from updating.
+
         Re-enumerates at the end so the Conductor's module instances are fresh.
         Returns the list of attempted entries, each with added 'updated':bool and
         'error':str|None.
         """
-        todo = [r for r in self.firmware_report(manifest_fw) if r["needs_update"]]
+        skip = set(exclude_uids or ())
+        todo = [r for r in self.firmware_report(manifest_fw)
+                if r["needs_update"] and r.get("uid") not in skip]
         if not todo:
             logfn("Firmware: all modules up to date.")
             return []

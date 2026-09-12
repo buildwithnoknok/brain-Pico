@@ -1,5 +1,21 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.13 (field hardening pass 1 — survive a customer's house)
+# Version: 0.14 (field hardening pass 2)
+#
+# v0.14 changes (Sue): DEV-32 pass 2.
+#   - The OTA pass asks GitHub at most once per 24 h (last-check time in
+#     microcontroller.nvm, no filesystem write, survives power cycles). Other
+#     boots make no round-trips; the parked-module rescue still runs, from the
+#     on-device cache. The first connected boot after provisioning also warms
+#     that cache for every I2C type the product uses, so any module is
+#     rescuable offline from day one — not only the ones updated that day.
+#   - The layout gate refuses per MODULE, not per type: one older spare no
+#     longer blocks the rest of its type. update_all() takes exclude_uids.
+#   - Registry and index carry an optional "format"; a newer format than this
+#     brain understands is skipped (fail closed).
+#   - The customer hears about it: any refused/failed update or failed rescue
+#     plays the buzzer error motif and flashes the LED Buttons red before the
+#     product starts. Interim until the app can show device status over the
+#     home network (DEV-32 E10 / DEV-27).
 #
 # v0.13 changes (Sue): the four failure modes from the 12 Sep field review
 #   that turn "works on the bench" into "keeps working at home".
@@ -374,6 +390,8 @@ def _rescue_parked(c, get_image):
     event(f"[RESCUE] uid={res.get('uid')} type={res.get('type')} "
           f"reason={res.get('reason')} action={res.get('action')} "
           f"detail={res.get('detail')}")
+    if res.get("action") != "reflashed":
+        _field_alerts.append("rescue %s %s" % (res.get("action"), res.get("uid")))
 
 # ── HTML pages ─────────────────────────────────────────────────────────────────
 
@@ -899,11 +917,16 @@ def _resolve_module_firmware(session, module_firmware):
     # timeout. If the registry itself is not reachable quickly, the whole pass is
     # skipped and the product starts; the next boot tries again.
     try:
-        registry = (_download_json(session, MODULE_REGISTRY_URL, timeout=REGISTRY_TIMEOUT_S)
-                    or {}).get("modules", {})
+        registry_doc = _download_json(session, MODULE_REGISTRY_URL,
+                                      timeout=REGISTRY_TIMEOUT_S) or {}
     except Exception as e:
         log(f"[fw] module registry unavailable ({e!r}) — no firmware will be installed")
         return {}
+    if int(registry_doc.get("format", 1)) > INDEX_FORMAT:
+        log(f"[fw] registry format {registry_doc.get('format')} is newer than this brain "
+            f"understands ({INDEX_FORMAT}) — no firmware will be installed")
+        return {}
+    registry = registry_doc.get("modules", {})
 
     resolved = {}
     for mtype, spec in (module_firmware or {}).items():
@@ -918,6 +941,10 @@ def _resolve_module_firmware(session, module_firmware):
             log(f"[fw] {mtype}: index fetch failed ({e!r}) — skipping")
             continue
 
+        if int(index.get("format", 1)) > INDEX_FORMAT:
+            log(f"[fw] {mtype}: index format {index.get('format')} is newer than this "
+                f"brain understands — skipping")
+            continue
         version = index.get("version")
         url     = index.get("url")
         if not version or not url:
@@ -976,25 +1003,28 @@ def _bootloader_gate(c, entries, layout):
     does not know, is refused for I2C modules rather than guessed at. USB
     modules are skipped (no stage-0 port yet, V203 pending).
 
-    Returns (ok, reason). Checks every module of the type and fails the whole
-    type if any one of them disagrees: refusing is recoverable, flashing an
-    unrunnable image costs an SWD session."""
+    Gates PER MODULE. Returns a list of (uid, reason) for the modules that
+    must not receive this image; the rest of the type still updates. A first
+    version refused the whole type if any one module disagreed — which meant
+    one older spare LED Button would have blocked nine good ones for ever."""
+    refused = []
     for e in entries:
         if e.get("bus") != "i2c":
             continue
+        uid = e.get("uid")
         if layout is None:
-            return False, "index declares no layout for an I2C module"
+            refused.append((uid, "index declares no layout for an I2C module"))
+            continue
         try:
             actual = c.bootloader_layout(e)
         except Exception as ex:
-            return False, "could not read bootloader of %s: %r" % (e.get("uid"), ex)
+            refused.append((uid, "could not read bootloader: %r" % (ex,)))
+            continue
         if actual is None:
-            return False, ("module %s runs a stage-1 this Conductor does not know"
-                           % e.get("uid"))
-        if actual != layout:
-            return False, ("module %s is flash layout %d, image is layout %d"
-                           % (e.get("uid"), actual, layout))
-    return True, "layout %s" % layout
+            refused.append((uid, "runs a stage-1 this Conductor does not know"))
+        elif actual != layout:
+            refused.append((uid, "is flash layout %d, image is layout %d" % (actual, layout)))
+    return refused
 
 
 # Boot-time budget for the OTA pass (see _resolve_module_firmware). The registry
@@ -1002,6 +1032,88 @@ def _bootloader_gate(c, entries, layout):
 # usable for updates right now and the product should just start.
 REGISTRY_TIMEOUT_S = 6
 INDEX_TIMEOUT_S    = 8
+
+# Index / registry format the resolver understands. A file declaring a higher
+# format is skipped (fail closed) so a future schema change cannot be
+# misread by an older brain; absent = 1.
+INDEX_FORMAT = 1
+
+# ── How often the OTA pass actually asks GitHub ────────────────────────────────
+# Resolving means registry + one index per module type — N+1 round-trips before
+# the product starts. Doing that on every boot is wasteful and, on a slow
+# uplink, slow. So: at most once per OTA_CHECK_INTERVAL_S, with the time of the
+# last completed check kept in microcontroller.nvm (no filesystem write, and it
+# survives a power cycle). Needs a synced clock; without NTP the check simply
+# runs, which is the safe direction. The very first connected boot after
+# provisioning is always due — and it also warms the rescue cache for every
+# type the product uses, so a module parked later is rescuable from day one
+# without the internet, not only the types that happened to need an update.
+OTA_CHECK_INTERVAL_S = 24 * 3600
+OTA_NVM_INDEX        = 1               # 4 bytes, little-endian unix time
+
+def _last_ota_check():
+    try:
+        b = microcontroller.nvm[OTA_NVM_INDEX:OTA_NVM_INDEX + 4]
+        t = int.from_bytes(bytes(b), "little")
+        return t if 1_600_000_000 < t < 4_000_000_000 else None
+    except Exception:
+        return None
+
+def _mark_ota_checked():
+    if not _rtc_synced:
+        return
+    try:
+        microcontroller.nvm[OTA_NVM_INDEX:OTA_NVM_INDEX + 4] = \
+            int(time.time()).to_bytes(4, "little")
+    except Exception:
+        pass
+
+def _ota_check_due():
+    """True unless a completed check is on record less than the interval ago."""
+    if not _rtc_synced:
+        return True
+    last = _last_ota_check()
+    if last is None:
+        return True
+    return (time.time() - last) >= OTA_CHECK_INTERVAL_S
+
+# ── Telling the customer something went wrong ──────────────────────────────────
+# Every OTA / rescue outcome is otherwise log-only, and a customer never reads
+# a log. Until the app can show device status over the home network, the
+# modules themselves are the only channel we have: on any refused or failed
+# update or rescue, the buzzer plays its error motif and the LED Buttons flash
+# red for a moment, before the product starts. Best-effort, offline-capable,
+# unmistakable next to the product's own startup sounds.
+_field_alerts = []
+
+def alert_customer():
+    if not _field_alerts:
+        return
+    log(f"[alert] {len(_field_alerts)} problem(s) this boot: {_field_alerts}")
+    try:
+        c = get_conductor()
+        if c is None:
+            return
+        for m in getattr(c, "ledbutton", []):
+            try:
+                m.set_color(255, 0, 0)
+            except Exception:
+                pass
+        if getattr(c, "buzzer", []):
+            try:
+                c.buzzer[0].tune(4)          # BEEP_ERROR
+            except Exception:
+                pass
+        time.sleep(1.5)
+        for m in getattr(c, "ledbutton", []):
+            try:
+                m.led_off()
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"[alert] cue failed (ignored): {e!r}")
+    finally:
+        _release_conductor()
 
 # ── On-device firmware cache ────────────────────────────────────────────────────
 # Every image the OTA pass downloads is kept (one per module type, overwritten
@@ -1028,22 +1140,38 @@ def _cache_image(mtype, image, spec):
         json.dump(meta, fh)
     return bin_path
 
-def _cached_image(entry):
-    """Rescue image from the on-device cache for entry['type'], layout-checked
-    against the parked module's own bootloader layout and integrity-checked
-    against the sidecar. Raises with a clear reason if it cannot be used."""
-    bin_path, meta_path = _cache_paths(entry["type"])
+def _cache_meta(mtype):
+    """The sidecar for a type, or None. Cheap: no image read."""
+    _, meta_path = _cache_paths(mtype)
+    try:
+        with open(meta_path, "r") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+def _cache_read(mtype):
+    """(image, meta) from the cache, integrity-checked against the sidecar's
+    own size/crc32 — so a file left half-written by a power cut during the
+    fetch is rejected, never flashed. Raises with a clear reason."""
+    bin_path, meta_path = _cache_paths(mtype)
     try:
         with open(meta_path, "r") as fh:
             meta = json.load(fh)
         with open(bin_path, "rb") as fh:
             image = fh.read()
     except (OSError, ValueError):
-        raise ValueError("no cached image for %r" % entry["type"])
+        raise ValueError("no cached image for %r" % mtype)
+    _verify_image(image, meta.get("size"), meta.get("crc32"))
+    return image, meta
+
+def _cached_image(entry):
+    """Rescue image for a parked module: the cache for entry['type'], layout-
+    checked against the module's own bootloader layout. A wrong-layout image
+    would just hang it again."""
+    image, meta = _cache_read(entry["type"])
     have, need = entry.get("bootloader_layout"), meta.get("layout")
     if need is None or have is None or have != need:
         raise ValueError("cached image layout %s != module layout %s" % (need, have))
-    _verify_image(image, meta.get("size"), meta.get("crc32"))
     log(f"[rescue] using cached {entry['type']} {meta.get('version')} ({len(image)} B)")
     return image
 
@@ -1164,6 +1292,13 @@ def check_and_flash_modules(module_firmware):
         log(f"[fw] OTA setup failed: {e}")
         return
 
+    # Not due yet? Then no GitHub round-trips at all this boot. The parked-
+    # module rescue still runs — it is one I2C read — with the on-device cache
+    # as its image source, exactly as on an offline boot.
+    if not _ota_check_due():
+        log("[fw] update check not due (last < 24 h ago) — rescue from cache only")
+        get_conductor(rescue_get_image=_cached_image)
+        return
     # Resolve the manifest's floors into concrete versions + URLs via the module
     # registry. Two small JSON fetches; everything downstream then works on the
     # {version, url} shape firmware_report() has always taken.
@@ -1172,31 +1307,38 @@ def check_and_flash_modules(module_firmware):
         log("[fw] nothing resolved — skipping firmware check")
         return
 
-    def _url_for(mtype):
-        spec = resolved.get(mtype)
-        return spec.get("url") if isinstance(spec, dict) else None
+    # ── Refresh the on-device cache, BEFORE any Conductor exists ──────────────
+    # Every image this product could need, downloaded while no Conductor has
+    # ever been created in this process. That is the one condition under which
+    # HTTPS downloads on this board have always been reliable; a download made
+    # after a Conductor existed — even one that has since been released — can
+    # hang without timing out (seen 12 Sep: the boot stopped at the fetch and
+    # never reached the product). So all network work happens here, and the
+    # flash step later reads from these files and never touches the radio.
+    # Cost: one download per type per published firmware version, at most once
+    # a day. The first check after provisioning fills the cache for every type,
+    # which is also what makes offline rescue work from day one.
+    for mtype, spec in resolved.items():
+        cached = _cache_meta(mtype)
+        if cached and cached.get("version") == spec.get("version") \
+                  and cached.get("crc32") == spec.get("crc32"):
+            continue
+        url = spec.get("url")
+        if not url:
+            continue
+        try:
+            image = _download_image(session, url, size=spec.get("size"),
+                                    crc32=spec.get("crc32"))
+            _cache_image(mtype, image, spec)
+            log(f"[fw] cached {mtype} {spec.get('version')}: {len(image)} bytes")
+        except Exception as e:
+            log(f"[fw] fetch FAILED {mtype}: {e!r}")
+            _field_alerts.append("fetch failed %s" % mtype)
 
     def rescue_image(entry):
-        """One image, fetched on demand — we cannot know which module is parked
-        until we have asked it, and a parked module is the rare case. Same
-        layout rule as the gate: a parked module is already in its bootloader,
-        so its layout is known for free, and pushing a wrong-layout image would
-        just hang it again. Falls back to the on-device cache if the download
-        fails — a rescue should not depend on GitHub answering right now."""
-        spec = resolved.get(entry["type"]) or {}
-        url  = spec.get("url")
-        if not url:
-            return _cached_image(entry)
-        have, need = entry.get("bootloader_layout"), spec.get("layout")
-        if need is None or have is None or have != need:
-            raise ValueError("layout mismatch: module is %s, image is %s"
-                             % (have, need))
-        try:
-            return _download_image(session, url, size=spec.get("size"),
-                                   crc32=spec.get("crc32"))
-        except Exception as e:
-            log(f"[rescue] download failed ({e!r}) — trying the on-device cache")
-            return _cached_image(entry)
+        """A parked module is already in its bootloader, so its layout is known
+        for free; the cache (just refreshed) is layout-checked against it."""
+        return _cached_image(entry)
 
     # ── Pass 1: decide. No image downloads, no filesystem writes. ─────────────
     # The overwhelmingly common boot is "everything already current", and that
@@ -1213,79 +1355,51 @@ def check_and_flash_modules(module_firmware):
             if r["needs_update"]]
     if not todo:
         log("[fw] all modules up to date")
+        _mark_ota_checked()
         return
 
-    # Gate each type on whether its modules can actually run the new image, and
-    # drop the ones that can't from `resolved` — update_all() recomputes its own
-    # report, so removing the type is what stops it flashing anyway.
+    # Gate each outdated MODULE on whether its bootloader can run the new image.
+    # Refused UIDs are handed to update_all() as an exclusion list; the type
+    # stays resolved so its other modules still update.
     types = []
     for r in todo:
         if r["type"] not in types:
             types.append(r["type"])
-    for mtype in list(types):
-        ok, why = _bootloader_gate(c, [r for r in todo if r["type"] == mtype],
-                                   resolved[mtype].get("layout"))
-        if not ok:
-            log(f"[fw] {mtype}: REFUSED — {why}")
-            event(f"[FW]    {mtype:<11} refused: {why}")
-            types.remove(mtype)
-            resolved.pop(mtype, None)
+    refused_uids = set()
+    for mtype in types:
+        for uid, why in _bootloader_gate(c, [r for r in todo if r["type"] == mtype],
+                                         resolved[mtype].get("layout")):
+            log(f"[fw] {mtype} {uid}: REFUSED — {why}")
+            event(f"[FW]    {mtype:<11} uid={uid} refused: {why}")
+            _field_alerts.append("refused %s %s" % (mtype, uid))
+            refused_uids.add(uid)
 
-    todo = [r for r in todo if r["type"] in types]
+    todo = [r for r in todo if r.get("uid") not in refused_uids]
     if not todo:
         log("[fw] every pending update was refused — nothing flashed")
+        _mark_ota_checked()
         return
-    log(f"[fw] {len(todo)} module(s) need an update — fetching {len(types)} image(s) first")
+    log(f"[fw] {len(todo)} module(s) need an update — flashing from the cache")
 
-    # ── Pass 2: fetch everything BEFORE touching a single module. ─────────────
-    # A flash that starts is a flash that can finish. Once the first module is
-    # erased, no remaining step needs the radio, so a WiFi drop mid-run cannot
-    # leave one module half-written and the rest untouched. The Conductor is
-    # released first so the downloads run with the RAM and the I2C bus free —
-    # which is also the condition under which the product-script download has
-    # always been reliable.
-    _release_conductor()
-    local_bins = {}                      # module type -> file on the Pico FS
-    for mtype in types:
-        spec = resolved[mtype]
-        url  = spec.get("url")
-        if not url:
-            log(f"[fw] {mtype}: manifest has no url — skipping")
-            continue
-        try:
-            image = _download_image(session, url, size=spec.get("size"),
-                                    crc32=spec.get("crc32"))
-            local_bins[mtype] = _cache_image(mtype, image, spec)
-            log(f"[fw] fetched {mtype}: {len(image)} bytes -> {local_bins[mtype]}")
-        except Exception as e:
-            log(f"[fw] fetch FAILED {mtype}: {e!r}")
-
-    if not local_bins:
-        log("[fw] no images could be fetched — nothing flashed")
-        return
-
-    # ── Pass 3: flash from local files. Network is no longer involved. ────────
-    # The files stay afterwards: they are the on-device rescue cache (see
-    # _cache_image), overwritten by the next fetch of that type.
-    c = get_conductor()
-    if c is None:
-        log("[fw] Conductor unavailable after fetch — nothing flashed")
-        return
-
+    # ── Flash from the cache. The radio is not involved from here on. ─────────
+    # Every image was fetched and verified before the Conductor existed, so a
+    # WiFi drop now cannot leave one module half-written and the rest untouched.
+    # The files stay afterwards — they ARE the rescue cache.
     def get_image(entry):
-        fname = local_bins.get(entry["type"])
-        if not fname:
-            raise ValueError("no local image for %r" % entry["type"])
-        with open(fname, "rb") as fh:
-            image = fh.read()
-        log(f"[fw] {entry['type']}: flashing {len(image)} bytes from {fname}")
+        spec = resolved.get(entry["type"]) or {}
+        image, meta = _cache_read(entry["type"])
+        if meta.get("version") != spec.get("version"):
+            raise ValueError("cache holds %s, current is %s (fetch failed?)"
+                             % (meta.get("version"), spec.get("version")))
+        log(f"[fw] {entry['type']}: flashing {len(image)} bytes from the cache")
         return image
 
     def progress(done, total):
         if total and (done == total or done % 512 == 0):
             log(f"[fw] flashing {done}/{total} ({100 * done // total}%)")
 
-    results = c.update_all(resolved, get_image, progress=progress, logfn=log)
+    results = c.update_all(resolved, get_image, progress=progress, logfn=log,
+                           exclude_uids=refused_uids)
 
     # update_all() already re-enumerated internally (both buses); pull a fresh
     # report to log the DEFINITIVE per-module outcome to the durable audit log —
@@ -1302,6 +1416,8 @@ def check_and_flash_modules(module_firmware):
             reason = r["error"] or ("reports %s" % now)
             event(f"[FW]    {r['type']:<11} uid={r['uid']} bus={r['bus']}  "
                   f"{r['installed']} -> {r['required']}  FAIL ({reason})")
+            _field_alerts.append("update failed %s %s" % (r["type"], r["uid"]))
+    _mark_ota_checked()
 
 # ── Main flow ──────────────────────────────────────────────────────────────────
 
@@ -1430,6 +1546,7 @@ def main():
             except Exception as e:
                 log(f"[fw] check_and_flash_modules error (ignored): {e!r}")
             _release_conductor()
+            alert_customer()
             run_product(connected=True)
         else:
             log("[boot] product.py missing — will download")
@@ -1445,6 +1562,7 @@ def main():
             # after a power cut is still rescued, from the on-device cache.
             log("[boot] offline — running the product without updates")
             rescue_offline()
+            alert_customer()
             run_product(connected=False)
         else:
             log("[boot] offline and no product.py — offering setup "
