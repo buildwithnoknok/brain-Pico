@@ -1,5 +1,18 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.14 (field hardening pass 2)
+# Version: 0.15 (stage-1 bootloader updates over the air — DEV-31 closed end to end)
+#
+# v0.15 changes (Sue): the field-update path for the BOOTLOADER itself.
+#   Until now Conductor.stage1_update() existed and was bench-proven, but
+#   nothing in the field could trigger it: no brain knew what the current
+#   stage-1 was, and code.py never called it. Now the registry names the
+#   stage-1 index (module-I2C-bootloader/firmware/index.json), the OTA pass
+#   caches the stage-1 image like any other, and _stage1_pass() brings every
+#   I2C module up to it BEFORE the app pass — same-layout only (a cross-layout
+#   stage-1 is refused by the module, error 8, so it is refused here first),
+#   restoring the module's current app from the cache in the same transaction.
+#   Each module's stage-1 version is read once (a bootloader round-trip) and
+#   remembered in noknok_state.json ("bl"), so later checks are a free compare.
+#   Legacy monolithic bootloaders cannot self-update and are logged once.
 #
 # v0.14 changes (Sue): DEV-32 pass 2.
 #   - The OTA pass asks GitHub at most once per 24 h (last-check time in
@@ -921,12 +934,13 @@ def _resolve_module_firmware(session, module_firmware):
                                       timeout=REGISTRY_TIMEOUT_S) or {}
     except Exception as e:
         log(f"[fw] module registry unavailable ({e!r}) — no firmware will be installed")
-        return {}
+        return {}, None
     if int(registry_doc.get("format", 1)) > INDEX_FORMAT:
         log(f"[fw] registry format {registry_doc.get('format')} is newer than this brain "
             f"understands ({INDEX_FORMAT}) — no firmware will be installed")
-        return {}
+        return {}, None
     registry = registry_doc.get("modules", {})
+    stage1   = _resolve_stage1(session, registry_doc)
 
     resolved = {}
     for mtype, spec in (module_firmware or {}).items():
@@ -967,7 +981,136 @@ def _resolve_module_firmware(session, module_firmware):
                 f"integrity-checked (add them to firmware/index.json)")
         log(f"[fw] {mtype}: current is {version} (min {minimum or 'none'}, "
             f"layout {index.get('layout', '-')})")
-    return resolved
+    return resolved, stage1
+
+
+def _resolve_stage1(session, registry_doc):
+    """The current stage-1 bootloader, from the registry's `bootloader.stage1`
+    entry, or None. Same index shape as a module: {version, url, layout, size,
+    crc32}. All five are required here — a bootloader update destroys the app
+    region and there is no rollback, so nothing about it is guessed."""
+    entry = (registry_doc.get("bootloader") or {}).get("stage1")
+    if not entry or not entry.get("index"):
+        return None
+    try:
+        idx = _download_json(session, entry["index"], timeout=INDEX_TIMEOUT_S) or {}
+    except Exception as e:
+        log(f"[bl] stage-1 index fetch failed ({e!r}) — bootloader updates skipped")
+        return None
+    if int(idx.get("format", 1)) > INDEX_FORMAT:
+        log("[bl] stage-1 index format is newer than this brain understands — skipped")
+        return None
+    for k in ("version", "url", "layout", "size", "crc32"):
+        if idx.get(k) is None:
+            log(f"[bl] stage-1 index is missing {k} — bootloader updates skipped")
+            return None
+    log(f"[bl] current stage-1 is {idx['version']} (layout {idx['layout']})")
+    return {"version": idx["version"], "url": idx["url"], "layout": int(idx["layout"]),
+            "size": idx["size"], "crc32": idx["crc32"]}
+
+
+def _semver3(s):
+    try:
+        return tuple(int(x) for x in str(s).split("."))[:3]
+    except (ValueError, AttributeError):
+        return None
+
+
+def _stage1_pass(c, s1):
+    """Bring every I2C module's stage-1 bootloader up to the published version.
+
+    This is what makes DEV-31's promise real in the field: a bootloader bug
+    found after the batch ships is fixed over the air, not with a clamp.
+
+    Rules, all from the runbook (Ecosystem/software/bootloader-update.md):
+      - same transfer as an app update, then the app is pushed back — so the
+        module's CURRENT app image must be in the cache, for the SAME layout;
+      - a cross-layout stage-1 is refused by the module itself (error 8), so
+        it is refused here first rather than transferred and rejected;
+      - a legacy monolithic bootloader (no 0xB1) cannot self-update — SWD only.
+    Reading a module's stage-1 version costs a bootloader round-trip and a
+    re-enumeration, so it is done once per module and remembered in
+    noknok_state.json; after that a newer published stage-1 is a free compare."""
+    if not s1:
+        return
+    want = _semver3(s1["version"])
+    try:
+        s1_image, s1_meta = _cache_read("stage1")
+    except ValueError as e:
+        log(f"[bl] no usable stage-1 image in the cache ({e}) — skipped")
+        return
+    if s1_meta.get("version") != s1["version"]:
+        log(f"[bl] cache holds stage-1 {s1_meta.get('version')}, current is "
+            f"{s1['version']} (fetch failed?) — skipped")
+        return
+
+    targets = []
+    for list_attr, mf_key in c._FW_GROUPS:
+        for m in getattr(c, list_attr, []):
+            targets.append((mf_key, getattr(m, "_uid_hex", None)))
+
+    for mf_key, uid in targets:
+        m = c.by_uid(uid) if uid else None
+        if m is None:
+            continue
+        entry = {"bus": "i2c", "address": m.address, "uid": uid, "type": mf_key}
+        if not hasattr(m, "bootloader"):
+            log(f"[bl] {mf_key} {uid}: reading stage-1 version (once)")
+            try:
+                c.bootloader_version(entry)         # sets m.bootloader, saves state
+            except Exception as e:
+                log(f"[bl] {mf_key} {uid}: could not read bootloader ({e!r})")
+                continue
+            m = c.by_uid(uid)
+            if m is None:
+                continue
+        bl = getattr(m, "bootloader", None)
+        if bl is None:
+            log(f"[bl] {mf_key} {uid}: legacy monolithic bootloader — cannot self-update (SWD)")
+            continue
+        have = (bl[1], bl[2], bl[3])
+        layout = bl[4] if len(bl) > 4 and bl[4] else None
+        if want is None or have >= want:
+            continue
+        if layout != s1["layout"]:
+            why = "module stage-1 layout %s, published stage-1 is layout %s" % (layout, s1["layout"])
+            log(f"[bl] {mf_key} {uid}: REFUSED — {why}")
+            event(f"[BL]    {mf_key:<11} uid={uid} refused: {why}")
+            _field_alerts.append("stage-1 refused %s" % uid)
+            continue
+        try:
+            app_image, app_meta = _cache_read(mf_key)
+        except ValueError as e:
+            log(f"[bl] {mf_key} {uid}: no cached app to restore after the update ({e}) — skipped")
+            _field_alerts.append("stage-1 no app %s" % uid)
+            continue
+        if app_meta.get("layout") != s1["layout"]:
+            log(f"[bl] {mf_key} {uid}: cached app is layout {app_meta.get('layout')}, "
+                f"stage-1 is layout {s1['layout']} — skipped")
+            continue
+
+        m = c.by_uid(uid)
+        entry = {"bus": "i2c", "address": m.address, "uid": uid, "type": mf_key}
+        log(f"[bl] {mf_key} {uid}: stage-1 {'.'.join(map(str, have))} -> {s1['version']}, "
+            f"then restoring app {app_meta.get('version')}")
+        try:
+            res = c.stage1_update(entry, s1_image, app_image)
+            after = res.get("after")
+            ok = bool(after) and (after[1], after[2], after[3]) == want and res.get("app_restored")
+        except Exception as e:
+            after, ok = None, False
+            log(f"[bl] {mf_key} {uid}: stage-1 update FAILED ({e!r})")
+        m = c.by_uid(uid)
+        if m is not None and after:
+            m.bootloader = tuple(after)
+            c._save_state()
+        if ok:
+            event(f"[BL]    {mf_key:<11} uid={uid}  stage-1 {'.'.join(map(str, have))} -> "
+                  f"{s1['version']}  OK (app {app_meta.get('version')} restored)")
+        else:
+            event(f"[BL]    {mf_key:<11} uid={uid}  stage-1 {'.'.join(map(str, have))} -> "
+                  f"{s1['version']}  FAIL (after={after})")
+            _field_alerts.append("stage-1 update failed %s" % uid)
 
 
 def _semver_lt(a, b):
@@ -1016,7 +1159,11 @@ def _bootloader_gate(c, entries, layout):
             refused.append((uid, "index declares no layout for an I2C module"))
             continue
         try:
-            actual = c.bootloader_layout(e)
+            m = c.by_uid(uid) if uid else None
+            if m is not None and hasattr(m, "bootloader"):
+                actual = c.layout_of(m.bootloader)     # remembered — no round-trip
+            else:
+                actual = c.bootloader_layout(e)        # first time: read and remember
         except Exception as ex:
             refused.append((uid, "could not read bootloader: %r" % (ex,)))
             continue
@@ -1302,7 +1449,7 @@ def check_and_flash_modules(module_firmware):
     # Resolve the manifest's floors into concrete versions + URLs via the module
     # registry. Two small JSON fetches; everything downstream then works on the
     # {version, url} shape firmware_report() has always taken.
-    resolved = _resolve_module_firmware(session, module_firmware)
+    resolved, stage1 = _resolve_module_firmware(session, module_firmware)
     if not resolved:
         log("[fw] nothing resolved — skipping firmware check")
         return
@@ -1318,7 +1465,10 @@ def check_and_flash_modules(module_firmware):
     # Cost: one download per type per published firmware version, at most once
     # a day. The first check after provisioning fills the cache for every type,
     # which is also what makes offline rescue work from day one.
-    for mtype, spec in resolved.items():
+    to_cache = list(resolved.items())
+    if stage1:
+        to_cache.append(("stage1", stage1))     # the bootloader is cached like any image
+    for mtype, spec in to_cache:
         cached = _cache_meta(mtype)
         if cached and cached.get("version") == spec.get("version") \
                   and cached.get("crc32") == spec.get("crc32"):
@@ -1350,6 +1500,14 @@ def check_and_flash_modules(module_firmware):
     if c is None:
         log("[fw] no Conductor available — skipping firmware check")
         return
+
+    # Bootloader first. A stage-1 update restores the module's current app as
+    # part of the same transaction, so a module updated here comes out with
+    # both current and drops out of the app pass below.
+    try:
+        _stage1_pass(c, stage1)
+    except Exception as e:
+        log(f"[bl] stage-1 pass error (ignored): {e!r}")
 
     todo = [r for r in c.log_firmware_report(resolved, logfn=log)
             if r["needs_update"]]

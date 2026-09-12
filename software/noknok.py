@@ -326,6 +326,15 @@ class Conductor:
         v = f.get_version()
         f.boot()                        # app is still valid — jump straight back
         self.enumerate()
+        # Remember it. Reading costs a bootloader round-trip and a re-enumeration,
+        # so the answer is kept on the module object and in noknok_state.json
+        # ("bl": [...] or null for legacy) — one read per module lifetime, then
+        # a free comparison whenever a newer stage-1 is published.
+        uid = entry.get("uid")
+        m = self.by_uid(uid) if uid else None
+        if m is not None:
+            m.bootloader = v
+            self._save_state()
         return v
 
     @staticmethod
@@ -718,7 +727,13 @@ class Conductor:
                     t = self.TYPE_DISPLAY
                 else:
                     t = 0
-                data[uid_hex] = {"address": module.address, "type": t}
+                entry = {"address": module.address, "type": t}
+                if hasattr(module, "bootloader"):
+                    bl = module.bootloader
+                    entry["bl"] = list(bl) if bl else None
+                elif isinstance(data.get(uid_hex), dict) and "bl" in data[uid_hex]:
+                    entry["bl"] = data[uid_hex]["bl"]     # keep a value read on an earlier boot
+                data[uid_hex] = entry
                 live_addrs.add(module.address)
         for uid_hex, info in data.items():
             if uid_hex in self._registry or not isinstance(info, dict):
@@ -790,6 +805,9 @@ class Conductor:
 
             if module is not None:
                 self._apply_version(module, addr)
+                if "bl" in info:
+                    bl = info["bl"]
+                    module.bootloader = tuple(bl) if bl else None
                 self._registry[uid_hex] = module
                 restored += 1
 
