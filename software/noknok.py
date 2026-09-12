@@ -327,6 +327,28 @@ class Conductor:
         self.enumerate()
         return v
 
+    # Stage-1 (major, minor) -> flash layout it writes apps for. A layout change
+    # (the app base moves) is always a new stage-1 minor, and only the bootloader
+    # knows where it puts the app, so this is the one place the mapping lives.
+    # Legacy monolithic bootloader (no 0xB1) = layout 0.
+    #   layout 1: stage-1 1.0.x, app @0x1000    layout 2: stage-1 1.1.x, app @0x1400
+    STAGE1_LAYOUTS = {(1, 0): 1, (1, 1): 2}
+
+    @classmethod
+    def layout_of(cls, bl_version):
+        """Layout for a bootloader_version() tuple; 0 for legacy (None); None
+        for a stage-1 version this library does not know — refuse, don't guess."""
+        if bl_version is None:
+            return 0
+        return cls.STAGE1_LAYOUTS.get((bl_version[1], bl_version[2]))
+
+    def bootloader_layout(self, entry):
+        """Which flash layout this module's bootloader installs apps for. Same
+        cost as bootloader_version() (enters the bootloader, re-enumerates).
+        An app image linked for a different layout will not run — the CRC
+        cannot catch it, since it is over image bytes, not the link address."""
+        return self.layout_of(self.bootloader_version(entry))
+
     def stage1_update(self, entry, stage1_image, app_image=None, progress=None):
         """
         Replace one module's stage-1 bootloader over the bus, then (optionally)
@@ -425,10 +447,14 @@ class Conductor:
             return {"uid": uid, "type": None, "reason": reason,
                     "action": "none", "detail": "unknown UID"}
 
+        # The parked module is already in its bootloader, so its layout is known
+        # for free — pass it on so get_image() can refuse a wrong-layout image
+        # instead of pushing one that will hang the module all over again.
         entry = {"type": mf_key, "bus": "i2c", "uid": uid, "address": None,
-                 "reason": reason}
-        logfn("  UID %s was a %s (bootloader v%d.%d.%d) - fetching its app..."
-              % (uid, mf_key, ver[1], ver[2], ver[3]))
+                 "reason": reason, "bootloader": ver,
+                 "bootloader_layout": self.layout_of(ver)}
+        logfn("  UID %s was a %s (bootloader v%d.%d.%d, layout %s) - fetching its app..."
+              % (uid, mf_key, ver[1], ver[2], ver[3], entry["bootloader_layout"]))
         try:
             image = get_image(entry)
             if not image:

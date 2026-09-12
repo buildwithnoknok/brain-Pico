@@ -6,7 +6,7 @@
 #     version + .bin URL; they declare a floor ({"buzzer": {"min": "3.3.1"}}).
 #     _resolve_module_firmware() fetches Ecosystem/software/modules.json to map
 #     each module type to its repo, then that module's firmware/index.json for
-#     the current {version, url, requires_bootloader}. Firmware is backwards
+#     the current {version, url, layout}. Firmware is backwards
 #     compatible, so we install what is current rather than what the product was
 #     written against; the floor only catches a product published against an
 #     unreleased firmware. The version lives in the same commit as the binary,
@@ -16,10 +16,16 @@
 #   - _bootloader_gate() refuses an image the module cannot run. Backwards
 #     compatibility is a promise about the PROTOCOL, not about installability:
 #     the Sep 2026 relink to app base 0x1400 is wire-compatible and still
-#     hard-faults a module on the legacy bootloader, and nothing downstream
-#     would catch it (the flasher writes at an offset the bootloader picks, and
-#     the CRC is over image bytes, not the link address). Resolved against
-#     Conductor.bootloader_version(), where silence = legacy.
+#     hard-faults a module whose bootloader writes apps at 0x1000, and nothing
+#     downstream would catch it (the flasher writes at an offset the bootloader
+#     picks, and the CRC is over image bytes, not the link address). The index
+#     declares a numeric flash `layout` and the match is EXACT, via
+#     Conductor.bootloader_layout() (0 = legacy, 1 = stage-1 1.0.x @0x1000,
+#     2 = stage-1 1.1.x @0x1400). A first version of this gate only told legacy
+#     from stage-1; both layouts answer 0xB1, so it passed a layout-2 image to a
+#     layout-1 buzzer on the bench (12 Sep) and hung it. Fails closed on a
+#     missing layout or an unknown stage-1 version. The rescue path applies the
+#     same check before pushing an image onto a parked module.
 #   - POST /firmware/check now reports resolved:false. It runs at AP time with
 #     no internet, so it cannot reach the registry and can only say what is
 #     installed. The real check is the headless post-WiFi pass.
@@ -803,8 +809,8 @@ def _resolve_module_firmware(session, module_firmware):
     """Turn the manifest's floors into concrete firmware to install.
 
     In:  {"buzzer": {"min": "3.3.1"}}                    (the product manifest)
-    Out: {"buzzer": {"version": "3.5.0", "url": "...",
-                     "requires_bootloader": "stage1"}}   (what to actually flash)
+    Out: {"buzzer": {"version": "3.5.0", "url": "...", "layout": 2}}
+                                                          (what to actually flash)
 
     Module firmware is backwards compatible, so a product does not pin a version
     — it states the oldest it works against and takes whatever the module
@@ -847,8 +853,9 @@ def _resolve_module_firmware(session, module_firmware):
             continue
 
         resolved[mtype] = {"version": version, "url": url,
-                           "requires_bootloader": index.get("requires_bootloader", "any")}
-        log(f"[fw] {mtype}: current is {version} (min {minimum or 'none'})")
+                           "layout": index.get("layout")}
+        log(f"[fw] {mtype}: current is {version} (min {minimum or 'none'}, "
+            f"layout {index.get('layout', '-')})")
     return resolved
 
 
@@ -868,32 +875,42 @@ def _semver_lt(a, b):
     return pa < pb
 
 
-def _bootloader_gate(c, entries, requires):
+def _bootloader_gate(c, entries, layout):
     """DEV-31: refuse an image the module's bootloader cannot actually run.
 
     Backwards compatibility is a promise about the PROTOCOL, not about
-    installability. The Sep 2026 relink to app base 0x1400 (bootloader layout 2)
-    is wire-compatible and still hard-faults a module on the legacy bootloader —
-    the flasher writes at an offset the bootloader chooses, and the CRC is over
-    image bytes, not the link address, so nothing downstream would catch it.
+    installability. An app image is linked for one flash layout (where the app
+    base is); the bootloader writes at the base IT knows; the CRC is over image
+    bytes, not the link address — so a wrong-layout image passes every check
+    and then hangs the module. Nothing downstream would catch it.
+
+    The match is EXACT. "Newer bootloader" is not "compatible": layout 1 and
+    layout 2 both answer 0xB1 and are mutually unrunnable. That coarser
+    legacy-vs-stage-1 check is exactly what hung the bench buzzer on 12 Sep.
+
+    Fails closed: an index with no layout, or a stage-1 version this library
+    does not know, is refused for I2C modules rather than guessed at. USB
+    modules are skipped (no stage-0 port yet, V203 pending).
 
     Returns (ok, reason). Checks every module of the type and fails the whole
     type if any one of them disagrees: refusing is recoverable, flashing an
     unrunnable image costs an SWD session."""
-    if requires in (None, "any"):
-        return True, "no bootloader requirement"
     for e in entries:
         if e.get("bus") != "i2c":
-            continue          # USB modules: no stage-0 port yet (V203 pending)
+            continue
+        if layout is None:
+            return False, "index declares no layout for an I2C module"
         try:
-            ver = c.bootloader_version(e)
+            actual = c.bootloader_layout(e)
         except Exception as ex:
             return False, "could not read bootloader of %s: %r" % (e.get("uid"), ex)
-        actual = "legacy" if ver is None else "stage1"
-        if actual != requires:
-            return False, ("module %s has the %s bootloader, image needs %s"
-                           % (e.get("uid"), actual, requires))
-    return True, "bootloader is %s" % requires
+        if actual is None:
+            return False, ("module %s runs a stage-1 this Conductor does not know"
+                           % e.get("uid"))
+        if actual != layout:
+            return False, ("module %s is flash layout %d, image is layout %d"
+                           % (e.get("uid"), actual, layout))
+    return True, "layout %s" % layout
 
 
 def _download_image(session, url, timeout=30):
@@ -958,10 +975,18 @@ def check_and_flash_modules(module_firmware):
 
     def rescue_image(entry):
         """One image, fetched on demand — we cannot know which module is parked
-        until we have asked it, and a parked module is the rare case."""
-        url = _url_for(entry["type"])
+        until we have asked it, and a parked module is the rare case. Same
+        layout rule as the gate: a parked module is already in its bootloader,
+        so its layout is known for free, and pushing a wrong-layout image would
+        just hang it again."""
+        spec = resolved.get(entry["type"]) or {}
+        url  = spec.get("url")
         if not url:
             raise ValueError("no resolved firmware for %r" % entry["type"])
+        have, need = entry.get("bootloader_layout"), spec.get("layout")
+        if need is None or have is None or have != need:
+            raise ValueError("layout mismatch: module is %s, image is %s"
+                             % (have, need))
         return _download_image(session, url)
 
     # ── Pass 1: decide. No image downloads, no filesystem writes. ─────────────
@@ -990,7 +1015,7 @@ def check_and_flash_modules(module_firmware):
             types.append(r["type"])
     for mtype in list(types):
         ok, why = _bootloader_gate(c, [r for r in todo if r["type"] == mtype],
-                                   resolved[mtype].get("requires_bootloader"))
+                                   resolved[mtype].get("layout"))
         if not ok:
             log(f"[fw] {mtype}: REFUSED — {why}")
             event(f"[FW]    {mtype:<11} refused: {why}")
