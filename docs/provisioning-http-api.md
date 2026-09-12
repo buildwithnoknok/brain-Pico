@@ -102,11 +102,20 @@ handled, because it is the first point at which the Pico has internet:
    layout (byte 5 of the bootloader's `0xB1` reply) — exact match — and drop any
    type whose modules cannot run the image; fetch every remaining image
    **before** touching a module; flash from local files; delete them.
-6. Run `product.py`.
+6. Run `product.py` under three-strikes crash recovery (restart with backoff;
+   after three, a safe idle that still answers the factory-reset gesture and
+   re-fetches `product.py` once if online).
 
-Every step degrades to a no-op rather than failing the boot. Progress is
-log-only (`log.txt` + `noknok_events.txt`) — there is no live channel back to the
-phone by this point, since it is long off the setup AP.
+**If the WiFi join fails** (router down, out of range): nothing is deleted.
+With `product.py` present the product runs offline — no OTA, no NTP, but a
+module parked after a power cut is still rescued from the on-device image
+cache — and the credentials are retried on the next boot. Without
+`product.py` the setup AP is offered, credentials kept.
+
+Every step degrades to a no-op rather than failing the boot. Progress goes to
+the serial console and `noknok_events.txt`; `log.txt` is written only with the
+bench marker `/debug_log` present, or once on a crash. There is no live channel
+back to the phone by this point, since it is long off the setup AP.
 
 ## Planned
 

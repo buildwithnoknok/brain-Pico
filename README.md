@@ -40,7 +40,24 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
 
 ## Current versions & features (PoC v1)
 
-**`code.py` v0.12** — provisioning + launcher + module firmware OTA:
+**`code.py` v0.13** — provisioning + launcher + module firmware OTA. Field-hardened 12 Sep 2026:
+- **Runs offline.** A failed WiFi join never deletes `wifi.json` any more; if `product.py`
+  exists the product runs without updates and the credentials are retried next boot. Only the
+  factory-reset gesture removes them. (It used to wipe them after three attempts and fall into
+  AP mode — a router hiccup meant a full re-setup, and no product until then.)
+- **Three-strikes crash recovery.** A `product.py` exception restarts it with backoff; the count
+  lives in `microcontroller.nvm` and clears on a real power-on. After three, a clean boot parks
+  in a safe idle that still answers the knob-hold factory reset and, if online, fetches a fresh
+  `product.py` once — acting on it only if it differs. (It used to end at "Code done running".)
+- **Flash writes only when they earn it.** `log.txt` is written only with the bench marker
+  `/debug_log` present, or once on a crash (a "RING FLUSH" of the last ~80 lines); otherwise
+  logging is serial + RAM. `noknok_state.json` is rewritten only on a real change. The events
+  file is unchanged. See DEV-18 for why this matters on an unjournaled FAT filesystem.
+- **Image integrity + offline rescue cache.** Downloads are checked against `index.json`
+  `size`/`crc32` before touching a module, and every fetched image is kept on the Pico with a
+  sidecar so a module parked after a power cut is rescued with no internet.
+
+Earlier features:
 - The app POSTs `ssid`, `password` and **`script_url`** to `192.168.4.1/connect`. The Pico
   downloads whatever product `script_url` points to, so the brain is **product-agnostic** —
   a new product is just a new manifest + script, no firmware change. (`SCRIPT_URL` remains a
