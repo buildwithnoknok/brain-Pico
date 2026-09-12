@@ -44,7 +44,12 @@ def banner(s):
 
 
 def fmt(v):
-    return "proto=%d  v%d.%d.%d" % v if v else "no answer"
+    if not v:
+        return "no answer"
+    s = "proto=%d  v%d.%d.%d" % tuple(v[:4])
+    if len(v) > 4:
+        s += "  layout=%s" % (v[4] or "?")      # 5th byte since stage-1 1.2.0
+    return s
 
 
 def main():
@@ -59,7 +64,7 @@ def main():
     print("   0x7E answers 0xB1:", fmt(v))
     if v is None:
         raise SystemExit("FAIL: stage-1 did not answer GET_VERSION")
-    print("   PASS — stage-1 v%d.%d.%d is running and speaks 0xB1" % tuple(v[1:]))
+    print("   PASS — stage-1 v%d.%d.%d is running and speaks 0xB1" % tuple(v[1:4]))
 
     # ── 3. stage the v1.0.1 image into the app region ─────────────────────────
     banner("2. Stage the new image (ERASE + WRITE_CHUNK)")
@@ -95,11 +100,11 @@ def main():
     print("   0x7E answers 0xB1:", fmt(v2))
     if v2 is None:
         raise SystemExit("FAIL: new stage-1 did not answer GET_VERSION")
-    if tuple(v2[1:]) != (v[1], v[2], v[3] + 1):
+    if tuple(v2[1:4]) != (v[1], v[2], v[3] + 1):
         raise SystemExit("FAIL: expected v%d.%d.%d after update, got v%d.%d.%d"
                          % (v[1], v[2], v[3] + 1, v2[1], v2[2], v2[3]))
 
-    banner("ALL PASS — stage-1 updated itself over I2C: v%d.%d.%d -> v%d.%d.%d" % (tuple(v[1:]) + tuple(v2[1:])))
+    banner("ALL PASS — stage-1 updated itself over I2C: v%d.%d.%d -> v%d.%d.%d" % (tuple(v[1:4]) + tuple(v2[1:4])))
     print("Now verify over SWD from the Pi (stage-1 region, control block, staging).")
 
 

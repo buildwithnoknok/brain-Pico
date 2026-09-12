@@ -29,7 +29,12 @@ def banner(s):
 
 
 def fmt(v):
-    return "proto=%d  v%d.%d.%d" % v if v else "no answer (legacy bootloader)"
+    if not v:
+        return "no answer (legacy bootloader)"
+    s = "proto=%d  v%d.%d.%d" % tuple(v[:4])
+    if len(v) > 4:
+        s += "  layout=%s" % (v[4] or "?")      # 5th byte since stage-1 1.2.0
+    return s
 
 
 def find_ledbutton(c):

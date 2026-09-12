@@ -17,8 +17,9 @@
 #                                         stage-0 installs it)
 #   write [0x06, len(4 LE), crc32(4 LE)]  VERIFY_STAGE1 -> arms a bootloader
 #                                         self-update (stage-0/stage-1 only)
-#   write [0xB1], then read 4 bytes       GET_VERSION -> [proto, major, minor,
-#                                         patch] (stage-0/stage-1 only)
+#   write [0xB1], then read 5 bytes       GET_VERSION -> [proto, major, minor,
+#                                         patch, layout] (stage-0/stage-1 only;
+#                                         layout byte = 0 before stage-1 1.2.0)
 #   read  2 bytes -> [state, last_error]  state: 0 IDLE 1 BUSY 2 READY 3 ERROR
 #
 # A running app is flipped into the bootloader with app command 0xB0.
@@ -189,13 +190,18 @@ class ModuleFlasher:
 
     # ── DEV-31: bootloader self-update ───────────────────────────────────────
     def get_version(self):
-        """Bootloader version: write 0xB1, read [proto, major, minor, patch].
-        Returns the 4-tuple, or None if the bootloader doesn't answer — which is
+        """Bootloader version: write 0xB1, read [proto, major, minor, patch, layout].
+        Returns the 5-tuple, or None if the bootloader doesn't answer — which is
         how you tell a legacy monolithic bootloader (not self-updatable) from a
-        stage-0/stage-1 one."""
+        stage-0/stage-1 one.
+
+        Byte 4 is the flash layout the bootloader installs apps for (stage-1
+        v1.2.0+). A stage-1 older than that returns 0 there — "did not say" —
+        and the Conductor treats that as unknown, never as a guess. (The app's
+        own 0xB1 reply is still 4 bytes; that is a different address.)"""
         if not self._write(BL_ADDR, [CMD_GET_VERSION]):
             return None
-        buf = bytearray(4)
+        buf = bytearray(5)
         while not self.i2c.try_lock():
             pass
         try:

@@ -308,9 +308,10 @@ class Conductor:
         Read a module's bootloader version — the fleet discriminator.
 
         Drops the running app into the bootloader (0xB0), asks 0xB1, then BOOTs
-        the app again and re-enumerates. Returns (proto, major, minor, patch) for a
-        stage-0/stage-1 module, or None for the legacy monolithic bootloader,
-        which does not implement 0xB1 and cannot self-update (needs SWD).
+        the app again and re-enumerates. Returns (proto, major, minor, patch,
+        layout) for a stage-0/stage-1 module — layout is 0 if the stage-1 predates
+        1.2.0 — or None for the legacy monolithic bootloader, which does not
+        implement 0xB1 and cannot self-update (needs SWD).
 
         Heavier than it sounds — the module has to be in the bootloader to answer —
         so call it once per module when deciding whether a stage-1 update applies,
@@ -327,20 +328,21 @@ class Conductor:
         self.enumerate()
         return v
 
-    # Stage-1 (major, minor) -> flash layout it writes apps for. A layout change
-    # (the app base moves) is always a new stage-1 minor, and only the bootloader
-    # knows where it puts the app, so this is the one place the mapping lives.
-    # Legacy monolithic bootloader (no 0xB1) = layout 0.
-    #   layout 1: stage-1 1.0.x, app @0x1000    layout 2: stage-1 1.1.x, app @0x1400
-    STAGE1_LAYOUTS = {(1, 0): 1, (1, 1): 2}
+    @staticmethod
+    def layout_of(bl_version):
+        """Flash layout from a bootloader_version() tuple.
 
-    @classmethod
-    def layout_of(cls, bl_version):
-        """Layout for a bootloader_version() tuple; 0 for legacy (None); None
-        for a stage-1 version this library does not know — refuse, don't guess."""
+        The bootloader states it itself: byte 4 of its 0xB1 reply (stage-1
+        1.2.0+). Only the bootloader knows where it puts the app, so nothing
+        host-side infers it. Returns 0 for the legacy monolithic bootloader
+        (no 0xB1 at all), and None when the stage-1 predates the layout byte
+        (it answers 0 there) — refuse rather than guess; that module needs a
+        stage-1 update first."""
         if bl_version is None:
             return 0
-        return cls.STAGE1_LAYOUTS.get((bl_version[1], bl_version[2]))
+        if len(bl_version) < 5 or bl_version[4] == 0:
+            return None
+        return bl_version[4]
 
     def bootloader_layout(self, entry):
         """Which flash layout this module's bootloader installs apps for. Same
@@ -431,7 +433,7 @@ class Conductor:
                     "action": "none", "detail": "legacy bootloader, unidentifiable"}
         uid = f.get_uid()
         if not uid:
-            logfn("  bootloader v%d.%d.%d answered but gave no UID" % ver[1:])
+            logfn("  bootloader v%d.%d.%d answered but gave no UID" % tuple(ver[1:4]))
             return {"uid": None, "type": None, "reason": reason,
                     "action": "none", "detail": "no UID"}
 
