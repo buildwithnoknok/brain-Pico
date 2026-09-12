@@ -678,8 +678,16 @@ class Conductor:
         must NOT be forgotten: its UID -> type entry is the only way
         rescue_parked_module() can tell what app to push. Found on the bench
         11 Sep 2026: one enumeration with the module parked wiped the file and
-        the rescue reported 'unknown UID'. Stale addresses are harmless —
-        _restore_state() pings each one and skips those that don't answer."""
+        the rescue reported 'unknown UID'.
+
+        A stale entry's ADDRESS, however, is only kept while nothing live has
+        claimed it. Found on the bench 12 Sep 2026: the buzzer died, only the
+        LED Button re-enumerated and took 0x08, the merge kept the buzzer's old
+        0x08 too, and _restore_state() — which only checks that *something*
+        answers — then 'restored' the buzzer as a phantom object pointing at the
+        LED Button. Two UIDs, one address. So: a stale entry whose address a
+        live module now owns gets address None (type kept, that is all rescue
+        needs), and _restore_state() skips None."""
         try:
             with open(filename, "r") as f:
                 data = json.load(f)
@@ -687,6 +695,7 @@ class Conductor:
                 data = {}
         except (OSError, ValueError):
             data = {}
+        live_addrs = set()
         for uid_hex, module in self._registry.items():
             if module is not None:
                 if isinstance(module, NoknokBuzzer):
@@ -700,6 +709,12 @@ class Conductor:
                 else:
                     t = 0
                 data[uid_hex] = {"address": module.address, "type": t}
+                live_addrs.add(module.address)
+        for uid_hex, info in data.items():
+            if uid_hex in self._registry or not isinstance(info, dict):
+                continue
+            if info.get("address") in live_addrs:
+                info["address"] = None
         try:
             with open(filename, "w") as f:
                 json.dump(data, f)
@@ -718,12 +733,26 @@ class Conductor:
             return 0
 
         restored = 0
+        claimed  = set()          # one address restores at most one UID
         for uid_hex, info in data.items():
-            addr      = info.get("address", 0)
-            type_code = info.get("type",    0)
+            if not isinstance(info, dict):
+                continue
+            addr      = info.get("address")
+            type_code = info.get("type", 0)
 
+            if not addr:
+                continue   # known UID, no current address (parked or moved) — rescue's job
+            if addr in claimed:
+                # A second UID on an address already restored this pass can only come
+                # from a file written before _save_state() nulled such addresses.
+                # First entry wins; a presence ping cannot tell which UID actually
+                # answered, so this is the best available until modules answer a
+                # runtime GET_UID and restore becomes identity-checked.
+                print("  state: %s also claims 0x%02X — skipped (stale)" % (uid_hex, addr))
+                continue
             if self._read(addr, 1) is None:
                 continue   # module not responding
+            claimed.add(addr)
 
             if type_code == self.TYPE_BUZZER:
                 module = NoknokBuzzer(self.i2c, address=addr)

@@ -19,7 +19,8 @@ print("=== 2. state file after that enumerate ===")
 with open("noknok_state.json") as f:
     st = json.load(f)
 for uid, info in st.items():
-    print("   %s -> type %d @0x%02X" % (uid, info["type"], info["address"]))
+    a = info.get("address")
+    print("   %s -> type %d @%s" % (uid, info["type"], ("0x%02X" % a) if a else "None (no address)"))
 if not any(i["type"] == 3 for i in st.values()):
     raise SystemExit("FAIL: the parked LED Button was forgotten (merge not working)")
 print("   LED Button entry SURVIVED the enumerate")
