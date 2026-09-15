@@ -14,8 +14,9 @@ over I2C.
 | `boot.py` | Runs first on power-up. Hides the CIRCUITPY drive and makes the filesystem read-only to the program (see [Filesystem policy](#filesystem-policy-dev-18)). Fails open. |
 | `settings.toml` | **The maker config file.** I2C/USB pins, drive visibility. Every key has the ecosystem-standard default built into the code — see [settings.toml](#settingstoml--maker-configuration). |
 | `code.py` | Provisioning brain + launcher. WiFi-AP setup on first boot, then connect + download + run the app-selected product script crash-safely on every boot. |
-| `noknok.py` | Conductor library — module discovery/enumeration + drivers (Buzzer, Knob, LED Button, ...). Includes the factory-reset watchdog and the power-safe file helpers (`writable()`, `write_atomic()`). |
-| `bench_fs_policy.py` | DEV-18 acceptance script: proves on the board that the filesystem is read-only outside a window, atomic writes work, `.tmp` orphans are swept. |
+| `noknok.py` | Conductor library — module discovery/enumeration + drivers (Buzzer, Knob, LED Button, ...). Includes the factory-reset watchdog, the runtime `Store` (FRAM / nvm) and the setup-time file helpers (`writable()`, `write_atomic()`). |
+| `bench_fs_policy.py` / `bench_store.py` / `bench_yank.py` | DEV-18 bench scripts: filesystem read-only outside a window; Store round-trip + stable addresses; board-guided power-yank test (beeps, then a tone = pull the cable). |
+| `lib/` | Pinned CircuitPython libraries the brain needs (see `lib/README.md`). |
 | `module_flasher.py` | I2C OTA flasher — streams a module application `.bin` to the CH32V003 bootloader (`ModuleFlasher`). Shared by the bench tool and (later) the provisioning flow. |
 | `bench_flash.py` | Bench bring-up tool — flashes application firmware onto a blank module (bootloader only) one at a time from the REPL. See [Bench-flashing modules](#bench-flashing-modules-bring-up). |
 | `trio_demo.py` | Light & Sound Controller demo — uses all three I2C modules. |
@@ -42,45 +43,67 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
 
 ## Filesystem policy (DEV-18)
 
-The CIRCUITPY drive is a FAT filesystem on raw flash with **no journal**. A power cut in the
-middle of any write can corrupt it — and can take unrelated files (`product.py`) with it. A
-noknok product is switched off by unplugging, so the brain must never have a write in flight
-when that happens. Software cannot make a FAT write survive a power cut; it can only make sure
-none is in flight, and that the rare writes cannot destroy what is already there.
+**The brain never writes its filesystem while a product runs.** That is the whole
+policy, and it exists because of a bench-proven fact, not a precaution:
 
-**Three layers, only one of them ever written.** The RP2350's BOOTSEL bootloader is ROM and
-cannot be damaged. CircuitPython itself is written only by a UF2 flash, never by our code. Only
-the filesystem is at risk — and a brain with a broken filesystem always shows up on a PC as a
-drive again (see *fail open* below), so it can always be recovered ([DEV-38](https://noknokdev.atlassian.net/browse/DEV-38):
-one-file recovery image).
+> On CircuitPython + RP2 internal flash, **no filesystem write can be made power-safe.**
+> The flash driver changes one 512 B FAT sector by erasing and reprogramming the whole
+> 4 KB block in place, with no spare copy. A power cut during that reprogram takes every
+> directory entry in the block — and a fresh brain's ~15 files all sit in one block. On
+> 15 Sep 2026 three cable pulls during writes produced three filesystem failures, the
+> third a **total loss** (`code.py`, `noknok.py`, `lib/` gone) from a 200-byte JSON
+> write. Atomic temp+rename does not help; the rename *is* the block rewrite.
+> Unplugging is how a product is switched off, and loose cables and flaky adapters do
+> the same at random moments — so the only safe write is the one that doesn't happen.
 
-The rules, enforced by the OS rather than by discipline:
+**Three layers, only one at risk.** The RP2350's BOOTSEL bootloader is ROM; CircuitPython
+is written only by a UF2 flash; both are untouched by our code — the Pico can never be
+bricked. Only the FAT filesystem is exposed, and a brain with a broken filesystem always
+shows up on a PC as a drive again (fail-open, below), so recovery is always possible:
+[DEV-38](https://noknokdev.atlassian.net/browse/DEV-38) makes that one drag-and-drop.
 
-1. **Read-only to the program by default.** `boot.py` hides the CIRCUITPY drive from PCs
-   (`settings.toml` → `NOKNOK_USB_DRIVE = 0`) and remounts the filesystem read-only. Any stray
-   `open(..., "w")` — in `code.py`, `noknok.py`, or a product — raises `OSError` instead of
-   silently writing flash. (With the drive hidden, CircuitPython would otherwise leave the
-   filesystem *writable* to code; the explicit remount is the whole policy.)
-2. **Short write windows.** `with noknok.writable():` remounts rw, and the outermost exit runs
-   `os.sync()` and remounts read-only. Windows exist for provisioning, OTA, roles and factory
-   reset — the first seconds after boot — and **never while `product.py` runs**. Remount itself
-   is free; each small write costs ~200 ms of flash erase, so writes stay rare.
-3. **Every write atomic and only-when-changed.** `noknok.write_atomic(path, data)` writes
-   `<path>.tmp` and renames it over the target, so a power cut mid-write leaves the old file
-   intact. `product.py` is additionally `compile()`d before it replaces the running copy.
-   Orphan `.tmp` files are swept by `noknok.clean_tmp()` at boot. Counters and flags
-   (crash strikes, OTA timestamp) live in `microcontroller.nvm`, a separate flash region that
-   cannot hurt the FAT.
-4. **Fail open.** If `settings.toml` has no `NOKNOK_USB_DRIVE` key, or `code.py` / `noknok.py`
-   are missing, or `boot.py` raises, the drive stays visible. `boot.py` can never lock a brain out.
+### The rules
 
-**Maker / bench mode** (`NOKNOK_USB_DRIVE = 1`): the drive is visible and a PC may write it;
-the program then cannot, and provisioning fails loudly (logged + `[CFG]` event) instead of two
-writers sharing one FAT volume. Switch from the REPL with `import noknok; noknok.set_usb_drive(True)`
-and power-cycle; switch back by editing `settings.toml` on the PC. Bench file transfers
-(`tools/pico.py put`) go over the REPL and open their own window, so they work in both modes.
+1. **Read-only to the program by default.** `boot.py` hides the CIRCUITPY drive
+   (`settings.toml` → `NOKNOK_USB_DRIVE = 0`) and remounts the filesystem read-only. Any
+   stray `open(..., "w")` — in `code.py`, `noknok.py`, or a product — raises `OSError`.
+   (With the drive hidden CircuitPython would otherwise leave it *writable*; the explicit
+   remount is the guarantee.)
+2. **Runtime data lives in the Store, never on the FAT.** `noknok.store()` is a small
+   CRC-checked record on an **I2C FRAM** at 0x50 when the PicoHub has one
+   ([DEV-40](https://noknokdev.atlassian.net/browse/DEV-40): byte-atomic writes, no wear,
+   genuinely power-safe; two slots written alternately) and otherwise in
+   `microcontroller.nvm` (one 4 KB flash sector — a cut mid-write loses the record, which
+   is acceptable only because every key is self-healing). Keys: module state (UID →
+   address/type/bootloader), roles, the event history (`[FW]/[CRASH]/…`, replaces
+   `noknok_events.txt`), a WiFi-credentials copy, and product settings (DEV-34).
+3. **Stable module addresses.** Enumeration gives a known module its previous address, so
+   the state record only changes when hardware changes — it used to be rewritten on most
+   power-ons because modules were numbered in arrival order.
+4. **Filesystem writes only at setup and OTA**, into `/data/`: `wifi.json`, `product.py`
+   (compiled before it replaces the running copy), the firmware cache, and a copy of the
+   roles. Those are moments the customer is holding the phone and the app says *keep it
+   plugged in*. `/data`'s directory entries live in their own block, so a cut there can
+   lose `/data/*` but not `code.py`'s entry — a mitigation, not a cure: the allocation
+   table is still shared. Recovery: `wifi.json` is rebuilt from the Store copy,
+   `product.py` and the cache are re-downloaded, and DEV-38 covers the rest.
+   `noknok.writable()` / `noknok.write_atomic()` are the only way to write, and they are
+   for these moments only.
+5. **Fail open.** If `settings.toml` has no `NOKNOK_USB_DRIVE` key, or `code.py` /
+   `noknok.py` are missing, or `boot.py` raises, the drive stays visible. `boot.py` can
+   never lock a brain out.
 
-**Bench proof:** `bench_fs_policy.py` (run via `./pico.py run`), 10/10 on the Pi4 bench, 15 Sep 2026.
+**Maker / bench mode** (`NOKNOK_USB_DRIVE = 1`): the drive is visible and a PC may write
+it; the program then cannot write the filesystem (the Store still works), and provisioning
+reports the failure instead of pretending. Switch from the REPL with
+`import noknok; noknok.set_usb_drive(True)` and power-cycle; switch back by editing
+`settings.toml` on the PC. `tools/pico.py put` goes over the REPL and works in both modes.
+
+**Bench proof (Pi4, 15 Sep 2026):** `bench_fs_policy.py` 10/10 (read-only default,
+windows, atomic writes); `bench_store.py` 11/11 (Store round-trip, stable addresses, no
+filesystem writes on re-enumeration); `bench_yank.py` — the board beeps, then holds a tone
+while it writes, you pull the cable during the tone; *runtime* rounds (product idle, Store
+churn) must never lose a file, *setup-time* rounds reproduce the finding.
 
 ## settings.toml — maker configuration
 
@@ -101,9 +124,9 @@ OTA interval, mDNS name) move here under [DEV-39](https://noknokdev.atlassian.ne
 
 ## Current versions & features (PoC v1)
 
-**`code.py` v0.16** — provisioning + launcher + module firmware OTA. 15 Sep 2026: **filesystem
-policy (DEV-18)** — read-only by default, atomic writes in short windows, `settings.toml` for
-pins and drive visibility; see the two sections above. Field-hardened 12 Sep 2026:
+**`code.py` v0.16** — provisioning + launcher + module firmware OTA. 15 Sep 2026: **no filesystem
+writes while a product runs (DEV-18)** — read-only by default, runtime data in the Store (FRAM / nvm),
+setup-time writes into `/data`, `settings.toml` for pins and drive visibility; see the two sections above. Field-hardened 12 Sep 2026:
 - **Bootloader updates over the air (DEV-31).** The registry names the current stage-1
   (`module-I2C-bootloader/firmware/index.json`); it is cached like any image, and before the
   app pass every I²C module below the published stage-1 gets it — and its current app back —

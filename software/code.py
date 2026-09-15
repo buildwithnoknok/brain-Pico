@@ -1,11 +1,24 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.16 (filesystem read-only by default, atomic writes — DEV-18)
+# Version: 0.16 (no filesystem writes while a product runs — DEV-18)
 #
-# v0.16 changes (Sue): DEV-18 — a power cut can no longer corrupt the brain.
-#   The CIRCUITPY drive is FAT on raw flash with no journal; a power cut mid-
-#   write corrupts it, and unplugging is how a product is switched off. Until
-#   now boot.py left the filesystem permanently writable to the program and
-#   every save was truncate-then-rewrite. Now:
+# v0.16 changes (Sue): DEV-18. Bench-proven 15 Sep 2026 that on RP2 flash NO
+#   FAT write can be made power-safe: the driver rewrites whole 4 KB blocks in
+#   place, so a cut during any write can wipe the directory (3 pulls, 3
+#   losses, one total). Unplugging is how a product is switched off, and loose
+#   cables do the same. So the brain no longer writes the filesystem while a
+#   product runs — at all:
+#   - Runtime data lives in the Store (noknok.store(): I2C FRAM at 0x50 when
+#     the PicoHub has one — power-safe — else microcontroller.nvm, self-
+#     healing): module state, roles, event history, a credentials copy, and
+#     product settings once DEV-34 lands. noknok_events.txt is gone; event()
+#     appends to the Store ring, events() reads it.
+#   - Filesystem writes happen only at setup and OTA — wifi.json, product.py,
+#     the firmware cache — into /data, whose directory block is not the one
+#     naming code.py / noknok.py / lib. Legacy root files are still read.
+#   - wifi.json is restored from the Store copy if a setup-time cut took it.
+#   - Enumeration keeps a known module's previous address (noknok.py), so the
+#     state no longer changes — and is no longer written — on every power-on.
+#   Earlier in v0.16, still true:
 #   - boot.py hides the drive from PCs (settings.toml NOKNOK_USB_DRIVE = 0)
 #     and remounts the filesystem READ-ONLY to the program. Any stray write
 #     raises OSError — the OS enforces the policy. Fail open: a brain whose
@@ -150,7 +163,7 @@
 #     already off the noknok-setup AP by then). A future GET /status + mDNS
 #     endpoint (see poc-private/docs/firmware-change-for-sam.md) would be a
 #     separate task if live in-app progress is wanted later.
-#   - Outcomes logged to log.txt (verbose) + noknok_events.txt (durable audit).
+#   - Outcomes logged to log.txt (verbose, bench) + the Store event history (durable audit).
 #
 # v0.10 changes (Sue): module-firmware version check + OTA (DEV-1 / PoC v2 Step 5).
 #   - POST /firmware/check (AP time): the app sends the manifest's module_firmware{};
@@ -215,8 +228,9 @@ import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 import noknok as nk          # filesystem policy helpers (DEV-18) + settings.toml
 
-LOG_FILE    = "log.txt"
-EVENTS_FILE = "noknok_events.txt"   # durable, categorized audit log (FW/CFG/ROLE/RESET)
+LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
+EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
+EVENTS_MAX  = 40           # Store (FRAM / nvm), never on the FAT — DEV-18. Last N lines.
 
 # Wall-clock availability. The Pico 2W has no battery-backed RTC, so on every
 # boot we only know uptime (time.monotonic). After a successful WiFi connect we
@@ -298,7 +312,11 @@ def event(msg):
     history is easy to find. Best-effort; never raises."""
     line = _timestamp() + str(msg)
     sys.stdout.write(line + "\n")
-    nk.append_line(EVENTS_FILE, line)          # short write window; best-effort
+    nk.store().append(EVENTS_KEY, line, EVENTS_MAX)   # Store, never the FAT (DEV-18)
+
+def events():
+    """The audit history, oldest first (what DEV-36 shows the customer)."""
+    return list(nk.store().get(EVENTS_KEY) or [])
 
 def sync_time_ntp(pool):
     """One-time NTP sync to set the RTC so logs get wall-clock timestamps.
@@ -329,6 +347,7 @@ def log_new_boot():
     if not _flash_logging_enabled():
         return
     try:
+        nk.ensure_dir(LOG_FILE)
         with nk.writable():
             try:
                 if os.stat(LOG_FILE)[6] > LOG_MAX_BYTES:   # index 6 = file size
@@ -352,8 +371,15 @@ AP_PASSWORD = ""   # Open network
 # In production this URL comes from the backend based on the purchased product.
 SCRIPT_URL = "https://raw.githubusercontent.com/buildwithnoknok/buildwithnoknok.github.io/main/poc/trio_demo.py"
 
-WIFI_CREDENTIALS_FILE = "wifi.json"
-PRODUCT_SCRIPT_FILE   = "product.py"
+# Field-written files live in /data (DEV-18): their directory entries share a
+# block with each other, not with code.py / noknok.py / lib. Brains provisioned
+# before /data existed still have them in the root — read as a fallback, never
+# migrated (a migration would be one more setup-class write for no gain).
+WIFI_CREDENTIALS_FILE = nk.DATA_DIR + "/wifi.json"
+PRODUCT_SCRIPT_FILE   = nk.DATA_DIR + "/product.py"
+_LEGACY_WIFI_FILE     = "wifi.json"
+_LEGACY_PRODUCT_FILE  = "product.py"
+WIFI_STORE_KEY        = "wifi"       # recovery copy in the Store (FRAM / nvm)
 WIFI_TIMEOUT_S        = 15
 
 # Shared state: the /connect handler fills this, the main loop acts on it.
@@ -460,27 +486,40 @@ h1{color:#00aa44}</style></head><body>
 # ── Filesystem helpers ─────────────────────────────────────────────────────────
 
 def load_wifi_credentials():
-    """Return saved {"ssid":..., "password":...} or None."""
-    try:
-        with open(WIFI_CREDENTIALS_FILE, "r") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
+    """Saved {"ssid", "password", "script_url", "module_firmware"} or None.
+    Three homes, first intact one wins: /data/wifi.json, the legacy root
+    wifi.json, and the Store copy (FRAM: power-safe; nvm: usually there).
+    If only the Store copy survived a bad power cut, the file is rewritten
+    from it so the next boot is normal — a setup-class write, once."""
+    for path in (WIFI_CREDENTIALS_FILE, _LEGACY_WIFI_FILE):
+        creds = nk.read_json(path)
+        if isinstance(creds, dict) and creds.get("ssid"):
+            return creds
+    creds = nk.store().get(WIFI_STORE_KEY)
+    if isinstance(creds, dict) and creds.get("ssid"):
+        log("[storage] wifi.json missing — restored from the Store copy")
+        nk.write_json_atomic(WIFI_CREDENTIALS_FILE, creds)
+        return creds
+    return None
 
 def save_wifi_credentials(ssid, password, script_url=None, module_firmware=None):
-    """Atomic write (DEV-18). Returns False when the filesystem is read-only —
-    i.e. the CIRCUITPY drive is visible to a PC (settings.toml
-    NOKNOK_USB_DRIVE = 1); the caller must not pretend provisioning worked."""
-    ok = nk.write_json_atomic(WIFI_CREDENTIALS_FILE,
-        {"ssid": ssid, "password": password, "script_url": script_url,
-         "module_firmware": module_firmware})
-    log("[storage] Saved wifi.json" if ok else
-        "[storage] CANNOT save wifi.json — filesystem read-only "
+    """Store copy first (power-safe on FRAM), then the file (atomic write into
+    /data). Returns False only when NEITHER took it — e.g. the CIRCUITPY drive
+    is visible to a PC (settings.toml NOKNOK_USB_DRIVE = 1) and there is no
+    FRAM; the caller must not pretend provisioning worked."""
+    creds = {"ssid": ssid, "password": password, "script_url": script_url,
+             "module_firmware": module_firmware}
+    in_store = nk.store().set(WIFI_STORE_KEY, creds)
+    in_file  = nk.write_json_atomic(WIFI_CREDENTIALS_FILE, creds)
+    log("[storage] credentials saved (store=%s file=%s)" % (in_store, in_file)
+        if (in_store or in_file) else
+        "[storage] CANNOT save credentials — filesystem read-only and no Store "
         "(drive visible to a PC? set NOKNOK_USB_DRIVE = 0 in settings.toml)")
-    return ok
+    return in_store or in_file
 
 def delete_wifi_credentials():
-    if nk.remove(WIFI_CREDENTIALS_FILE):
+    nk.store().delete(WIFI_STORE_KEY)
+    if nk.remove(WIFI_CREDENTIALS_FILE, _LEGACY_WIFI_FILE):
         log("[storage] Deleted wifi.json")
 
 def _url_decode(s):
@@ -507,12 +546,19 @@ def _url_decode(s):
     except Exception:
         return out.decode("latin-1")
 
+def product_script_path():
+    """Where the product script is: /data/product.py, or the legacy root
+    product.py on a brain provisioned before /data existed. None if absent."""
+    for path in (PRODUCT_SCRIPT_FILE, _LEGACY_PRODUCT_FILE):
+        try:
+            os.stat(path)
+            return path
+        except OSError:
+            pass
+    return None
+
 def product_script_exists():
-    try:
-        os.stat(PRODUCT_SCRIPT_FILE)
-        return True
-    except OSError:
-        return False
+    return product_script_path() is not None
 
 # ── WiFi ──────────────────────────────────────────────────────────────────────
 
@@ -1315,7 +1361,7 @@ def alert_customer():
 # power cut during the fetch is rejected rather than flashed.
 
 def _cache_paths(mtype):
-    return "/fw_%s.bin" % mtype, "/fw_%s.json" % mtype
+    return "%s/fw_%s.bin" % (nk.DATA_DIR, mtype), "%s/fw_%s.json" % (nk.DATA_DIR, mtype)
 
 def _cache_image(mtype, image, spec):
     """Store a verified image + sidecar. Returns the .bin path. Sidecar carries
@@ -1628,10 +1674,10 @@ def run_product(connected):
     """Run product.py with three-strikes crash recovery (see the crash-recovery
     block above). Never returns on the happy path — a product loops forever."""
     strikes = _crash_count()
-    log(f"[boot] product.py present — running {PRODUCT_SCRIPT_FILE}"
+    log(f"[boot] product.py present — running {product_script_path()}"
         + (f" (strike {strikes}/{CRASH_MAX})" if strikes else ""))
     try:
-        exec(open(PRODUCT_SCRIPT_FILE).read(), {"__name__": "__main__"})
+        exec(open(product_script_path()).read(), {"__name__": "__main__"})
         # A product that returns is a product that stopped: treat like a crash
         # so a script that falls off the end gets the same three tries.
         raise RuntimeError("product.py returned")
@@ -1648,7 +1694,8 @@ def run_product(connected):
             pass
         event(f"[CRASH] product.py {type(e).__name__}: {str(e)[:120]}  "
               f"strike {strikes}/{CRASH_MAX}")
-        flush_log_ring("product crash")      # the one write that earns its place
+        if _flash_logging_enabled():
+            flush_log_ring("product crash")  # bench only: a runtime FAT write (DEV-18)
         # Always reload — a clean VM releases the I2C pins the product held. If
         # this was the third strike, main() sees the count and parks instead of
         # running the product again.
@@ -1670,7 +1717,7 @@ def safe_idle(connected):
     if connected:
         try:
             creds = load_wifi_credentials() or {}
-            with open(PRODUCT_SCRIPT_FILE, "r") as fh:
+            with open(product_script_path(), "r") as fh:
                 current = fh.read()
             if download_and_save_script(creds.get("script_url")):
                 with open(PRODUCT_SCRIPT_FILE, "r") as fh:
@@ -1702,11 +1749,12 @@ def main():
     log("[boot] noknok Pico W — starting")
     # DEV-18: say which filesystem mode boot.py chose, and sweep any .tmp left
     # by a write that a power cut interrupted (the real file is untouched).
-    log("[fs] CIRCUITPY drive %s — filesystem %s" % (
+    log("[fs] CIRCUITPY drive %s — filesystem %s — runtime store: %s" % (
         ("VISIBLE to PCs (maker mode: program writes will fail)"
          if nk.usb_drive_visible() else "hidden"),
         "writable in short windows only" if not nk.usb_drive_visible()
-        else "owned by the PC"))
+        else "owned by the PC",
+        nk.store().backend))
     nk.clean_tmp()
     if _is_fresh_start():
         _set_crash_count(0)                  # a power cycle always grants three fresh tries

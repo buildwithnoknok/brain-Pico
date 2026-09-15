@@ -25,12 +25,20 @@
 #             enumeration / state / roles, plus the NoknokDisplay driver, RGB565
 #             colour helpers and a BUILT-IN 8x16 font, so text at ANY pixel size
 #             works with no extra font files on the Pico.
-# v1.7 (Sue): DEV-18 — the filesystem is read-only to the program by default.
-#             Every write in this library goes through writable() (a short
-#             remount-rw window, synced and closed again) and write_atomic()
-#             (temp file + rename, so a power cut never leaves a half-written
-#             file under the real name). Pins come from settings.toml
-#             (NOKNOK_I2C_SDA/SCL/FREQ) so makers never edit this file.
+# v1.7 (Sue): DEV-18 — no filesystem writes while a product runs. Bench-proven
+#             15 Sep 2026: on RP2 flash ANY FAT write can destroy the whole
+#             directory on a power cut (3 pulls, 3 losses, one total). So:
+#             - the FS is read-only to the program by default (boot.py);
+#               setup/OTA-time writes go through writable() + write_atomic()
+#               into /data, whose directory block is not the one naming
+#               code.py / noknok.py / lib;
+#             - everything that changes at runtime lives in the Store —
+#               I2C FRAM at 0x50 when present (power-safe, DEV-40), else
+#               microcontroller.nvm (self-healing): module state, roles,
+#               settings (DEV-34), event history, a credentials copy;
+#             - enumeration gives a known module its previous address, so
+#               the state stops changing from boot to boot.
+#             Pins come from settings.toml (NOKNOK_I2C_SDA/SCL/FREQ).
 #
 # Quick start:
 #   from noknok import Conductor
@@ -101,11 +109,15 @@ def env_pin(key, default):
 #      A stray open(..., "w") anywhere raises OSError instead of silently
 #      writing flash — the OS enforces the policy, not code discipline.
 #   2. writable() opens a short window: remount rw, write, os.sync(), remount
-#      ro. Windows exist for provisioning, OTA, roles and factory reset — all
-#      in the first seconds after boot — and NEVER while product.py runs.
+#      ro. Windows exist for provisioning, OTA and factory reset — moments the
+#      app tells the customer to keep the plug in — and NEVER while product.py
+#      runs. A power cut inside a window CAN still destroy the filesystem
+#      (bench-proven: the flash driver rewrites whole 4 KB blocks in place);
+#      /data + DEV-38 (one-file recovery) are the mitigations, not a cure.
 #   3. write_atomic() writes <path>.tmp first and renames it over the target,
-#      so a power cut mid-write leaves the OLD file intact. Orphan .tmp files
-#      are cleaned by clean_tmp() on the next boot.
+#      so a power cut mid-write leaves the OLD file's bytes intact. Orphan .tmp
+#      files are cleaned by clean_tmp() on the next boot.
+#   4. Runtime data never touches the FAT: see Store below.
 #
 # Maker/bench mode (NOKNOK_USB_DRIVE = 1): the drive is visible and a PC may
 # write it. CircuitPython then refuses a runtime remount, so writable() is a
@@ -159,13 +171,29 @@ class writable:
                 _we_remounted = False
         return False           # never swallow the caller's exception
 
+def ensure_dir(path):
+    """Create the parent directory of `path` if missing (inside a window)."""
+    parent = path.rsplit("/", 1)[0] if "/" in path.strip("/") else ""
+    if not parent:
+        return
+    try:
+        os.stat(parent)
+    except OSError:
+        with writable():
+            os.mkdir(parent)
+
 def write_atomic(path, data):
-    """Write `data` (str or bytes) to `path` power-safely: bytes go to
-    <path>.tmp, are synced, then renamed over the target in one directory
-    update. The old file is never truncated in place. Raises OSError when the
-    filesystem is not writable (maker mode) — callers decide how loud to be."""
+    """Write `data` (str or bytes) to `path`: bytes go to <path>.tmp, are
+    synced, then renamed over the target. Protects the FILE's bytes (the old
+    content is never truncated in place) — it does NOT protect the directory
+    or the FAT: on RP2 flash any directory/FAT change rewrites a whole 4 KB
+    block in place, and a power cut during that can take every entry in the
+    block (bench-proven 15 Sep 2026, DEV-18). Hence the rule: call this only
+    at setup / OTA time, never while a product runs; runtime data goes to
+    Store (FRAM / nvm). Raises OSError when the filesystem is not writable."""
     tmp = path + ".tmp"
     binary = isinstance(data, (bytes, bytearray, memoryview))
+    ensure_dir(path)
     with writable():
         with open(tmp, "wb" if binary else "w") as f:
             f.write(data)
@@ -198,6 +226,7 @@ def append_line(path, line):
     FAT; keep them rare (audit events) and never call this from a product loop.
     Best-effort: returns False instead of raising."""
     try:
+        ensure_dir(path)
         with writable():
             with open(path, "a") as f:
                 f.write(line + "\n")
@@ -220,20 +249,282 @@ def remove(*paths):
         pass
     return removed
 
-def clean_tmp(root="/"):
+def clean_tmp(*roots):
     """Delete leftover *.tmp files from a write interrupted by a power cut.
     Called once at boot by code.py. Opens a window only if there is something
     to delete. Returns the number of files removed."""
-    try:
-        orphans = [root + n for n in os.listdir(root) if n.endswith(".tmp")]
-    except OSError:
-        return 0
+    orphans = []
+    for root in roots or ("/", DATA_DIR):
+        try:
+            orphans += [root.rstrip("/") + "/" + n for n in os.listdir(root) if n.endswith(".tmp")]
+        except OSError:
+            pass
     if not orphans:
         return 0
     n = remove(*orphans)
     if n:
         print(f"[fs] removed {n} orphan .tmp file(s) left by an interrupted write")
     return n
+
+# Field-written files live in their own directory. Their directory entries then
+# sit in /data's own cluster, not in the root-directory block that names
+# code.py / noknok.py / lib — so a power cut during a setup-time write can at
+# worst lose /data/* (recoverable: re-provision, or the Store copies), never
+# the brain itself. The FAT block is still shared; that residual risk is why
+# such writes happen only at setup / OTA, and why DEV-38 exists.
+DATA_DIR = "/data"
+
+
+# ── Store: runtime data that must NEVER touch the FAT (DEV-18) ────────────────
+# Everything that changes while a product runs — module state, settings (DEV-34),
+# the event history, plus recovery copies of the WiFi credentials and roles —
+# lives here, as one small JSON record with a CRC:
+#
+#   FRAM backend (I2C FM24CL64B at 0x50 on the PicoHub, DEV-40): two 4 KB slots,
+#     written alternately with a rising sequence number; a power cut mid-write
+#     leaves one slot with a bad CRC and the other intact. FRAM writes are
+#     byte-atomic and wear-free, so this is genuinely power-safe.
+#   nvm backend (fallback, any Pico): the record at microcontroller.nvm[64:]
+#     (nvm[0] and nvm[1:5] belong to code.py). nvm is one 4 KB flash sector
+#     rewritten in place, so a cut mid-write loses the whole record — which is
+#     ACCEPTABLE only because every key here is self-healing: state is
+#     re-enumerated, settings fall back to defaults, the history starts empty,
+#     and credentials/roles have their primaries on the filesystem.
+#
+# API: st = store(); st.get(key, default); st.set(key, value); st.append(key,
+# item, max_items); st.delete(key); st.wipe(). Each set() writes immediately.
+
+STORE_MAGIC      = b"NKS1"
+STORE_NVM_OFFSET = 64
+FRAM_ADDR        = 0x50
+FRAM_SLOT_BYTES  = 4096        # 2 slots = one FM24CL64B (8 KB); bigger chips use the same 2 slots
+
+_crc_table = None
+def _crc32(data):
+    """zlib-compatible CRC-32 (table-driven; ~1 KB of RAM on first use)."""
+    global _crc_table
+    if _crc_table is None:
+        t = []
+        for i in range(256):
+            c = i
+            for _ in range(8):
+                c = (c >> 1) ^ 0xEDB88320 if c & 1 else c >> 1
+            t.append(c)
+        _crc_table = t
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc = _crc_table[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFF
+
+class Store:
+    def __init__(self):
+        self._data, self._seq = None, 0
+        self._backend = None        # "fram" | "nvm"
+        self._bus = None            # a Conductor's busio.I2C when one exists
+        self._fram_slot = 0         # slot the current record lives in
+
+    # ── bus handling ─────────────────────────────────────────────────────────
+    def attach(self, i2c):
+        """Share a Conductor's bus (None to detach)."""
+        self._bus = i2c
+
+    def _with_bus(self, fn):
+        """Run fn(i2c) on the attached bus, or on a temporary one that is
+        deinit'ed afterwards so a later Conductor can claim the pins."""
+        if self._bus is not None:
+            try:
+                return fn(self._bus)
+            except (ValueError, RuntimeError):
+                self._bus = None    # bus was deinit'ed under us — use a temporary one
+        bus = busio.I2C(env_pin("NOKNOK_I2C_SCL", board.GP9), env_pin("NOKNOK_I2C_SDA", board.GP8),
+                        frequency=int(env("NOKNOK_I2C_FREQ", 100_000)))
+        try:
+            return fn(bus)
+        finally:
+            bus.deinit()
+
+    # ── FRAM primitives (FM24CL64B / MB85RC: 2-byte address, then data) ──────
+    @staticmethod
+    def _fram_write(i2c, addr, data):
+        while not i2c.try_lock():
+            pass
+        try:
+            for off in range(0, len(data), 30):
+                a = addr + off
+                i2c.writeto(FRAM_ADDR, bytes([a >> 8, a & 0xFF]) + bytes(data[off:off + 30]))
+        finally:
+            i2c.unlock()
+
+    @staticmethod
+    def _fram_read(i2c, addr, n):
+        out = bytearray(n)
+        while not i2c.try_lock():
+            pass
+        try:
+            for off in range(0, n, 32):
+                a = addr + off
+                chunk = memoryview(out)[off:min(off + 32, n)]
+                i2c.writeto_then_readfrom(FRAM_ADDR, bytes([a >> 8, a & 0xFF]), chunk)
+        finally:
+            i2c.unlock()
+        return out
+
+    @staticmethod
+    def _fram_present(i2c):
+        while not i2c.try_lock():
+            pass
+        try:
+            return FRAM_ADDR in i2c.scan()
+        finally:
+            i2c.unlock()
+
+    # ── record encoding ──────────────────────────────────────────────────────
+    @staticmethod
+    def _encode(seq, data):
+        body = json.dumps(data).encode()
+        hdr = STORE_MAGIC + seq.to_bytes(4, "little") + len(body).to_bytes(4, "little")
+        return hdr + _crc32(body).to_bytes(4, "little") + body
+
+    @staticmethod
+    def _decode(buf):
+        """(seq, dict) or None for anything that is not an intact record."""
+        try:
+            if bytes(buf[:4]) != STORE_MAGIC:
+                return None
+            seq = int.from_bytes(bytes(buf[4:8]), "little")
+            n   = int.from_bytes(bytes(buf[8:12]), "little")
+            crc = int.from_bytes(bytes(buf[12:16]), "little")
+            body = bytes(buf[16:16 + n])
+            if len(body) != n or _crc32(body) != crc:
+                return None
+            data = json.loads(body)
+            return (seq, data) if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    # ── load / flush ─────────────────────────────────────────────────────────
+    def _load(self):
+        if self._data is not None:
+            return
+        self._data, self._seq = {}, 0
+        # FRAM first (unless disabled in settings.toml: NOKNOK_FRAM = 0)
+        if str(env("NOKNOK_FRAM", "1")) != "0":
+            try:
+                def probe(i2c):
+                    if not self._fram_present(i2c):
+                        return None
+                    best = None
+                    for slot in (0, 1):
+                        hdr = self._fram_read(i2c, slot * FRAM_SLOT_BYTES, 16)
+                        n = int.from_bytes(bytes(hdr[8:12]), "little")
+                        if bytes(hdr[:4]) == STORE_MAGIC and 0 <= n <= FRAM_SLOT_BYTES - 16:
+                            rec = self._decode(hdr + self._fram_read(i2c, slot * FRAM_SLOT_BYTES + 16, n))
+                            if rec and (best is None or rec[0] > best[0]):
+                                best = (rec[0], rec[1], slot)
+                    return best or (0, {}, 1)      # empty FRAM: first write goes to slot 0
+                found = self._with_bus(probe)
+                if found is not None:
+                    self._backend = "fram"
+                    self._seq, self._data, self._fram_slot = found
+                    return
+            except Exception as e:
+                print("[store] FRAM probe failed (%r) — using nvm" % (e,))
+        self._backend = "nvm"
+        try:
+            import microcontroller
+            rec = self._decode(microcontroller.nvm[STORE_NVM_OFFSET:])
+            if rec:
+                self._seq, self._data = rec
+        except Exception:
+            pass
+
+    def _flush(self):
+        self._seq += 1
+        blob = self._encode(self._seq, self._data)
+        if self._backend == "fram":
+            slot = 1 - self._fram_slot
+            if len(blob) > FRAM_SLOT_BYTES:
+                raise ValueError("store record too large for FRAM slot")
+            def w(i2c):
+                self._fram_write(i2c, slot * FRAM_SLOT_BYTES, blob)
+                back = self._fram_read(i2c, slot * FRAM_SLOT_BYTES, len(blob))
+                if bytes(back) != blob:
+                    raise OSError("FRAM verify failed")
+            self._with_bus(w)
+            self._fram_slot = slot
+        else:
+            import microcontroller
+            cap = len(microcontroller.nvm) - STORE_NVM_OFFSET
+            if len(blob) > cap:
+                raise ValueError("store record too large for nvm")
+            microcontroller.nvm[STORE_NVM_OFFSET:STORE_NVM_OFFSET + len(blob)] = blob
+
+    def _fit(self):
+        """Trim the event ring until the record fits the backend."""
+        cap = FRAM_SLOT_BYTES if self._backend == "fram" else 4096 - STORE_NVM_OFFSET
+        while len(self._encode(self._seq, self._data)) > cap:
+            ev = self._data.get("events")
+            if ev:
+                del ev[0]
+            else:
+                raise ValueError("store record too large")
+
+    # ── public API ───────────────────────────────────────────────────────────
+    @property
+    def backend(self):
+        self._load()
+        return self._backend
+
+    def get(self, key, default=None):
+        self._load()
+        return self._data.get(key, default)
+
+    def set(self, key, value):
+        """Write immediately. Returns True on success; never raises."""
+        self._load()
+        if self._data.get(key) == value and key in self._data:
+            return True
+        self._data[key] = value
+        try:
+            self._fit()
+            self._flush()
+            return True
+        except Exception as e:
+            print("[store] write failed: %r" % (e,))
+            return False
+
+    def append(self, key, item, max_items=40):
+        self._load()
+        lst = list(self._data.get(key) or [])
+        lst.append(item)
+        return self.set(key, lst[-max_items:])
+
+    def delete(self, key):
+        self._load()
+        if key in self._data:
+            del self._data[key]
+            try:
+                self._flush(); return True
+            except Exception as e:
+                print("[store] write failed: %r" % (e,)); return False
+        return True
+
+    def wipe(self):
+        """Factory reset: empty record."""
+        self._load()
+        self._data = {}
+        try:
+            self._flush(); return True
+        except Exception:
+            return False
+
+_store = None
+def store():
+    """The brain's one Store instance (lazy)."""
+    global _store
+    if _store is None:
+        _store = Store()
+    return _store
 
 def usb_drive_visible():
     """True when settings.toml asks boot.py to show the CIRCUITPY drive
@@ -337,6 +628,7 @@ class Conductor:
                          else env("NOKNOK_I2C_FREQ", 100_000))
         self.i2c = None
         self._init_i2c()   # tolerant: warns + leaves i2c=None if no pull-ups / no bus
+        store().attach(self.i2c)   # the Store (FRAM at 0x50 / nvm) shares this bus
         self.buzzer    = []    # NoknokBuzzer instances, indexed by discovery order
         self.knob      = []    # NoknokKnob instances
         self.ledbutton = []    # NoknokLedButton instances
@@ -693,15 +985,11 @@ class Conductor:
             return {"uid": None, "type": None, "reason": reason,
                     "action": "none", "detail": "no UID"}
 
-        try:
-            with open(state_file, "r") as fh:
-                saved = json.load(fh)
-        except (OSError, ValueError):
-            saved = {}
+        saved = self._state_map()
         info = saved.get(uid)
         mf_key = self._TYPE_TO_MF_KEY.get(info.get("type", 0)) if info else None
         if not mf_key:
-            logfn("  UID %s is not in %s - cannot tell what app to push" % (uid, state_file))
+            logfn("  UID %s is not in the module state - cannot tell what app to push" % uid)
             return {"uid": uid, "type": None, "reason": reason,
                     "action": "none", "detail": "unknown UID"}
 
@@ -796,11 +1084,25 @@ class Conductor:
         if restored > 0:
             print(f"  {restored} module(s) already assigned.")
 
-        # Determine next free address (skip ones already in use)
-        used = {m.address for m in self._registry.values() if m is not None}
-        next_addr = 0x08
-        while next_addr in used:
-            next_addr += 1
+        # Stable addresses (DEV-18): a module we have seen before gets the SAME
+        # address it had last time, so the saved state does not change from
+        # boot to boot — modules come up at 0x7F after every power cycle and
+        # used to be numbered in whatever order they answered, which rewrote
+        # the state on most boots. Addresses of known-but-absent modules stay
+        # reserved so a newcomer cannot take them.
+        known    = self._state_map()
+        used     = {m.address for m in self._registry.values() if m is not None}
+        reserved = {info.get("address") for info in known.values()
+                    if isinstance(info, dict) and info.get("address")}
+
+        def pick_address(uid_hex):
+            a = known.get(uid_hex, {}).get("address") if isinstance(known.get(uid_hex), dict) else None
+            if not a or a in used:
+                a = 0x08
+                while a in used or a in reserved or 0x50 <= a <= 0x57:   # 0x50-57 = brain FRAM
+                    a += 1
+            used.add(a)
+            return a
 
         # ── Step 2: Scan 0x7F for new (unassigned) modules ───────────────────
         # Always wait the full 3000 ms so a new module with a long backoff
@@ -829,8 +1131,7 @@ class Conductor:
 
             uid_hex     = bytes(buf[:8]).hex()
             module_type = buf[8]
-            addr        = next_addr
-            next_addr  += 1
+            addr        = pick_address(uid_hex)
 
             # Assign address
             self._write(self.ENUM_ADDR, [self.ASSIGN_REG, addr])
@@ -933,10 +1234,22 @@ class Conductor:
 
     # ── State persistence ─────────────────────────────────────────────────────
 
-    def _save_state(self, filename="noknok_state.json"):
-        """Save current module assignments to JSON so next run can restore them.
+    def _state_map(self):
+        """UID -> {address, type, bl} as last saved. Lives in the Store (FRAM /
+        nvm) since DEV-18; a legacy noknok_state.json is imported once, read-
+        only, when the Store has no state yet."""
+        data = store().get("state")
+        if isinstance(data, dict):
+            return json.loads(json.dumps(data))   # a copy: callers mutate entries
+        legacy = read_json("noknok_state.json")
+        return legacy if isinstance(legacy, dict) else {}
 
-        MERGES into the existing file rather than replacing it. A module that
+    def _save_state(self, filename=None):
+        """Save current module assignments (to the Store — never to the FAT)
+        so next run can restore them. `filename` is accepted for backwards
+        compatibility and ignored.
+
+        MERGES into the existing map rather than replacing it. A module that
         did not answer this time — parked in its bootloader after an interrupted
         update, refused by stage-1 as unhealthy (DEV-31), or simply unplugged —
         must NOT be forgotten: its UID -> type entry is the only way
@@ -952,15 +1265,8 @@ class Conductor:
         LED Button. Two UIDs, one address. So: a stale entry whose address a
         live module now owns gets address None (type kept, that is all rescue
         needs), and _restore_state() skips None."""
-        try:
-            with open(filename, "r") as f:
-                raw = f.read()
-            data = json.loads(raw)
-            if not isinstance(data, dict):
-                data, raw = {}, None
-        except (OSError, ValueError):
-            data, raw = {}, None
-        before = json.dumps(data) if raw is not None else None
+        data = dict(self._state_map())
+        before = json.dumps(data)
         live_addrs = set()
         for uid_hex, module in self._registry.items():
             if module is not None:
@@ -987,23 +1293,21 @@ class Conductor:
                 continue
             if info.get("address") in live_addrs:
                 info["address"] = None
-        # This runs on every enumeration, i.e. every boot. Writing an unchanged
-        # file is a pointless flash write on an unjournaled FAT filesystem
-        # (DEV-18): compare first, write only on a real change — and then
-        # atomically, inside a write window (the FS is read-only otherwise).
-        if before is not None and json.dumps(data) == before:
+        # This runs on every enumeration, i.e. every boot. With stable addresses
+        # the map only changes when hardware changes; compare first and write
+        # only then — to the Store (FRAM: power-safe; nvm: self-healing), never
+        # to the FAT (DEV-18).
+        if json.dumps(data) == before:
             return
-        write_json_atomic(filename, data)   # False in maker mode — state is only a cache
+        store().set("state", data)
 
-    def _restore_state(self, filename="noknok_state.json"):
+    def _restore_state(self, filename=None):
         """
         Load saved state and ping each module at its known address.
         Returns the number of modules successfully restored.
         """
-        try:
-            with open(filename, "r") as f:
-                data = json.load(f)
-        except OSError:
+        data = self._state_map()
+        if not data:
             return 0
 
         restored = 0
@@ -1059,20 +1363,39 @@ class Conductor:
 
     # ── Role management ───────────────────────────────────────────────────────
 
-    def load_roles(self, filename="noknok_roles.json"):
+    # Roles live in two places since DEV-18: the Store (FRAM: power-safe; nvm:
+    # may be lost on a cut mid-write) and a copy in /data/noknok_roles.json
+    # written at setup time (the app's role step — a moment the customer is
+    # holding the phone). Whichever survives wins; both are written together.
+    ROLES_FILE = DATA_DIR + "/noknok_roles.json"
+
+    def _roles_map(self):
+        data = store().get("roles")
+        if isinstance(data, dict) and data:
+            return dict(data)
+        for path in (self.ROLES_FILE, "noknok_roles.json"):     # copy, then legacy root file
+            data = read_json(path)
+            if isinstance(data, dict):
+                return data
+        return {}
+
+    def _write_roles(self, data):
+        ok_store = store().set("roles", data)
+        ok_file  = write_json_atomic(self.ROLES_FILE, data)
+        return ok_store or ok_file
+
+    def load_roles(self, filename=None):
         """
-        Load role assignments from a JSON file on the Pico's CIRCUITPY drive.
+        Load role assignments (Store, or the /data copy). `filename` is kept
+        for backwards compatibility and ignored.
         Returns True if all roles were found, False if any are missing.
         """
-        try:
-            with open(filename, "r") as f:
-                mapping = json.load(f)
-        except OSError:
-            print(f"  No roles file found at '{filename}'")
-            print(f"  Run c.setup_roles() to create one.")
+        mapping = self._roles_map()
+        if not mapping:
+            print("  No roles saved yet. Run c.setup_roles() (or assign roles in the app).")
             return False
 
-        print(f"Loading roles from '{filename}'...")
+        print("Loading roles...")
         self.role = {}
         missing   = []
 
@@ -1095,9 +1418,9 @@ class Conductor:
 
         return len(missing) == 0
 
-    def save_roles(self, mapping, filename="noknok_roles.json"):
+    def save_roles(self, mapping, filename=None):
         """
-        Save a role mapping dict to a JSON file.
+        Save a role mapping dict (Store + /data copy).
         mapping = { "role_name": module_object, ... }
         """
         data = {}
@@ -1107,12 +1430,12 @@ class Conductor:
             else:
                 print(f"  ⚠ Skipping '{role_name}' — no UID available")
 
-        if not write_json_atomic(filename, data):
-            print(f"  ⚠ Could not write '{filename}' — filesystem read-only "
-                  f"(drive visible to a PC? see settings.toml NOKNOK_USB_DRIVE)")
+        if not self._write_roles(data):
+            print("  ⚠ Could not save roles — Store write failed and filesystem "
+                  "read-only (drive visible to a PC? see settings.toml NOKNOK_USB_DRIVE)")
             return
 
-        print(f"Saved {len(data)} role(s) to '{filename}'")
+        print(f"Saved {len(data)} role(s)")
 
     def setup_roles(self, filename="noknok_roles.json"):
         """
@@ -1179,11 +1502,11 @@ class Conductor:
                 print(f"  → skipped\n")
 
         if assignment:
-            if not write_json_atomic(filename, assignment):
-                print(f"⚠ Could not write '{filename}' — filesystem read-only "
-                      f"(drive visible to a PC? see settings.toml NOKNOK_USB_DRIVE)")
+            if not self._write_roles(assignment):
+                print("⚠ Could not save roles — Store write failed and filesystem read-only "
+                      "(drive visible to a PC? see settings.toml NOKNOK_USB_DRIVE)")
                 return None
-            print(f"Saved {len(assignment)} role(s) to '{filename}'")
+            print(f"Saved {len(assignment)} role(s)")
             print(f"\nIn your app code:")
             print(f"  c.enumerate()")
             print(f"  c.load_roles()")
@@ -1402,44 +1725,32 @@ class Conductor:
 
         return None
 
-    def append_role(self, role_id, uid_hex, filename="noknok_roles.json"):
+    def append_role(self, role_id, uid_hex, filename=None):
         """
-        Add or update a single role->UID entry in noknok_roles.json and write it
-        back. Compatible with load_roles() ({role_name: uid_hex} format).
-
-        Reads the existing file if present, sets data[role_id] = normalised uid
-        (lowercase, '-' and spaces stripped), and writes the whole dict back.
-        Creates the file if absent. All file IO is wrapped so a read-only
-        filesystem or malformed file can't crash the caller. Returns True on a
-        successful write, False otherwise.
+        Add or update a single role->UID entry and persist the whole map
+        (Store + /data copy). Compatible with load_roles() ({role: uid}).
+        Never raises; returns True if at least one home took the write.
         """
         uid = str(uid_hex).lower().replace("-", "").replace(" ", "")
-
-        data = {}
-        try:
-            with open(filename, "r") as f:
-                loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    data = loaded
-        except (OSError, ValueError):
-            data = {}   # file absent or malformed — start fresh
-
+        data = self._roles_map()
         data[role_id] = uid
-        return write_json_atomic(filename, data)   # False = filesystem read-only
+        return self._write_roles(data)
 
     # ── Factory reset ─────────────────────────────────────────────────────────
     # Added v1.1 (Sam): hold the knob button for 5 s to wipe all credentials /
     # state and reboot into the noknok-setup provisioning AP. Call once per
     # product main-loop iteration: ks = knb.read(); c.check_factory_reset(ks)
 
-    # Files removed on reset. We wipe the credentials (wifi.json), the product
-    # script (product.py) and the product-level role map (noknok_roles.json).
-    # We deliberately KEEP noknok_state.json — it's the I2C address map. A reset
-    # reboots the Pico but does NOT power-cycle the modules, so they keep their
-    # assigned addresses; the map lets the next product find them again. The
-    # restore logic self-heals if the hardware changed (pings + skips missing,
-    # discovers new at 0x7F), so keeping it is safe.
-    _RESET_FILES = ("wifi.json", "product.py", "noknok_roles.json")
+    # Removed on reset: the credentials (wifi.json), the product script
+    # (product.py) and the product-level role map — in /data (DEV-18) and, for
+    # brains provisioned before /data existed, in the root. The Store loses its
+    # credentials copy, roles and product settings; it deliberately KEEPS the
+    # module state (UID -> address/type): a reset reboots the Pico but does NOT
+    # power-cycle the modules, so they keep their addresses, and rescue needs
+    # the UID -> type map. The restore logic self-heals if hardware changed.
+    _RESET_FILES = (DATA_DIR + "/wifi.json", DATA_DIR + "/product.py", ROLES_FILE,
+                    "wifi.json", "product.py", "noknok_roles.json")
+    _RESET_KEYS  = ("wifi", "roles", "settings")
 
     def check_factory_reset(self, knob_status, hold_seconds=5.0):
         """
@@ -1515,6 +1826,9 @@ class Conductor:
     def _do_factory_reset(self):
         """Wipe credentials/state and reboot into the provisioning AP."""
         print("[reset] Factory reset triggered — wiping credentials and state.")
+        st = store()
+        for key in self._RESET_KEYS:          # Store first: power-safe on FRAM
+            st.delete(key)
         # One write window for all of them (DEV-18); absent files are ignored.
         n = remove(*self._RESET_FILES)
         print(f"[reset] removed {n} file(s)")
