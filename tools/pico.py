@@ -76,7 +76,14 @@ class Pico:
         wait for '>>> ', THEN Ctrl-A and wait for the raw-REPL banner."""
         self.ser.reset_input_buffer()
         self.ser.write(CTRL_B + CTRL_C + CTRL_C)
-        self._read_until(b'>>> ', timeout=8.0)
+        try:
+            self._read_until(b'>>> ', timeout=3.0)
+        except TimeoutError:
+            # code.py had already finished ("Code done running ... Press any
+            # key to enter the REPL") — typical right after a reset. Ctrl-C is
+            # not "a key" there; a carriage return is. Then the prompt appears.
+            self.ser.write(b'\r')
+            self._read_until(b'>>> ', timeout=8.0)
         self.ser.write(CTRL_A)
         self._read_until(b'raw REPL; CTRL-B to exit\r\n>', timeout=5.0)
 
