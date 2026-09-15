@@ -1,4 +1,4 @@
-# noknok.py  v1.6
+# noknok.py  v1.7
 # CircuitPython library for the noknok modular ecosystem
 # Raspberry Pi Pico — I2C master ("Conductor")
 #
@@ -25,6 +25,12 @@
 #             enumeration / state / roles, plus the NoknokDisplay driver, RGB565
 #             colour helpers and a BUILT-IN 8x16 font, so text at ANY pixel size
 #             works with no extra font files on the Pico.
+# v1.7 (Sue): DEV-18 — the filesystem is read-only to the program by default.
+#             Every write in this library goes through writable() (a short
+#             remount-rw window, synced and closed again) and write_atomic()
+#             (temp file + rename, so a power cut never leaves a half-written
+#             file under the real name). Pins come from settings.toml
+#             (NOKNOK_I2C_SDA/SCL/FREQ) so makers never edit this file.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -40,6 +46,241 @@ import busio
 import board
 import time
 import json
+import os
+
+try:
+    import storage            # CircuitPython only; absent on a host Python
+except ImportError:
+    storage = None
+
+
+# ── settings.toml — the one maker-facing config file ──────────────────────────
+# CircuitPython reads /settings.toml natively; os.getenv("KEY") returns the
+# value (str, or int for a bare number) or None when the key is absent. Every
+# key has a default here that equals the noknok ecosystem standard, so a brain
+# without the file behaves exactly like a factory unit. Makers wiring their own
+# Pico change the file, never this library. Keys read here:
+#   NOKNOK_I2C_SDA  = "GP8"      NOKNOK_I2C_SCL = "GP9"     NOKNOK_I2C_FREQ = 100000
+#   NOKNOK_USB_DP   = "GP16"     NOKNOK_USB_DM  = "GP17"    (read by noknok_usb.py)
+#   NOKNOK_USB_DRIVE = 0         (read by boot.py, see set_usb_drive() below)
+
+SETTINGS_FILE = "/settings.toml"
+
+def env(key, default=None):
+    """settings.toml value for `key`, or `default` when absent / unreadable."""
+    try:
+        v = os.getenv(key)
+    except Exception:
+        v = None
+    return default if v is None else v
+
+def env_pin(key, default):
+    """A board pin named in settings.toml (e.g. "GP8"), or `default`. An unknown
+    pin name is reported once and the default used, so a typo never kills the
+    bus at boot."""
+    name = env(key)
+    if not name:
+        return default
+    try:
+        return getattr(board, str(name).strip())
+    except AttributeError:
+        print(f"[settings] {key}={name!r} is not a pin on this board — using default")
+        return default
+
+
+# ── Filesystem policy (DEV-18) ────────────────────────────────────────────────
+# The CIRCUITPY drive is a FAT filesystem on raw flash with no journal. A power
+# cut in the middle of ANY write can corrupt it — and unplugging is how a noknok
+# product is switched off. Software cannot make a FAT write survive a power
+# cut; it can only make sure no write is in flight when the plug is pulled and
+# that the rare writes cannot destroy what is already there. Hence:
+#
+#   1. The filesystem is READ-ONLY to the program by default. boot.py hides the
+#      CIRCUITPY drive from PCs (NOKNOK_USB_DRIVE = 0) and remounts read-only
+#      (with the drive hidden CircuitPython would otherwise leave it writable).
+#      A stray open(..., "w") anywhere raises OSError instead of silently
+#      writing flash — the OS enforces the policy, not code discipline.
+#   2. writable() opens a short window: remount rw, write, os.sync(), remount
+#      ro. Windows exist for provisioning, OTA, roles and factory reset — all
+#      in the first seconds after boot — and NEVER while product.py runs.
+#   3. write_atomic() writes <path>.tmp first and renames it over the target,
+#      so a power cut mid-write leaves the OLD file intact. Orphan .tmp files
+#      are cleaned by clean_tmp() on the next boot.
+#
+# Maker/bench mode (NOKNOK_USB_DRIVE = 1): the drive is visible and a PC may
+# write it. CircuitPython then refuses a runtime remount, so writable() is a
+# no-op and program writes raise OSError — provisioning fails loudly rather
+# than the brain and the PC both writing one FAT volume. Bench file transfers
+# go over the REPL (pico.py put), which is unaffected by any of this.
+
+_write_depth = 0          # nesting counter: one remount per outermost window
+_we_remounted = False     # True only if THIS window flipped the FS to rw
+
+def _fs_readonly():
+    """Current state of '/', or None if unknown (host Python)."""
+    try:
+        return storage.getmount("/").readonly
+    except Exception:
+        return None
+
+class writable:
+    """`with writable():` — the filesystem is writable inside the block.
+    Nests safely; the outermost exit syncs and returns to read-only — but only
+    if it was this window that made the FS writable. A filesystem that was
+    already writable (an old rw-remounting boot.py, a maker's own boot.py) is
+    left exactly as found."""
+
+    def __enter__(self):
+        global _write_depth, _we_remounted
+        if _write_depth == 0 and storage is not None:
+            _we_remounted = False
+            if _fs_readonly():
+                try:
+                    storage.remount("/", readonly=False)
+                    _we_remounted = True
+                except (RuntimeError, OSError):
+                    pass   # refused (drive in use by a PC) — the write will raise
+        _write_depth += 1
+        return self
+
+    def __exit__(self, *exc):
+        global _write_depth, _we_remounted
+        _write_depth -= 1
+        if _write_depth == 0 and storage is not None:
+            try:
+                os.sync()
+            except Exception:
+                pass
+            if _we_remounted:
+                try:
+                    storage.remount("/", readonly=True)
+                except (RuntimeError, OSError):
+                    pass
+                _we_remounted = False
+        return False           # never swallow the caller's exception
+
+def write_atomic(path, data):
+    """Write `data` (str or bytes) to `path` power-safely: bytes go to
+    <path>.tmp, are synced, then renamed over the target in one directory
+    update. The old file is never truncated in place. Raises OSError when the
+    filesystem is not writable (maker mode) — callers decide how loud to be."""
+    tmp = path + ".tmp"
+    binary = isinstance(data, (bytes, bytearray, memoryview))
+    with writable():
+        with open(tmp, "wb" if binary else "w") as f:
+            f.write(data)
+            f.flush()
+        try:
+            os.sync()
+        except Exception:
+            pass
+        os.rename(tmp, path)   # replaces an existing target (MicroPython semantics)
+
+def write_json_atomic(path, obj):
+    """json.dumps(obj) → write_atomic(). Returns True on success, False when the
+    filesystem is read-only; never raises."""
+    try:
+        write_atomic(path, json.dumps(obj))
+        return True
+    except OSError:
+        return False
+
+def read_json(path, default=None):
+    """json.load(path), or `default` when the file is absent or malformed."""
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+def append_line(path, line):
+    """Append one line inside a write window. Appends cannot be made atomic on
+    FAT; keep them rare (audit events) and never call this from a product loop.
+    Best-effort: returns False instead of raising."""
+    try:
+        with writable():
+            with open(path, "a") as f:
+                f.write(line + "\n")
+        return True
+    except OSError:
+        return False
+
+def remove(*paths):
+    """Delete files inside one write window. Missing files are ignored."""
+    removed = 0
+    try:
+        with writable():
+            for p in paths:
+                try:
+                    os.remove(p)
+                    removed += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return removed
+
+def clean_tmp(root="/"):
+    """Delete leftover *.tmp files from a write interrupted by a power cut.
+    Called once at boot by code.py. Opens a window only if there is something
+    to delete. Returns the number of files removed."""
+    try:
+        orphans = [root + n for n in os.listdir(root) if n.endswith(".tmp")]
+    except OSError:
+        return 0
+    if not orphans:
+        return 0
+    n = remove(*orphans)
+    if n:
+        print(f"[fs] removed {n} orphan .tmp file(s) left by an interrupted write")
+    return n
+
+def usb_drive_visible():
+    """True when settings.toml asks boot.py to show the CIRCUITPY drive
+    (NOKNOK_USB_DRIVE = 1). Absent key = visible (fail open, see boot.py)."""
+    v = env("NOKNOK_USB_DRIVE")
+    if v is None:
+        return True
+    try:
+        return int(v) != 0
+    except (TypeError, ValueError):
+        return True
+
+def set_usb_drive(visible):
+    """Rewrite NOKNOK_USB_DRIVE in settings.toml. Takes effect on the next
+    power cycle (boot.py reads it). From the REPL on a shipped brain:
+        >>> import noknok; noknok.set_usb_drive(True)
+    then unplug/replug — the drive appears and a PC can edit files. To hide it
+    again, edit settings.toml on the PC (the program cannot write while the
+    drive is visible) and power-cycle. Returns True when the file was written."""
+    key, val = "NOKNOK_USB_DRIVE", "1" if visible else "0"
+    try:
+        with open(SETTINGS_FILE, "r") as f:
+            lines = f.read().split("\n")
+    except OSError:
+        lines = []
+    out, done = [], False
+    for ln in lines:
+        if ln.split("=")[0].strip() == key:
+            out.append(f"{key} = {val}")
+            done = True
+        else:
+            out.append(ln)
+    if not done:
+        if out and out[-1] != "":
+            out.append("")
+        out.append(f"{key} = {val}")
+    text = "\n".join(out)
+    if not text.endswith("\n"):
+        text += "\n"
+    try:
+        write_atomic(SETTINGS_FILE, text)
+        print(f"[settings] {key} = {val} — power-cycle the brain to apply")
+        return True
+    except OSError:
+        print("[settings] cannot write settings.toml (drive visible to a PC?) "
+              "— edit it on the PC instead")
+        return False
 
 
 # ── CRC8 (polynomial 0x07) — matches firmware ────────────────────────────────
@@ -86,8 +327,14 @@ class Conductor:
     CMD_GET_VERSION  = 0xB1   # write 0xB1, read 4 bytes [PROTO, FW_MAJOR, MINOR, PATCH]
     PROTOCOL_VERSION = 0x01   # the standard-command protocol version this lib understands
 
-    def __init__(self, sda=board.GP8, scl=board.GP9, frequency=100_000):
-        self._sda, self._scl, self._freq = sda, scl, frequency
+    def __init__(self, sda=None, scl=None, frequency=None):
+        # Pins: explicit argument > settings.toml > ecosystem standard (GP8/GP9,
+        # 100 kHz). noknok hardware follows the standard; the file is for makers
+        # wiring their own Pico.
+        self._sda  = sda if sda is not None else env_pin("NOKNOK_I2C_SDA", board.GP8)
+        self._scl  = scl if scl is not None else env_pin("NOKNOK_I2C_SCL", board.GP9)
+        self._freq = int(frequency if frequency is not None
+                         else env("NOKNOK_I2C_FREQ", 100_000))
         self.i2c = None
         self._init_i2c()   # tolerant: warns + leaves i2c=None if no pull-ups / no bus
         self.buzzer    = []    # NoknokBuzzer instances, indexed by discovery order
@@ -742,14 +989,11 @@ class Conductor:
                 info["address"] = None
         # This runs on every enumeration, i.e. every boot. Writing an unchanged
         # file is a pointless flash write on an unjournaled FAT filesystem
-        # (DEV-18): compare first, write only on a real change.
+        # (DEV-18): compare first, write only on a real change — and then
+        # atomically, inside a write window (the FS is read-only otherwise).
         if before is not None and json.dumps(data) == before:
             return
-        try:
-            with open(filename, "w") as f:
-                json.dump(data, f)
-        except OSError:
-            pass   # read-only filesystem — silently skip
+        write_json_atomic(filename, data)   # False in maker mode — state is only a cache
 
     def _restore_state(self, filename="noknok_state.json"):
         """
@@ -863,8 +1107,10 @@ class Conductor:
             else:
                 print(f"  ⚠ Skipping '{role_name}' — no UID available")
 
-        with open(filename, "w") as f:
-            json.dump(data, f)
+        if not write_json_atomic(filename, data):
+            print(f"  ⚠ Could not write '{filename}' — filesystem read-only "
+                  f"(drive visible to a PC? see settings.toml NOKNOK_USB_DRIVE)")
+            return
 
         print(f"Saved {len(data)} role(s) to '{filename}'")
 
@@ -933,8 +1179,10 @@ class Conductor:
                 print(f"  → skipped\n")
 
         if assignment:
-            with open(filename, "w") as f:
-                json.dump(assignment, f)
+            if not write_json_atomic(filename, assignment):
+                print(f"⚠ Could not write '{filename}' — filesystem read-only "
+                      f"(drive visible to a PC? see settings.toml NOKNOK_USB_DRIVE)")
+                return None
             print(f"Saved {len(assignment)} role(s) to '{filename}'")
             print(f"\nIn your app code:")
             print(f"  c.enumerate()")
@@ -1177,13 +1425,7 @@ class Conductor:
             data = {}   # file absent or malformed — start fresh
 
         data[role_id] = uid
-
-        try:
-            with open(filename, "w") as f:
-                json.dump(data, f)
-            return True
-        except OSError:
-            return False   # read-only filesystem — silently fail
+        return write_json_atomic(filename, data)   # False = filesystem read-only
 
     # ── Factory reset ─────────────────────────────────────────────────────────
     # Added v1.1 (Sam): hold the knob button for 5 s to wipe all credentials /
@@ -1272,14 +1514,10 @@ class Conductor:
 
     def _do_factory_reset(self):
         """Wipe credentials/state and reboot into the provisioning AP."""
-        import os
         print("[reset] Factory reset triggered — wiping credentials and state.")
-        for fname in self._RESET_FILES:
-            try:
-                os.remove(fname)
-                print(f"[reset] removed {fname}")
-            except OSError:
-                pass   # already absent / read-only — ignore
+        # One write window for all of them (DEV-18); absent files are ignored.
+        n = remove(*self._RESET_FILES)
+        print(f"[reset] removed {n} file(s)")
         # Let the confirmation beep/flash finish before the board drops out.
         time.sleep(0.8)
         print("[reset] rebooting...")

@@ -1,5 +1,25 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.15 (stage-1 bootloader updates over the air — DEV-31 closed end to end)
+# Version: 0.16 (filesystem read-only by default, atomic writes — DEV-18)
+#
+# v0.16 changes (Sue): DEV-18 — a power cut can no longer corrupt the brain.
+#   The CIRCUITPY drive is FAT on raw flash with no journal; a power cut mid-
+#   write corrupts it, and unplugging is how a product is switched off. Until
+#   now boot.py left the filesystem permanently writable to the program and
+#   every save was truncate-then-rewrite. Now:
+#   - boot.py hides the drive from PCs (settings.toml NOKNOK_USB_DRIVE = 0)
+#     and remounts the filesystem READ-ONLY to the program. Any stray write
+#     raises OSError — the OS enforces the policy. Fail open: a brain whose
+#     code.py / noknok.py / settings.toml are missing shows the drive again.
+#   - Every write goes through noknok.writable() (short remount-rw window,
+#     synced and closed) and noknok.write_atomic() (temp file + rename, the
+#     old file survives a power cut mid-write): wifi.json, product.py, the
+#     firmware cache, roles, state. Orphan .tmp files are cleaned at boot.
+#   - product.py is compiled BEFORE it replaces the running copy, so a
+#     truncated download can never take a working product down.
+#   - Windows exist only during provisioning, OTA, roles and factory reset —
+#     the first seconds after boot — never while product.py runs.
+#   - Pins and drive visibility come from settings.toml (makers' file):
+#     NOKNOK_I2C_SDA/SCL/FREQ, NOKNOK_USB_DP/DM, NOKNOK_USB_DRIVE.
 #
 # v0.15 changes (Sue): the field-update path for the BOOTLOADER itself.
 #   Until now Conductor.stage1_update() existed and was bench-proven, but
@@ -193,6 +213,7 @@ import ssl
 import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
+import noknok as nk          # filesystem policy helpers (DEV-18) + settings.toml
 
 LOG_FILE    = "log.txt"
 EVENTS_FILE = "noknok_events.txt"   # durable, categorized audit log (FW/CFG/ROLE/RESET)
@@ -255,20 +276,17 @@ def log(msg):
     if len(_log_ring) > LOG_RING_LINES:
         del _log_ring[0]
     if _flash_logging_enabled():
-        try:
-            with open(LOG_FILE, "a") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
+        nk.append_line(LOG_FILE, line)         # bench only; best-effort
 
 def flush_log_ring(reason):
     """One-shot: write the RAM ring to log.txt. Used on a crash so the lines
     leading up to it survive the reload — one write, not one per line."""
     try:
-        with open(LOG_FILE, "a") as f:
-            f.write("\n" + _timestamp() + "===== RING FLUSH (%s) =====\n" % reason)
-            for line in _log_ring:
-                f.write(line + "\n")
+        with nk.writable():
+            with open(LOG_FILE, "a") as f:
+                f.write("\n" + _timestamp() + "===== RING FLUSH (%s) =====\n" % reason)
+                for line in _log_ring:
+                    f.write(line + "\n")
     except Exception:
         pass
 
@@ -280,11 +298,7 @@ def event(msg):
     history is easy to find. Best-effort; never raises."""
     line = _timestamp() + str(msg)
     sys.stdout.write(line + "\n")
-    try:
-        with open(EVENTS_FILE, "a") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+    nk.append_line(EVENTS_FILE, line)          # short write window; best-effort
 
 def sync_time_ntp(pool):
     """One-time NTP sync to set the RTC so logs get wall-clock timestamps.
@@ -315,14 +329,15 @@ def log_new_boot():
     if not _flash_logging_enabled():
         return
     try:
-        try:
-            if os.stat(LOG_FILE)[6] > LOG_MAX_BYTES:   # index 6 = file size
-                with open(LOG_FILE, "w") as f:
-                    f.write("(log trimmed — exceeded size cap)\n")
-        except OSError:
-            pass  # file doesn't exist yet
-        with open(LOG_FILE, "a") as f:
-            f.write("\n" + _timestamp() + "===== BOOT =====\n")
+        with nk.writable():
+            try:
+                if os.stat(LOG_FILE)[6] > LOG_MAX_BYTES:   # index 6 = file size
+                    with open(LOG_FILE, "w") as f:
+                        f.write("(log trimmed — exceeded size cap)\n")
+            except OSError:
+                pass  # file doesn't exist yet
+            with open(LOG_FILE, "a") as f:
+                f.write("\n" + _timestamp() + "===== BOOT =====\n")
     except Exception:
         pass
 
@@ -453,19 +468,20 @@ def load_wifi_credentials():
         return None
 
 def save_wifi_credentials(ssid, password, script_url=None, module_firmware=None):
-    with open(WIFI_CREDENTIALS_FILE, "w") as f:
-        json.dump(
-            {"ssid": ssid, "password": password, "script_url": script_url,
-             "module_firmware": module_firmware}, f
-        )
-    log("[storage] Saved wifi.json")
+    """Atomic write (DEV-18). Returns False when the filesystem is read-only —
+    i.e. the CIRCUITPY drive is visible to a PC (settings.toml
+    NOKNOK_USB_DRIVE = 1); the caller must not pretend provisioning worked."""
+    ok = nk.write_json_atomic(WIFI_CREDENTIALS_FILE,
+        {"ssid": ssid, "password": password, "script_url": script_url,
+         "module_firmware": module_firmware})
+    log("[storage] Saved wifi.json" if ok else
+        "[storage] CANNOT save wifi.json — filesystem read-only "
+        "(drive visible to a PC? set NOKNOK_USB_DRIVE = 0 in settings.toml)")
+    return ok
 
 def delete_wifi_credentials():
-    try:
-        os.remove(WIFI_CREDENTIALS_FILE)
+    if nk.remove(WIFI_CREDENTIALS_FILE):
         log("[storage] Deleted wifi.json")
-    except OSError:
-        pass
 
 def _url_decode(s):
     """Percent-decode an application/x-www-form-urlencoded value.
@@ -552,8 +568,23 @@ def download_and_save_script(script_url=None):
             content = response.text
             response.close()
 
-            with open(PRODUCT_SCRIPT_FILE, "w") as f:
-                f.write(content)
+            # Compile before it replaces the running copy: a truncated or
+            # half-served download must never take a working product down
+            # (DEV-18). Same bytecode exec() builds later, so no extra cost.
+            try:
+                compile(content, PRODUCT_SCRIPT_FILE, "exec")
+            except SyntaxError as e:
+                log(f"[download] REFUSED — {PRODUCT_SCRIPT_FILE} does not compile: {e}")
+                return False
+            except NameError:
+                pass   # build without compile(); exec() will judge it
+
+            try:
+                nk.write_atomic(PRODUCT_SCRIPT_FILE, content)   # temp + rename
+            except OSError:
+                log(f"[download] CANNOT save {PRODUCT_SCRIPT_FILE} — filesystem "
+                    "read-only (drive visible to a PC? see settings.toml)")
+                return False
 
             log(f"[download] SUCCESS — saved {PRODUCT_SCRIPT_FILE} ({len(content)} bytes) from {url}")
             return True
@@ -860,11 +891,23 @@ def run_ap_provisioning():
             # AP->STA transition (without a chip reset) leaves DNS broken.
             # A hardware reset brings the radio up clean in STA-only mode, and
             # main() will then connect + download on the fresh boot.
-            save_wifi_credentials(ssid, pw, su, mf)
-            log("[boot] Credentials saved — hardware reset into WiFi mode")
-            time.sleep(2)  # let the success page flush to the browser
-            microcontroller.reset()
-            return
+            if save_wifi_credentials(ssid, pw, su, mf):
+                log("[boot] Credentials saved — hardware reset into WiFi mode")
+                time.sleep(2)  # let the success page flush to the browser
+                microcontroller.reset()
+                return
+            # Filesystem read-only (drive visible to a PC): the app already saw
+            # the success page, so say it loudly here and offer setup again
+            # rather than reboot into a brain that has nothing saved.
+            event("[CFG] provisioning NOT saved — filesystem read-only "
+                  "(settings.toml NOKNOK_USB_DRIVE = 1?)")
+            try:
+                server.stop()
+            except Exception:
+                pass
+            pending["ready"] = False
+            time.sleep(1)
+            # loop back to top -> start_ap again
         else:
             # WiFi join failed after all retries — restart the AP so the user
             # can retry. We do NOT supervisor.reload() here: a soft reload leaves
@@ -1281,10 +1324,12 @@ def _cache_image(mtype, image, spec):
     bin_path, meta_path = _cache_paths(mtype)
     meta = {"version": spec.get("version"), "layout": spec.get("layout"),
             "size": len(image), "crc32": "%08x" % _crc(image)}
-    with open(bin_path, "wb") as fh:
-        fh.write(image)
-    with open(meta_path, "w") as fh:
-        json.dump(meta, fh)
+    # Both atomic, image first (DEV-18): a power cut between the two leaves an
+    # old sidecar next to a new image, which the size/crc32 check on read
+    # rejects — never a half-written file under the real name.
+    with nk.writable():                         # one window for the pair
+        nk.write_atomic(bin_path, image)
+        nk.write_atomic(meta_path, json.dumps(meta))
     return bin_path
 
 def _cache_meta(mtype):
@@ -1655,6 +1700,14 @@ def safe_idle(connected):
 def main():
     log_new_boot()
     log("[boot] noknok Pico W — starting")
+    # DEV-18: say which filesystem mode boot.py chose, and sweep any .tmp left
+    # by a write that a power cut interrupted (the real file is untouched).
+    log("[fs] CIRCUITPY drive %s — filesystem %s" % (
+        ("VISIBLE to PCs (maker mode: program writes will fail)"
+         if nk.usb_drive_visible() else "hidden"),
+        "writable in short windows only" if not nk.usb_drive_visible()
+        else "owned by the PC"))
+    nk.clean_tmp()
     if _is_fresh_start():
         _set_crash_count(0)                  # a power cycle always grants three fresh tries
 

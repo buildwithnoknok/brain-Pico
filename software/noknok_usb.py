@@ -26,9 +26,19 @@ except ImportError:
 
 NOKNOK_VID = 0x1209
 
-# Default PIO-USB host pins (noknok standard). D+ must be the lower GPIO number.
-DEFAULT_DP = board.GP16 if _USB_OK else None
-DEFAULT_DM = board.GP17 if _USB_OK else None
+# Default PIO-USB host pins (noknok standard GP16/GP17; D+ must be the lower
+# GPIO number). Makers wiring their own Pico override them in settings.toml
+# (NOKNOK_USB_DP / NOKNOK_USB_DM) — never here. See noknok.env_pin().
+def _pins():
+    if not _USB_OK:
+        return None, None
+    try:
+        from noknok import env_pin
+        return env_pin("NOKNOK_USB_DP", board.GP16), env_pin("NOKNOK_USB_DM", board.GP17)
+    except ImportError:
+        return board.GP16, board.GP17
+
+DEFAULT_DP, DEFAULT_DM = _pins()
 
 
 def _clamp(v):

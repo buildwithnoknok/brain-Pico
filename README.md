@@ -11,9 +11,11 @@ over I2C.
 
 | File | Role |
 |------|------|
-| `boot.py` | Runs first on boot. Remounts the filesystem writable so the firmware can save files. |
+| `boot.py` | Runs first on power-up. Hides the CIRCUITPY drive and makes the filesystem read-only to the program (see [Filesystem policy](#filesystem-policy-dev-18)). Fails open. |
+| `settings.toml` | **The maker config file.** I2C/USB pins, drive visibility. Every key has the ecosystem-standard default built into the code — see [settings.toml](#settingstoml--maker-configuration). |
 | `code.py` | Provisioning brain + launcher. WiFi-AP setup on first boot, then connect + download + run the app-selected product script crash-safely on every boot. |
-| `noknok.py` | Conductor library — module discovery/enumeration + drivers (Buzzer, Knob, LED Button, ...). Includes the factory-reset watchdog. |
+| `noknok.py` | Conductor library — module discovery/enumeration + drivers (Buzzer, Knob, LED Button, ...). Includes the factory-reset watchdog and the power-safe file helpers (`writable()`, `write_atomic()`). |
+| `bench_fs_policy.py` | DEV-18 acceptance script: proves on the board that the filesystem is read-only outside a window, atomic writes work, `.tmp` orphans are swept. |
 | `module_flasher.py` | I2C OTA flasher — streams a module application `.bin` to the CH32V003 bootloader (`ModuleFlasher`). Shared by the bench tool and (later) the provisioning flow. |
 | `bench_flash.py` | Bench bring-up tool — flashes application firmware onto a blank module (bootloader only) one at a time from the REPL. See [Bench-flashing modules](#bench-flashing-modules-bring-up). |
 | `trio_demo.py` | Light & Sound Controller demo — uses all three I2C modules. |
@@ -38,9 +40,70 @@ Confluence: *Software Development -> Pico W Provisioning — Process & Implement
 `/roles/assign`, and the planned `/settings`) are documented in
 [docs/provisioning-http-api.md](docs/provisioning-http-api.md).
 
+## Filesystem policy (DEV-18)
+
+The CIRCUITPY drive is a FAT filesystem on raw flash with **no journal**. A power cut in the
+middle of any write can corrupt it — and can take unrelated files (`product.py`) with it. A
+noknok product is switched off by unplugging, so the brain must never have a write in flight
+when that happens. Software cannot make a FAT write survive a power cut; it can only make sure
+none is in flight, and that the rare writes cannot destroy what is already there.
+
+**Three layers, only one of them ever written.** The RP2350's BOOTSEL bootloader is ROM and
+cannot be damaged. CircuitPython itself is written only by a UF2 flash, never by our code. Only
+the filesystem is at risk — and a brain with a broken filesystem always shows up on a PC as a
+drive again (see *fail open* below), so it can always be recovered ([DEV-38](https://noknokdev.atlassian.net/browse/DEV-38):
+one-file recovery image).
+
+The rules, enforced by the OS rather than by discipline:
+
+1. **Read-only to the program by default.** `boot.py` hides the CIRCUITPY drive from PCs
+   (`settings.toml` → `NOKNOK_USB_DRIVE = 0`) and remounts the filesystem read-only. Any stray
+   `open(..., "w")` — in `code.py`, `noknok.py`, or a product — raises `OSError` instead of
+   silently writing flash. (With the drive hidden, CircuitPython would otherwise leave the
+   filesystem *writable* to code; the explicit remount is the whole policy.)
+2. **Short write windows.** `with noknok.writable():` remounts rw, and the outermost exit runs
+   `os.sync()` and remounts read-only. Windows exist for provisioning, OTA, roles and factory
+   reset — the first seconds after boot — and **never while `product.py` runs**. Remount itself
+   is free; each small write costs ~200 ms of flash erase, so writes stay rare.
+3. **Every write atomic and only-when-changed.** `noknok.write_atomic(path, data)` writes
+   `<path>.tmp` and renames it over the target, so a power cut mid-write leaves the old file
+   intact. `product.py` is additionally `compile()`d before it replaces the running copy.
+   Orphan `.tmp` files are swept by `noknok.clean_tmp()` at boot. Counters and flags
+   (crash strikes, OTA timestamp) live in `microcontroller.nvm`, a separate flash region that
+   cannot hurt the FAT.
+4. **Fail open.** If `settings.toml` has no `NOKNOK_USB_DRIVE` key, or `code.py` / `noknok.py`
+   are missing, or `boot.py` raises, the drive stays visible. `boot.py` can never lock a brain out.
+
+**Maker / bench mode** (`NOKNOK_USB_DRIVE = 1`): the drive is visible and a PC may write it;
+the program then cannot, and provisioning fails loudly (logged + `[CFG]` event) instead of two
+writers sharing one FAT volume. Switch from the REPL with `import noknok; noknok.set_usb_drive(True)`
+and power-cycle; switch back by editing `settings.toml` on the PC. Bench file transfers
+(`tools/pico.py put`) go over the REPL and open their own window, so they work in both modes.
+
+**Bench proof:** `bench_fs_policy.py` (run via `./pico.py run`), 10/10 on the Pi4 bench, 15 Sep 2026.
+
+## settings.toml — maker configuration
+
+CircuitPython reads `/settings.toml` natively; the noknok code reads it with `os.getenv()`.
+It is *the* place to adapt a brain you wired yourself — never edit `noknok.py` or `code.py` for
+these. noknok hardware (PicoHub) follows the Ecosystem standard and ships the defaults.
+
+| Key | Default | Used by |
+|-----|---------|---------|
+| `NOKNOK_I2C_SDA` / `NOKNOK_I2C_SCL` | `"GP8"` / `"GP9"` (Ecosystem standard) | `noknok.Conductor()` |
+| `NOKNOK_I2C_FREQ` | `100000` | `noknok.Conductor()` |
+| `NOKNOK_USB_DP` / `NOKNOK_USB_DM` | `"GP16"` / `"GP17"` (D+ = lower GPIO of a consecutive pair) | `noknok_usb` host port |
+| `NOKNOK_USB_DRIVE` | `0` = hidden (shipped) · `1` = visible (maker/bench) | `boot.py` |
+
+A missing key falls back to the default in code, so a brain without the file behaves like a
+factory unit — except drive visibility, which fails open to *visible*. More knobs (debug log,
+OTA interval, mDNS name) move here under [DEV-39](https://noknokdev.atlassian.net/browse/DEV-39).
+
 ## Current versions & features (PoC v1)
 
-**`code.py` v0.15** — provisioning + launcher + module firmware OTA. Field-hardened 12 Sep 2026:
+**`code.py` v0.16** — provisioning + launcher + module firmware OTA. 15 Sep 2026: **filesystem
+policy (DEV-18)** — read-only by default, atomic writes in short windows, `settings.toml` for
+pins and drive visibility; see the two sections above. Field-hardened 12 Sep 2026:
 - **Bootloader updates over the air (DEV-31).** The registry names the current stage-1
   (`module-I2C-bootloader/firmware/index.json`); it is cached like any image, and before the
   app pass every I²C module below the published stage-1 gets it — and its current app back —
@@ -157,15 +220,18 @@ Core:
 - `adafruit_ntp.mpy` (optional — enables wall-clock timestamps)
 
 ### Flash / test
-1. Copy `boot.py` + `code.py` + `noknok.py` + the libs to the Pico (CIRCUITPY drive or Thonny).
+1. Copy `boot.py` + `settings.toml` + `code.py` + `noknok.py` + `noknok_usb.py` +
+   `module_flasher.py` + the libs to the Pico. On a fresh CircuitPython (no `boot.py` yet) the
+   CIRCUITPY drive is visible — drag and drop. Afterwards the drive is hidden: push files over
+   the REPL (`tools/pico.py put`, Thonny) or set `NOKNOK_USB_DRIVE = 1` first.
    Write `.py` files **without a BOM** — CircuitPython errors on a leading byte-order mark.
 2. **Power-cycle** the Pico (the radio is not reset by a soft reboot; a power cycle also returns
    the I2C modules to their `0x7F` staging address).
 3. Join `noknok-setup`, open the setup page (or use the noknok app), enter WiFi credentials.
 4. Watch the live serial console, or — to have `log.txt` written on the Pico — first create an
    empty file named `debug_log` in its root (that marker is the only thing that turns on flash
-   logging; the field default is off). The host drive view of `log.txt` can be stale while the
-   device owns the filesystem. `noknok_events.txt` is always written.
+   logging; the field default is off). Read it over the REPL — the drive is hidden on a
+   shipped-configured brain. `noknok_events.txt` is always written.
 
 ## Bench-flashing modules (bring-up)
 

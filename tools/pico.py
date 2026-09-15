@@ -18,10 +18,14 @@
 #   Ctrl-B  back to the friendly REPL
 #
 # Files are written THROUGH the REPL (device-side open/write), not via the
-# CIRCUITPY mass-storage mount. boot.py remounts the FS writable for CircuitPython,
-# which makes the host's MSC view read-only — and writing MSC + device at once is
-# how CIRCUITPY gets corrupted (DEV-18). REPL-side writes also don't trigger
-# CircuitPython's auto-reload, so pushing a helper module won't reboot the board.
+# CIRCUITPY mass-storage mount. Since DEV-18 boot.py hides the drive and leaves
+# the filesystem read-only to the program, so `put` opens its own write window:
+# remount rw -> write <name>.tmp -> rename over the target -> sync -> remount ro
+# (same atomic pattern as noknok.write_atomic, and the old file survives a power
+# cut mid-transfer). If the drive is visible (settings.toml NOKNOK_USB_DRIVE = 1)
+# the remount is refused and the write fails — copy over the mount instead.
+# REPL-side writes also don't trigger CircuitPython's auto-reload, so pushing a
+# helper module won't reboot the board.
 #
 # Port: the by-id path is stable across re-enumeration; ttyACM numbering is not
 # (the WCH-LinkE also exposes a CDC port and grabs ttyACM0 if it enumerates first).
@@ -117,14 +121,34 @@ class Pico:
         remote = remote or local.split('/')[-1]
         with open(local, 'rb') as f:
             data = f.read()
+        tmp = remote + '.tmp'
         self.enter_raw()
         try:
-            self.exec_raw("f = open(%r, 'wb')" % remote, echo=False)
+            # Open the write window (DEV-18). A refused remount (drive visible
+            # to a PC) is reported by the open() below as a read-only error —
+            # unless an old rw-remounting boot.py made the FS writable anyway,
+            # in which case we must NOT flip it read-only afterwards (that
+            # would break every following put until a hard reset): only undo
+            # a remount we actually did.
+            self.exec_raw("import os, storage\n"
+                          "_rw = False\n"
+                          "try:\n"
+                          "    if storage.getmount('/').readonly:\n"
+                          "        storage.remount('/', readonly=False); _rw = True\n"
+                          "except Exception as e: print('remount:', e)\n", echo=True)
+            _, err = self.exec_raw("f = open(%r, 'wb')" % tmp, echo=True)
+            if err:
+                return 1
             for i in range(0, len(data), 512):
                 self.exec_raw("f.write(%r)" % data[i:i + 512], echo=False)
-            _, err = self.exec_raw("f.close(); print('wrote', %d, 'bytes to', %r)"
-                                   % (len(data), remote), echo=True)
+            _, err = self.exec_raw(
+                "f.close(); os.sync(); os.rename(%r, %r); os.sync()\n"
+                "print('wrote', %d, 'bytes to', %r)" % (tmp, remote, len(data), remote),
+                echo=True)
         finally:
+            self.exec_raw("try:\n"
+                          "    if _rw: storage.remount('/', readonly=True)\n"
+                          "except Exception: pass\n", echo=False)
             self.exit_raw()
         return 1 if err else 0
 

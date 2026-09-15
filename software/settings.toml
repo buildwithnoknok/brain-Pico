@@ -1,0 +1,25 @@
+# settings.toml — noknok brain configuration (CircuitPython reads this file
+# natively; the noknok code reads it with os.getenv()). This is THE place a
+# maker adapts the brain to their own wiring. Never edit noknok.py or code.py
+# for these. Every key has the ecosystem-standard default built into the code,
+# so a missing key behaves exactly like a factory unit.
+#
+# noknok hardware (PicoHub) follows the Ecosystem standard and ships these
+# defaults. Change them only for a Pico you wired yourself.
+
+# ── I2C bus (JST SH 4-pin / Qwiic / Stemma QT modules) ───────────────────────
+# Ecosystem standard: GP8 = SDA, GP9 = SCL, 100 kHz.
+NOKNOK_I2C_SDA = "GP8"
+NOKNOK_I2C_SCL = "GP9"
+NOKNOK_I2C_FREQ = 100000
+
+# ── USB host port (PIO-USB, for USB-C modules behind the DataHub) ────────────
+# D+ must be the lower GPIO number of a consecutive pair.
+NOKNOK_USB_DP = "GP16"
+NOKNOK_USB_DM = "GP17"
+
+# ── CIRCUITPY drive visibility (DEV-18) ──────────────────────────────────────
+# 0 = hidden from PCs; the program may save settings (shipped default).
+# 1 = visible; a PC may edit files, the program cannot write (maker/bench).
+# Read by boot.py at power-up. From the REPL: noknok.set_usb_drive(True).
+NOKNOK_USB_DRIVE = 0
