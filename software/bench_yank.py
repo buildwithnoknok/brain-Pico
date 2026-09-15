@@ -21,6 +21,8 @@
 # yank_* files and prints the tally).
 
 import os, time, json
+import supervisor
+supervisor.runtime.autoreload = False   # our own file writes must not soft-reboot us
 import noknok as nk
 
 STATE   = "/yank_state.json"

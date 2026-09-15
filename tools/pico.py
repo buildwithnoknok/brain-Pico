@@ -143,6 +143,11 @@ class Pico:
                           "    if storage.getmount('/').readonly:\n"
                           "        storage.remount('/', readonly=False); _rw = True\n"
                           "except Exception as e: print('remount:', e)\n", echo=True)
+            # parent directories (lib/adafruit_httpserver/...) — create if missing
+            parts = remote.strip('/').split('/')[:-1]
+            for i in range(len(parts)):
+                self.exec_raw("try: os.mkdir(%r)\nexcept OSError: pass\n"
+                              % ('/' + '/'.join(parts[:i + 1])), echo=False)
             _, err = self.exec_raw("f = open(%r, 'wb')" % tmp, echo=True)
             if err:
                 return 1
@@ -162,6 +167,58 @@ class Pico:
     def ls(self, d='/'):
         return self.exec("import os\nfor n in sorted(os.listdir(%r)): print(n)" % d)
 
+    def get(self, remote, local=None):
+        """Copy a file FROM the Pico (base64 over the REPL). Read-only, so it
+        is safe on a damaged filesystem — used to rescue lib/ on 15 Sep 2026."""
+        import base64, os
+        local = local or remote.split('/')[-1]
+        self.enter_raw()
+        try:
+            out, err = self.exec_raw(
+                "import binascii\n"
+                "with open(%r, 'rb') as f:\n"
+                "    while True:\n"
+                "        b = f.read(3000)\n"
+                "        if not b: break\n"
+                "        print(binascii.b2a_base64(b).decode().strip())\n" % remote,
+                echo=False)
+        finally:
+            self.exit_raw()
+        if err:
+            return 1
+        data = b''.join(base64.b64decode(line) for line in out.split(b'\n') if line.strip())
+        d = os.path.dirname(local)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(local, 'wb') as f:
+            f.write(data)
+        print('got', len(data), 'bytes from', remote, '->', local)
+        return 0
+
+    def get_tree(self, remote_dir, local_dir):
+        """Recursively copy a directory from the Pico."""
+        import os
+        self.enter_raw()
+        try:
+            out, _ = self.exec_raw(
+                "import os\n"
+                "def walk(d):\n"
+                "    for n in sorted(os.listdir(d)):\n"
+                "        p = d + '/' + n\n"
+                "        if os.stat(p)[0] & 0x4000: walk(p)\n"
+                "        else: print(p)\n"
+                "walk(%r)\n" % remote_dir, echo=False)
+        finally:
+            self.exit_raw()
+        rc = 0
+        for p in out.decode().split('\n'):
+            p = p.strip()
+            if not p:
+                continue
+            rel = p[len(remote_dir):].lstrip('/')
+            rc |= self.get(p, os.path.join(local_dir, rel))
+        return rc
+
     def reset(self):
         self.ser.write(CTRL_C + CTRL_C)
         time.sleep(0.2)
@@ -180,6 +237,8 @@ def main(argv):
     if cmd == 'exec':  return p.exec(args[0])
     if cmd == 'put':   return p.put(*args)
     if cmd == 'ls':    return p.ls(*args)
+    if cmd == 'get':   return p.get(*args)
+    if cmd == 'gettree': return p.get_tree(*args)
     if cmd == 'reset': return p.reset()
     print('unknown command', cmd)
     return 2
