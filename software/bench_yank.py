@@ -128,18 +128,24 @@ else:
     before = state.get("snapshot", {})
     now, garbage = snapshot()
     lost = sorted(n for n in before if n not in now and "/yank_" not in n and not n.endswith(".tmp"))
-    verdict = file_ok and not lost and garbage == 0
+    # Garbage entries left by an EARLIER pull cannot be deleted (stat fails,
+    # remove fails) and stay until the directory is recreated — only NEW
+    # garbage counts against this round.
+    g_before = state.get("garbage_before")
+    new_garbage = (garbage - g_before) if g_before is not None else 0
+    verdict = file_ok and not lost and new_garbage <= 0
     kind = "runtime" if phase in RUNTIME else "setup"
     k = "%s_%s" % (kind, "pass" if verdict else "fail")
     tally[k] = tally.get(k, 0) + 1
     tally["lost_files"] = tally.get("lost_files", 0) + len(lost)
     print("ROUND %d (%s, %s): %s" % (rnd, phase, kind.upper(), "PASS" if verdict else "FAIL"))
     print("     target file intact:", "yes" if file_ok else "NO", "| last complete seq =", detail)
-    print("     collateral: %d other file(s) LOST, %d garbage directory entries, %d orphan .tmp"
-          % (len(lost), garbage, len(orphans)))
+    print("     collateral: %d other file(s) LOST, %d NEW garbage directory entries (%d total, %s before), %d orphan .tmp"
+          % (len(lost), max(new_garbage, 0), garbage,
+             "?" if g_before is None else g_before, len(orphans)))
     for n in lost:
         print("        lost: %s (%d B)" % (n, before[n]))
-    history.append({"round": rnd, "phase": phase, "ok": verdict, "lost": len(lost), "garbage": garbage})
+    history.append({"round": rnd, "phase": phase, "ok": verdict, "lost": len(lost), "new_garbage": max(new_garbage, 0)})
 print("tally so far — RUNTIME (must be clean): %d PASS / %d FAIL | SETUP-TIME (known unsafe): "
       "%d PASS / %d FAIL | %d files lost in total"
       % (tally.get("runtime_pass", 0), tally.get("runtime_fail", 0),
@@ -154,9 +160,10 @@ try:
     existed = target is not None and os.stat(target) is not None
 except OSError:
     existed = False
-snap, _ = snapshot()
+snap, g_now = snapshot()
 nk.write_json_atomic(STATE, {"round": rnd, "phase": phase, "existed": existed,
-                             "tally": tally, "history": history[-30:], "snapshot": snap})
+                             "tally": tally, "history": history[-30:], "snapshot": snap,
+                             "garbage_before": g_now})
 print("snapshot: %d files before the tone: %s" % (len(snap), " ".join(sorted(snap))))
 
 # cue hardware: buzzer + LED Button if on the bench (best-effort)
