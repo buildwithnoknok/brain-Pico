@@ -83,7 +83,7 @@ and continues headless (download `product.py`, OTA-update modules, run the produ
 | `ssid` | home WiFi name (required) |
 | `password` | home WiFi password |
 | `script_url` | raw URL of the product's `product.py` (from the manifest's `files[]`) |
-| `module_firmware` | optional JSON string: the manifest's `module_firmware{}` block (floors, e.g. `{"buzzer":{"min":"3.3.1"}}`), persisted to `wifi.json` for the headless OTA check |
+| `module_firmware` | optional JSON string: the manifest's `module_firmware{}` block (floors, e.g. `{"buzzer":{"min":"3.3.1"}}`), persisted with the credentials (Store + `/data/wifi.json`) for the headless OTA check |
 
 **Response:** the "Connected!" HTML page. (The Pico acts on the credentials after
 the page is delivered.)
@@ -98,8 +98,8 @@ handled, because it is the first point at which the Pico has internet:
 3. Otherwise resolve `module_firmware` floors: fetch
    `Ecosystem/software/modules.json`, then each module's `firmware/index.json`
    **and the stage-1 bootloader's** (`bootloader.stage1` in the registry);
-   then refresh the on-device image cache (`/fw_<type>.bin` + `.json` sidecar,
-   `/fw_stage1.bin` for the bootloader) for everything whose cached version/crc
+   then refresh the on-device image cache (`/data/fw_<type>.bin` + `.json` sidecar,
+   `/data/fw_stage1.bin` for the bootloader) for everything whose cached version/crc
    differs from current — **before any Conductor exists** (downloads after one
    has existed can hang). Each download is verified against the index's
    `size`/`crc32`.
@@ -109,7 +109,7 @@ handled, because it is the first point at which the Pico has internet:
 5. **Stage-1 pass:** every I²C module below the published stage-1 version gets
    it, and its current app back, in one transaction from the cache — same
    layout only; legacy bootloaders skipped. A module's stage-1 version is read
-   once and remembered in `noknok_state.json` (`"bl"`).
+   once and remembered in the Store's module state (`"bl"`).
 6. Compare installed app versions versus published; if nothing is outdated,
    stop here having written nothing further to flash.
 7. Check the index's `layout` against each outdated module's actual bootloader
@@ -130,9 +130,10 @@ cache — and the credentials are retried on the next boot. Without
 `product.py` the setup AP is offered, credentials kept.
 
 Every step degrades to a no-op rather than failing the boot. Progress goes to
-the serial console and `noknok_events.txt`; `log.txt` is written only with the
-bench marker `/debug_log` present, or once on a crash. There is no live channel
-back to the phone by this point, since it is long off the setup AP.
+the serial console and the event history in the runtime Store (`events()` in
+`code.py`; what DEV-36 will show the customer); `/data/log.txt` is written only
+with the bench marker `/debug_log` present. There is no live channel back to
+the phone by this point, since it is long off the setup AP.
 
 ## Planned
 
@@ -142,30 +143,34 @@ Push product configuration to the device so the app can configure a running prod
 
 | Field | Value |
 |-------|-------|
-| `settings` | JSON string written verbatim to the device's `product_settings.json` |
+| `settings` | JSON object stored in the runtime Store under `settings` (product-tagged) |
 
-The product reads `product_settings.json` on its next start (and, later, could watch
-it live). **Device settings convention** (see `poc/scripts/smart_lamp.py`):
+Superseded by the Device Protocol v1 `settings.get/set/reset` ops (DEV-34, Confluence
+113868802). Constraint carried over from DEV-18: **settings values live in the runtime
+Store (FRAM / nvm), never in a file** — the product reads them through `c.settings`.
+Convention: product-tagged, `{"product":"<manifest-id>", ...values...}`; a product ignores
+values whose tag isn't its own (stale after a switch). App-side, one blob per device.
 
-- **One generic file per device:** `product_settings.json` — a Pico runs one product
-  at a time, so the filename is product-agnostic and this endpoint needn't know which
-  product is installed (mirrors `wifi.json` / `noknok_roles.json` / `noknok_state.json`).
-- **Product-tagged inside:** `{"product":"<manifest-id>", ...state...}`. A product
-  ignores a settings file whose `product` tag isn't its own (stale after a switch).
+## Related on-device data
 
-App-side, store one such blob per device (each device = one product) rather than one
-monolithic all-products document.
+Since DEV-18 (15 Sep 2026) the brain **never writes its filesystem while a product runs**
+— a power cut during any FAT write can destroy the filesystem on this platform. Runtime data
+lives in the **Store** (`noknok.store()`: I2C FRAM at 0x50 on the PicoHub, else `nvm`);
+setup/OTA-time files live in `/data/`.
 
-## Related on-device files
+| Where | Written by | Purpose |
+|-------|-----------|---------|
+| Store `wifi` + `/data/wifi.json` | `/connect` | home WiFi creds + `script_url` + `module_firmware` (file is primary at boot; rebuilt from the Store copy if lost) |
+| Store `roles` + `/data/noknok_roles.json` | `/roles/*` | `role_id → module UID` map |
+| Store `state` | `enumerate()` | UID → address/type/bootloader (stable addresses; written only when hardware changes) |
+| Store `settings` | DEV-34 `settings.*` | product runtime settings |
+| Store `events` | `code.py` | last 40 `[FW]` `[RESCUE]` `[CRASH]` `[ROLE]` `[CFG]` lines (replaces `noknok_events.txt`) |
+| `/data/product.py` | first connected boot / re-fetch | the product script (compiled before it replaces the running copy) |
+| `/data/fw_<type>.bin` + `.json` | OTA pass | on-device image cache + sidecar (version, layout, size, crc32). Flash source and offline rescue source. |
+| `/data/log.txt` | `code.py`, bench only | verbose boot log, written only with the `/debug_log` marker present |
 
-| File | Written by | Purpose |
-|------|-----------|---------|
-| `wifi.json` | `/connect` | home WiFi creds + `script_url` + `module_firmware` |
-| `noknok_roles.json` | `/roles/*` | `role_id → module UID` map |
-| `noknok_state.json` | `enumerate()` | last-known module addresses (fast reconnect) |
-| `product_settings.json` | the product (+ future `/settings`) | product runtime settings |
-| `log.txt` / `noknok_events.txt` | `code.py` + products | verbose boot log (written only with the `/debug_log` marker, or once on a crash) / durable `[FW]` `[RESCUE]` `[CRASH]` audit (always) |
-| `fw_<type>.bin` + `fw_<type>.json` | OTA pass | on-device image cache: last fetched app per module type + sidecar (version, layout, size, crc32). Flash source and offline rescue source. |
+Legacy root `wifi.json` / `product.py` / `noknok_state.json` on brains provisioned before
+`/data` existed are still read, never written.
 
 ## See also
 - Implementation: `software/code.py` (route handlers) and `software/noknok.py`
