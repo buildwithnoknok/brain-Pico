@@ -85,8 +85,12 @@ shows up on a PC as a drive again (fail-open, below), so recovery is always poss
    roles. Those are moments the customer is holding the phone and the app says *keep it
    plugged in*. `/data`'s directory entries live in their own block, so a cut there can
    lose `/data/*` but not `code.py`'s entry — a mitigation, not a cure: the allocation
-   table is still shared. Recovery: `wifi.json` is rebuilt from the Store copy,
-   `product.py` and the cache are re-downloaded, and DEV-38 covers the rest.
+   table (one 4 KB block for the whole volume, rewritten on every write) and the 4 KB data
+   blocks (four 1 KB clusters each, possibly from different files) are still shared, so a
+   setup-time cut can in the worst case still reach the system files. A true second
+   partition or frozen system files would remove that; both need a custom CircuitPython
+   build and are scored on DEV-37. Recovery today: `wifi.json` is rebuilt from the Store
+   copy, `product.py` and the cache are re-downloaded, and DEV-38 covers the rest.
    `noknok.writable()` / `noknok.write_atomic()` are the only way to write, and they are
    for these moments only.
 5. **Fail open.** If `settings.toml` has no `NOKNOK_USB_DRIVE` key, or `code.py` /
@@ -103,7 +107,9 @@ reports the failure instead of pretending. Switch from the REPL with
 windows, atomic writes); `bench_store.py` 11/11 (Store round-trip, stable addresses, no
 filesystem writes on re-enumeration); `bench_yank.py` — the board beeps, then holds a tone
 while it writes, you pull the cable during the tone; *runtime* rounds (product idle, Store
-churn) must never lose a file, *setup-time* rounds reproduce the finding.
+churn) must never lose a file, *setup-time* rounds reproduce the finding. **Acceptance run
+15 Sep 2026: 8 runtime pulls (4 idle, 4 Store churn) → 0 files lost; 1 setup-time pull →
+`/data` lost, root intact** — the same pull that erased the entire brain before the change.
 
 ## settings.toml — maker configuration
 
