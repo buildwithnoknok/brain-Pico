@@ -94,6 +94,8 @@ def _service():
             _service_hook()
         except Exception:
             pass                    # the product loop must never die for the radio
+    if _settings_by_key:            # deliver app-side changes, flush after idle
+        _settings_tick()
 
 _last_conductor = None
 
@@ -568,6 +570,198 @@ def store():
         _store = Store()
     return _store
 
+
+# ── Settings — the values the app and the product both change (DEV-34) ───────
+# Principle (Device Protocol v1 §3): the manifest carries the schema, the
+# device carries the values; a knob turn and the app's settings page change
+# the same thing, so the device is the source of truth and the app a view of
+# it. Values live in the Store (key "settings"), never in a file (DEV-18), and
+# the Store is DESIGNED FOR nvm: one 4 KB flash sector, ~80 ms blocking per
+# write, finite endurance. So: write only what changed, and only after
+# IDLE_S without a change — a knob generates dozens of changes a second and a
+# product must never write from its hot loop. The flush and app-side change
+# callbacks both run from the servicing hook, i.e. at the top of a module
+# read/write or inside c.sleep() — never inside a module transaction.
+#
+#   s = c.settings                      # a Settings, created by the Conductor
+#   s.defaults({"brightness": 180, "color": "#FFAF5F", "on": True})
+#   s.get("brightness")                 # current value
+#   s.set("brightness", 200)            # device-side change (persisted later)
+#   s.on_change(lambda changed: apply(changed))   # app-side changes arrive here
+#
+# Records: {"product": "<tag>", "values": {...}, "defaults": {...}, "seq": n}.
+# A record tagged for another product is ignored, so a product switch starts
+# from defaults while a reinstall of the same product keeps its values.
+
+SETTINGS_KEY        = "settings"
+DEVICE_SETTINGS_KEY = "device_settings"
+SETTINGS_IDLE_S     = 5.0
+
+def product_tag():
+    """What the current product is called in the Store: the manifest id the app
+    sent at provisioning (code.py 0.17+), else the script's file name."""
+    creds = read_json(DATA_DIR + "/wifi.json") or read_json("/wifi.json") \
+        or store().get("wifi") or {}
+    pid = creds.get("product_id")
+    if pid:
+        return str(pid)
+    url = creds.get("script_url") or ""
+    return url.rsplit("/", 1)[-1] if url else "unknown"
+
+
+class Settings:
+    def __init__(self, tag=None, key=SETTINGS_KEY):
+        self._key   = key
+        self._tag   = tag
+        self._vals  = {}
+        self._defs  = {}
+        self._seq   = 0
+        self._dirty = False
+        self._last_change = 0.0
+        self._cbs   = []
+        self._pending = {}          # app-side changes not yet delivered to on_change
+        rec = store().get(key)
+        if isinstance(rec, dict) and (tag is None or rec.get("product") == tag):
+            self._vals = dict(rec.get("values") or {})
+            self._defs = dict(rec.get("defaults") or {})
+            self._seq  = int(rec.get("seq") or 0)
+        elif isinstance(rec, dict):
+            print("[settings] stored values belong to %r, not %r - starting from defaults"
+                  % (rec.get("product"), tag))
+
+    # ── product API ──────────────────────────────────────────────────────────
+    def defaults(self, defs):
+        """Declare defaults; fills in any key that has no value yet."""
+        added = False
+        for k, v in defs.items():
+            self._defs[k] = v
+            if k not in self._vals:
+                self._vals[k] = v
+                added = True
+        if added or self._defs != (store().get(self._key) or {}).get("defaults"):
+            self._mark()
+        return self
+
+    def get(self, key, default=None):
+        return self._vals.get(key, self._defs.get(key, default))
+
+    def set(self, key, value):
+        """Device-side change. Persisted after SETTINGS_IDLE_S of quiet."""
+        if self._vals.get(key) == value and key in self._vals:
+            return False
+        self._vals[key] = value
+        self._mark()
+        return True
+
+    def update(self, values):
+        return any([self.set(k, v) for k, v in values.items()])
+
+    def all(self):
+        return dict(self._vals)
+
+    @property
+    def seq(self):
+        return self._seq
+
+    def on_change(self, callback):
+        """callback(changed: dict) for changes made by the app, delivered from
+        the servicing hook (top of a module read / c.sleep), never mid-transaction."""
+        self._cbs.append(callback)
+        return callback
+
+    def reset(self):
+        """Back to defaults (app 'Reset to defaults' / provisioning)."""
+        self._vals = dict(self._defs)
+        self._mark()
+        return dict(self._vals)
+
+    def flush(self):
+        """Write now if anything changed. Returns True if a write happened."""
+        if not self._dirty:
+            return False
+        self._seq += 1
+        rec = {"product": self._tag, "values": self._vals,
+               "defaults": self._defs, "seq": self._seq}
+        ok = store().set(self._key, rec)
+        self._dirty = not ok
+        return ok
+
+    # ── app side (called by the settings.* ops) ──────────────────────────────
+    def apply_remote(self, values):
+        """Merge values sent by the app; queue them for on_change."""
+        changed = {}
+        for k, v in values.items():
+            if self._vals.get(k) != v or k not in self._vals:
+                self._vals[k] = v
+                changed[k] = v
+        if changed:
+            self._mark()
+            self._pending.update(changed)
+        return changed
+
+    def snapshot(self):
+        return {"product": self._tag, "values": dict(self._vals),
+                "defaults": dict(self._defs), "seq": self._seq,
+                "dirty": self._dirty}
+
+    # ── internals ────────────────────────────────────────────────────────────
+    def _mark(self):
+        self._dirty = True
+        self._last_change = time.monotonic()
+
+    def _tick(self):
+        """Called from the servicing hook: deliver app-side changes, then flush
+        once the values have been quiet for SETTINGS_IDLE_S."""
+        if self._pending:
+            changed, self._pending = self._pending, {}
+            for cb in self._cbs:
+                try:
+                    cb(changed)
+                except Exception as e:
+                    print("[settings] on_change callback failed: %r" % (e,))
+        if self._dirty and time.monotonic() - self._last_change >= SETTINGS_IDLE_S:
+            self.flush()
+
+_settings_by_key = {}
+
+def settings(scope="product"):
+    """The brain's Settings for a scope — one instance per scope, shared by
+    every Conductor and the RPC handlers. "product" values are tagged with
+    product_tag(); "device" values (timezone, radios, pairing — DEV-35/36)
+    survive product switches."""
+    key = SETTINGS_KEY if scope == "product" else DEVICE_SETTINGS_KEY
+    s = _settings_by_key.get(key)
+    if s is None:
+        s = Settings(product_tag() if scope == "product" else None, key)
+        _settings_by_key[key] = s
+    return s
+
+def install_defaults(tag, defaults):
+    """Provisioning-time (setup, not the hot loop): write the product's
+    config_defaults so device and app agree from first boot. Same product
+    (same tag) keeps its values and only gains new keys; a different product
+    starts from these defaults. Immediate Store write; returns True on success."""
+    defaults = dict(defaults or {})
+    rec = store().get(SETTINGS_KEY)
+    if isinstance(rec, dict) and rec.get("product") == tag:
+        values = dict(rec.get("values") or {})
+        for k, v in defaults.items():
+            values.setdefault(k, v)
+        values = {k: v for k, v in values.items() if k in defaults} if defaults else values
+        seq = int(rec.get("seq") or 0) + 1
+    else:
+        values, seq = dict(defaults), 1
+    _settings_by_key.pop(SETTINGS_KEY, None)          # a live instance is now stale
+    return store().set(SETTINGS_KEY, {"product": tag, "values": values,
+                                      "defaults": defaults, "seq": seq})
+
+def _settings_tick():
+    for s in _settings_by_key.values():
+        try:
+            s._tick()
+        except Exception:
+            pass
+
 def usb_drive_visible():
     """True when settings.toml asks boot.py to show the CIRCUITPY drive
     (NOKNOK_USB_DRIVE = 1). Absent key = visible (fail open, see boot.py)."""
@@ -673,6 +867,7 @@ class Conductor:
         store().attach(self.i2c)   # the Store (FRAM at 0x50 / nvm) shares this bus
         global _last_conductor
         _last_conductor = self     # see conductor()
+        self.settings = settings() # c.settings — product values (DEV-34), shared instance
         self.buzzer    = []    # NoknokBuzzer instances, indexed by discovery order
         self.knob      = []    # NoknokKnob instances
         self.ledbutton = []    # NoknokLedButton instances
@@ -1812,7 +2007,7 @@ class Conductor:
     # the UID -> type map. The restore logic self-heals if hardware changed.
     _RESET_FILES = (DATA_DIR + "/wifi.json", DATA_DIR + "/product.py", ROLES_FILE,
                     "wifi.json", "product.py", "noknok_roles.json")
-    _RESET_KEYS  = ("wifi", "roles", "settings")
+    _RESET_KEYS  = ("wifi", "roles", SETTINGS_KEY, DEVICE_SETTINGS_KEY)
 
     def check_factory_reset(self, knob_status, hold_seconds=5.0):
         """

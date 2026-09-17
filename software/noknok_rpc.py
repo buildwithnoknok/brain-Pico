@@ -235,6 +235,7 @@ def service(force=False):
     global _next, _busy
     if _busy:
         return
+    _feed()                                  # bench watchdog, if armed
     if _carrier is None and not _deferred:
         return
     now = time.monotonic()
@@ -256,6 +257,35 @@ def service(force=False):
             fn()
         except Exception as e:
             _logfn("[rpc] deferred call failed: %r" % (e,))
+
+
+# ── Bench watchdog ───────────────────────────────────────────────────────────
+
+_wdt = None
+
+def arm_watchdog(seconds=8, logfn=print):
+    """Hardware watchdog fed by service(). Once armed it cannot be disarmed on
+    RP2 — a hang (or a product that never services for `seconds`) resets the
+    board. Bench diagnostics only; see code.py start_app_channel()."""
+    global _wdt
+    try:
+        import microcontroller
+        from watchdog import WatchDogMode
+        w = microcontroller.watchdog
+        w.timeout = seconds
+        w.mode = WatchDogMode.RESET
+        w.feed()
+        _wdt = w
+        logfn("[wdt] armed: %d s RESET (bench)" % seconds)
+    except Exception as e:
+        logfn("[wdt] unavailable (%r)" % (e,))
+
+def _feed():
+    if _wdt is not None:
+        try:
+            _wdt.feed()
+        except Exception:
+            pass
 
 
 # ── mDNS ─────────────────────────────────────────────────────────────────────

@@ -409,7 +409,8 @@ WIFI_TIMEOUT_S        = 15
 
 # Shared state: the /connect handler fills this, the main loop acts on it.
 pending = {"ssid": None, "password": None, "script_url": None,
-           "module_firmware": None, "product_id": None, "ready": False}
+           "module_firmware": None, "product_id": None, "config_defaults": None,
+           "ready": False}
 
 # ── Role assignment: lazily-created, cached Conductor ───────────────────────────
 # The role endpoints need a Conductor to talk to the I2C modules. Enumeration
@@ -812,7 +813,40 @@ def _do_firmware_check(module_firmware):
     return {"update_needed": any(r["needs_update"] for r in report),
             "resolved": False, "modules": slim}
 
-def _do_provision(ssid, password, script_url, module_firmware, product_id):
+def _settings_for(args):
+    scope = args.get("scope") or "product"
+    if scope not in ("product", "device"):
+        raise rpc.RpcError("bad scope", scope)
+    return scope, nk.settings(scope)
+
+def _h_settings_get(args, msg):
+    """Current values (+ defaults + seq) — the app calls this before rendering
+    its page and polls it to pick up knob-driven changes (compare `seq`)."""
+    scope, s = _settings_for(args)
+    out = s.snapshot()
+    out["scope"] = scope
+    return out
+
+def _h_settings_set(args, msg):
+    """Merge values from the app. The product's on_change callback runs at
+    its next module read; the Store write follows after 5 s of quiet."""
+    scope, s = _settings_for(args)
+    values = args.get("values")
+    if not isinstance(values, dict):
+        raise rpc.RpcError("values must be an object")
+    changed = s.apply_remote(values)
+    log("[rpc] settings.set %s: %s" % (scope, changed))
+    return {"scope": scope, "changed": changed, "values": s.all(), "seq": s.seq}
+
+def _h_settings_reset(args, msg):
+    scope, s = _settings_for(args)
+    values = s.reset()
+    s.apply_remote(values)              # the product hears about it like any app change
+    log("[rpc] settings.reset %s" % scope)
+    return {"scope": scope, "values": values, "seq": s.seq}
+
+def _do_provision(ssid, password, script_url, module_firmware, product_id,
+                  config_defaults=None):
     """Two situations, one op:
     - On the setup AP: hand the credentials to run_ap_provisioning()'s loop,
       which stops the AP, verifies the join, saves and hard-resets (as today).
@@ -827,6 +861,7 @@ def _do_provision(ssid, password, script_url, module_firmware, product_id):
         pending["script_url"]      = script_url or ""
         pending["module_firmware"] = module_firmware
         pending["product_id"]      = product_id
+        pending["config_defaults"] = config_defaults
         pending["ready"]           = True
         log(f"[ap] Credentials received for '{ssid}' "
             f"(module_firmware: {'yes' if module_firmware else 'none'}, "
@@ -842,6 +877,7 @@ def _do_provision(ssid, password, script_url, module_firmware, product_id):
     if not save_wifi_credentials(ssid, password or "", script_url,
                                  module_firmware, product_id):
         return {"ok": False, "error": "cannot save (filesystem read-only, no store)"}
+    _install_settings(config_defaults)
     event(f"[CFG] product switch via app -> {product_id or script_url.rsplit('/', 1)[-1]}")
     def _switch():
         time.sleep(0.5)                  # let the reply leave the radio first
@@ -851,6 +887,18 @@ def _do_provision(ssid, password, script_url, module_firmware, product_id):
     rpc.defer(_switch)
     return {"accepted": True, "mode": "switch", "rebooting": True}
 
+def _install_settings(config_defaults):
+    """After the credentials are saved: write the product's defaults so device
+    and app agree from first boot (same product keeps values, a different one
+    starts fresh). Best-effort; an older app sends none and the product's own
+    c.settings.defaults() fills in."""
+    try:
+        ok = nk.install_defaults(nk.product_tag(), config_defaults or {})
+        log("[settings] defaults installed for %s (%d key(s), ok=%s)"
+            % (nk.product_tag(), len(config_defaults or {}), ok))
+    except Exception as e:
+        log(f"[settings] install failed (ignored): {e!r}")
+
 def register_ops():
     """Register every op on the brain's dispatcher (idempotent)."""
     d = rpc.dispatcher()
@@ -858,12 +906,15 @@ def register_ops():
     d.register("status", _h_status)
     d.register("reboot", _h_reboot)
     d.register("factory_reset", _h_factory_reset)
+    d.register("settings.get", _h_settings_get)
+    d.register("settings.set", _h_settings_set)
+    d.register("settings.reset", _h_settings_reset)
     d.register("roles.assign", lambda a, m: _do_roles_assign(
         a.get("role_id"), a.get("module_type") or "", list(a.get("exclude") or [])))
     d.register("firmware.check", lambda a, m: _do_firmware_check(a.get("module_firmware")))
     d.register("provision", lambda a, m: _do_provision(
         a.get("ssid"), a.get("password"), a.get("script_url"),
-        a.get("module_firmware"), a.get("product_id")))
+        a.get("module_firmware"), a.get("product_id"), a.get("config_defaults")))
 
 def _json(request, obj):
     return Response(request, json.dumps(obj), content_type="application/json")
@@ -887,6 +938,8 @@ def register_routes(server):
         mf_raw = (_url_decode(form.get("module_firmware") or "").strip()
                   if form else "")
         pid  = _url_decode(form.get("product_id") or "").strip() if form else ""
+        cd_raw = (_url_decode(form.get("config_defaults") or "").strip()
+                  if form else "")
 
         if not ssid:
             # No network name entered — show the form again
@@ -902,9 +955,16 @@ def register_routes(server):
             except Exception as e:
                 log(f"[ap] module_firmware parse failed ({e}) — ignoring")
 
+        config_defaults = None
+        if cd_raw:
+            try:
+                config_defaults = json.loads(cd_raw)
+            except Exception as e:
+                log(f"[ap] config_defaults parse failed ({e}) — ignoring")
+
         # Hand over to the provisioning loop (adapter over the `provision` op);
         # it acts after the success page has been delivered to the browser.
-        _do_provision(ssid, pw, url, module_firmware, pid or None)
+        _do_provision(ssid, pw, url, module_firmware, pid or None, config_defaults)
         return Response(request, HTML_SUCCESS, content_type="text/html")
 
     # ── Firmware version check (v0.10) ───────────────────────────────────────
@@ -1083,6 +1143,7 @@ def run_ap_provisioning():
             # A hardware reset brings the radio up clean in STA-only mode, and
             # main() will then connect + download on the fresh boot.
             if save_wifi_credentials(ssid, pw, su, mf, pid):
+                _install_settings(pending["config_defaults"])
                 log("[boot] Credentials saved — hardware reset into WiFi mode")
                 time.sleep(2)  # let the success page flush to the browser
                 microcontroller.reset()
@@ -1852,9 +1913,22 @@ def start_app_channel():
     try:
         register_ops()
         rpc.start_http(socketpool.SocketPool(wifi.radio), port=80, logfn=log)
-        rpc.start_mdns(80, log)
+        # mDNS is opt-in until proven over hours: the first long run with it on
+        # (17 Sep 2026) ended in a hard hang after ~30 min idle — no serial, no
+        # network, unrecoverable without a power cycle. settings.toml:
+        # NOKNOK_MDNS = 1 to advertise noknok-XXXX.local.
+        if str(nk.env("NOKNOK_MDNS", "0")) == "1":
+            rpc.start_mdns(80, log)
+        else:
+            log("[mdns] off (NOKNOK_MDNS != 1) — reach the brain by IP")
+        # Bench watchdog (NOKNOK_WATCHDOG = 1): a hang anywhere in the product
+        # or the channel becomes a reset, recorded as a [WDT] event at the next
+        # boot. Not for the field — a product that sleeps > 8 s without a
+        # module read would trip it.
+        if str(nk.env("NOKNOK_WATCHDOG", "0")) == "1":
+            rpc.arm_watchdog(8, log)
         nk.set_service_hook(rpc.service)
-        log("[rpc] app channel up — http://%s/rpc  (%s.local)"
+        log("[rpc] app channel up — http://%s/rpc  (%s)"
             % (wifi.radio.ipv4_address, rpc.device_name()))
     except Exception as e:
         log(f"[rpc] app channel NOT started (ignored): {e!r}")
@@ -1923,6 +1997,11 @@ def main():
         supervisor.reload()
     log_new_boot()
     log("[boot] noknok Pico W — starting")
+    try:
+        if microcontroller.cpu.reset_reason == microcontroller.ResetReason.WATCHDOG:
+            event("[WDT] watchdog reset — the previous run hung (bench watchdog)")
+    except Exception:
+        pass
     # DEV-18: say which filesystem mode boot.py chose, and sweep any .tmp left
     # by a write that a power cut interrupted (the real file is untouched).
     log("[fs] CIRCUITPY drive %s — filesystem %s — runtime store: %s" % (
