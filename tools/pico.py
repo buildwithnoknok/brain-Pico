@@ -5,7 +5,8 @@
 # pico.py — drive a CircuitPython Pico from the Pi4 bench host over its USB serial
 # REPL, so bench scripts can be run and files pushed without Thonny or a PC.
 #
-#   pico.py run  <local.py>           run a script on the Pico, stream its output
+#   pico.py run  <local.py> [secs]    run a script on the Pico, stream its output
+#                                     (secs = wait limit, default 120; soaks pass more)
 #   pico.py exec "<python>"           run a one-liner / snippet
 #   pico.py put  <local> [<remote>]   copy a file onto the Pico's filesystem
 #   pico.py ls   [<dir>]              list the Pico's filesystem
@@ -106,12 +107,14 @@ class Pico:
         return out, err
 
     # ── commands ───────────────────────────────────────────────────────────
-    def run(self, path):
+    def run(self, path, timeout=120.0):
+        """Run a script; `timeout` (s) bounds how long we wait for it to finish.
+        Long bench runs (soaks) pass a larger value: ./pico.py run f.py 4500"""
         with open(path, 'rb') as f:
             code = f.read()
         self.enter_raw()
         try:
-            out, err = self.exec_raw(code, echo=True)
+            out, err = self.exec_raw(code, echo=True, timeout=float(timeout))
         finally:
             self.exit_raw()
         return 1 if err else 0
@@ -233,7 +236,7 @@ def main(argv):
         return 2
     cmd, args = argv[1], argv[2:]
     p = Pico()
-    if cmd == 'run':   return p.run(args[0])
+    if cmd == 'run':   return p.run(*args)
     if cmd == 'exec':  return p.exec(args[0])
     if cmd == 'put':   return p.put(*args)
     if cmd == 'ls':    return p.ls(*args)
