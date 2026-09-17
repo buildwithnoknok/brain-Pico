@@ -69,7 +69,7 @@ def rpc(msg, slow=False):
     reply = json.loads(rest.decode())
     return reply, time.monotonic() - t
 
-stats = {"n": 0, "ok": 0, "fail": 0, "slow_n": 0, "slow_ok": 0,
+stats = {"n": 0, "ok": 0, "fail": 0, "slow_n": 0, "slow_ok": 0, "slow_fail": 0,
          "lat_sum": 0.0, "lat_max": 0.0, "slow_lat_max": 0.0,
          "outage_max": 0.0, "outages": 0}
 last_ok = time.monotonic()
@@ -104,11 +104,17 @@ while time.monotonic() < end:
             in_outage = False
         last_ok = time.monotonic()
     except Exception as e:
+        if slow:
+            # Expected: the server drops a client that stalls longer than its
+            # socket_timeout. Counted, never judged — the number that matters
+            # is what the stall cost the Pico's loop (its own log).
+            stats["slow_fail"] += 1
+            continue
         stats["fail"] += 1
         if not in_outage:
             stats["outages"] += 1
             in_outage = True
-        log("FAIL #%d (%s): %r" % (seq, "slow" if slow else "normal", e))
+        log("FAIL #%d: %r" % (seq, e))
     if time.monotonic() >= next_stats:
         next_stats += STATS_EVERY
         fast = max(1, stats["ok"] - stats["slow_ok"])
@@ -121,13 +127,13 @@ while time.monotonic() < end:
 if in_outage:
     stats["outage_max"] = max(stats["outage_max"], time.monotonic() - last_ok)
 fast = max(1, stats["ok"] - stats["slow_ok"])
-fail_pct = 100.0 * stats["fail"] / max(1, stats["n"])
+fail_pct = 100.0 * stats["fail"] / max(1, stats["n"] - stats["slow_n"])
 verdict = []
 if stats["outage_max"] > OUTAGE_FAIL_S: verdict.append("outage %.0f s" % stats["outage_max"])
 if fail_pct >= 1.0:                      verdict.append("%.1f %% failures" % fail_pct)
-log("FINAL n=%d ok=%d fail=%d (%.2f %%) avg=%.0fms max=%.0fms | slow ok=%d/%d max=%.1fs | outages=%d longest=%.1fs"
+log("FINAL n=%d ok=%d fail=%d (%.2f %%) avg=%.0fms max=%.0fms | slow ok=%d dropped=%d of %d max=%.1fs | outages=%d longest=%.1fs"
     % (stats["n"], stats["ok"], stats["fail"], fail_pct, 1000 * stats["lat_sum"] / fast,
-       1000 * stats["lat_max"], stats["slow_ok"], stats["slow_n"], stats["slow_lat_max"],
-       stats["outages"], stats["outage_max"]))
+       1000 * stats["lat_max"], stats["slow_ok"], stats["slow_fail"], stats["slow_n"],
+       stats["slow_lat_max"], stats["outages"], stats["outage_max"]))
 log("CLIENT %s" % ("PASS" if not verdict else "FAIL: " + "; ".join(verdict)))
 sys.exit(0 if not verdict else 1)
