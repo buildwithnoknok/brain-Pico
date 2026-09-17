@@ -1,4 +1,4 @@
-# noknok.py  v1.7
+# noknok.py  v1.8
 # CircuitPython library for the noknok modular ecosystem
 # Raspberry Pi Pico — I2C master ("Conductor")
 #
@@ -39,6 +39,13 @@
 #             - enumeration gives a known module its previous address, so
 #               the state stops changing from boot to boot.
 #             Pins come from settings.toml (NOKNOK_I2C_SDA/SCL/FREQ).
+# v1.8 (Sue): DEV-34 — reachable by the app while the product runs. Every
+#             driver read/write and Conductor.sleep() call _service(), the
+#             hook code.py points at noknok_rpc.service (non-blocking,
+#             throttled; ~1 ms idle, bench-soaked 17 Sep 2026). conductor()
+#             exposes the product's Conductor to the RPC handlers; the
+#             factory-reset wipe is a module function shared with the
+#             `factory_reset` op. No API removed; makers add zero lines.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -56,10 +63,45 @@ import time
 import json
 import os
 
+__version__ = "1.8"
+
 try:
     import storage            # CircuitPython only; absent on a host Python
 except ImportError:
     storage = None
+
+
+# ── App channel servicing hook (DEV-34) ───────────────────────────────────────
+# After setup the maker's product loop is the only Python running, so the app
+# can only be answered when the product gives us a moment. Every module driver
+# calls _service() at the top of its read/write — before it locks the bus — and
+# Conductor.sleep() calls it while sleeping. code.py installs the real pump
+# (noknok_rpc.service: non-blocking, throttled to 50 ms, ~1 ms when idle) with
+# set_service_hook(); without a hook this is a no-op, so bench scripts and
+# offline products pay nothing. Makers add zero lines.
+
+_service_hook = None
+
+def set_service_hook(fn):
+    """Install (or clear with None) the function the drivers call to service
+    the app channel between module transactions."""
+    global _service_hook
+    _service_hook = fn
+
+def _service():
+    if _service_hook is not None:
+        try:
+            _service_hook()
+        except Exception:
+            pass                    # the product loop must never die for the radio
+
+_last_conductor = None
+
+def conductor():
+    """The most recently created Conductor, or None. Lets the RPC handlers in
+    code.py reach the product's own Conductor (created inside product.py)
+    without creating a second one on the same pins."""
+    return _last_conductor
 
 
 # ── settings.toml — the one maker-facing config file ──────────────────────────
@@ -629,6 +671,8 @@ class Conductor:
         self.i2c = None
         self._init_i2c()   # tolerant: warns + leaves i2c=None if no pull-ups / no bus
         store().attach(self.i2c)   # the Store (FRAM at 0x50 / nvm) shares this bus
+        global _last_conductor
+        _last_conductor = self     # see conductor()
         self.buzzer    = []    # NoknokBuzzer instances, indexed by discovery order
         self.knob      = []    # NoknokKnob instances
         self.ledbutton = []    # NoknokLedButton instances
@@ -636,6 +680,22 @@ class Conductor:
         self.leds      = []    # NoknokLEDs (USB) instances, populated by enumerate_usb()
         self.role      = {}    # role_name → module object, populated by load_roles()
         self._registry = {}    # identity (I2C uid_hex / USB serial) → module object
+
+    # ── Cooperative sleep (DEV-34) ────────────────────────────────────────────
+
+    def sleep(self, seconds):
+        """Sleep like time.sleep(), but keep answering the app meanwhile.
+        A product that polls modules is serviced implicitly (every read/write
+        pumps the channel); one that idles in a long time.sleep() polls nothing,
+        so use c.sleep(s) there instead. Optional — forgetting it only delays
+        replies until the next module read."""
+        end = time.monotonic() + seconds
+        while True:
+            _service()
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            time.sleep(min(0.02, left))
 
     # ── Low-level I2C ─────────────────────────────────────────────────────────
 
@@ -657,6 +717,7 @@ class Conductor:
     def _read(self, addr, n):
         if self.i2c is None:
             return None
+        _service()
         buf = bytearray(n)
         while not self.i2c.try_lock():
             pass
@@ -671,6 +732,7 @@ class Conductor:
     def _write(self, addr, data):
         if self.i2c is None:
             return False
+        _service()
         while not self.i2c.try_lock():
             pass
         try:
@@ -1825,18 +1887,26 @@ class Conductor:
 
     def _do_factory_reset(self):
         """Wipe credentials/state and reboot into the provisioning AP."""
-        print("[reset] Factory reset triggered — wiping credentials and state.")
-        st = store()
-        for key in self._RESET_KEYS:          # Store first: power-safe on FRAM
-            st.delete(key)
-        # One write window for all of them (DEV-18); absent files are ignored.
-        n = remove(*self._RESET_FILES)
-        print(f"[reset] removed {n} file(s)")
         # Let the confirmation beep/flash finish before the board drops out.
-        time.sleep(0.8)
-        print("[reset] rebooting...")
-        import microcontroller
-        microcontroller.reset()
+        factory_reset(delay=0.8)
+
+
+def factory_reset(delay=0.0):
+    """Wipe credentials, roles and settings (Store + files) and hard-reset into
+    the provisioning AP. Shared by the knob-hold gesture and the app's
+    `factory_reset` op (DEV-34) so both wipe exactly the same things."""
+    print("[reset] Factory reset triggered — wiping credentials and state.")
+    st = store()
+    for key in Conductor._RESET_KEYS:         # Store first: power-safe on FRAM
+        st.delete(key)
+    # One write window for all of them (DEV-18); absent files are ignored.
+    n = remove(*Conductor._RESET_FILES)
+    print(f"[reset] removed {n} file(s)")
+    if delay:
+        time.sleep(delay)
+    print("[reset] rebooting...")
+    import microcontroller
+    microcontroller.reset()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1870,6 +1940,7 @@ class NoknokBuzzer:
 
     def _send(self, data):
         """Send bytes to the module. Returns True on success, False on I2C error."""
+        _service()                      # DEV-34: pump the app channel (before the lock)
         while not self.i2c.try_lock():
             pass
         try:
@@ -1882,6 +1953,7 @@ class NoknokBuzzer:
 
     def _read(self, n=1):
         """Read n bytes from the module. Returns bytearray or None on I2C error."""
+        _service()                      # DEV-34: pump the app channel (before the lock)
         buf = bytearray(n)
         while not self.i2c.try_lock():
             pass
@@ -1986,6 +2058,7 @@ class NoknokKnob:
 
     def _send(self, data):
         """Send bytes to the module. Returns True on success, False on I2C error."""
+        _service()                      # DEV-34: pump the app channel (before the lock)
         while not self.i2c.try_lock():
             pass
         try:
@@ -1998,6 +2071,7 @@ class NoknokKnob:
 
     def _read_raw(self, n=4):
         """Read n bytes from the module. Returns bytearray or None on I2C error."""
+        _service()                      # DEV-34: pump the app channel (before the lock)
         buf = bytearray(n)
         while not self.i2c.try_lock():
             pass
@@ -2116,6 +2190,7 @@ class NoknokLedButton:
 
     def _send(self, data):
         """Send bytes to the module. Returns True on success, False on I2C error."""
+        _service()                      # DEV-34: pump the app channel (before the lock)
         while not self.i2c.try_lock():
             pass
         try:
@@ -2128,6 +2203,7 @@ class NoknokLedButton:
 
     def _read_raw(self, n=2):
         """Read n bytes from the module. Returns bytearray or None on I2C error."""
+        _service()                      # DEV-34: pump the app channel (before the lock)
         buf = bytearray(n)
         while not self.i2c.try_lock():
             pass
@@ -2588,6 +2664,7 @@ class NoknokDisplay:
 
     def _send(self, data):
         """Send bytes to the module. Returns True on success, False on I2C error."""
+        _service()                      # DEV-34: pump the app channel (before the lock)
         while not self.i2c.try_lock():
             pass
         try:
@@ -2600,6 +2677,7 @@ class NoknokDisplay:
 
     def _read_raw(self, n=2):
         """Read n bytes from the module. Returns bytearray or None on I2C error."""
+        _service()                      # DEV-34: pump the app channel (before the lock)
         buf = bytearray(n)
         while not self.i2c.try_lock():
             pass

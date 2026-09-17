@@ -1,5 +1,27 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.16 (no filesystem writes while a product runs — DEV-18)
+# Version: 0.17 (reachable by the app after setup — DEV-34 dispatcher + /rpc)
+#
+# v0.17 changes (Sue): DEV-34 phase 1, the protocol dispatcher.
+#   - One message protocol (noknok_rpc.py, Confluence 113868802 §2): every
+#     handler is an op on a transport-agnostic Dispatcher — hello, status,
+#     roles.assign, firmware.check, provision, reboot, factory_reset (the
+#     settings.* ops arrive with c.settings). The HTTP routes the app uses
+#     today (/connect, /roles/assign, /firmware/check) are thin adapters over
+#     the same functions; behaviour unchanged.
+#   - POST /rpc served on the setup AP AND on home WiFi for the product's whole
+#     lifetime, advertised as noknok-XXXX.local (mDNS). The app can finally
+#     reach a provisioned brain: hello answers with state/product/versions,
+#     status with the event history and crash strikes. Servicing is implicit —
+#     noknok.py's drivers pump the channel between module transactions
+#     (noknok.set_service_hook), so product.py needs no change; the parked
+#     safe_idle loop pumps it too. Soak-proven 17 Sep 2026 (DEV-34 comment
+#     10829): ~1 ms idle, no hang after a Conductor exists.
+#   - provision over home WiFi = product switch: save the new script_url
+#     (+ product_id), drop product.py and hard-reset; the normal boot path
+#     downloads the new product BEFORE any Conductor exists (the DEV-32 rule).
+#     No download ever happens from a handler.
+#   - /connect and provision accept an optional product_id (the manifest id),
+#     kept in wifi.json — the app needs it to fetch the right config_schema.
 #
 # v0.16 changes (Sue): DEV-18. Bench-proven 15 Sep 2026 that on RP2 flash NO
 #   FAT write can be made power-safe: the driver rewrites whole 4 KB blocks in
@@ -227,6 +249,9 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 import noknok as nk          # filesystem policy helpers (DEV-18) + settings.toml
+import noknok_rpc as rpc     # Device Protocol v1: dispatcher + /rpc carrier (DEV-34)
+
+CODE_VERSION = "0.17"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -384,7 +409,7 @@ WIFI_TIMEOUT_S        = 15
 
 # Shared state: the /connect handler fills this, the main loop acts on it.
 pending = {"ssid": None, "password": None, "script_url": None,
-           "module_firmware": None, "ready": False}
+           "module_firmware": None, "product_id": None, "ready": False}
 
 # ── Role assignment: lazily-created, cached Conductor ───────────────────────────
 # The role endpoints need a Conductor to talk to the I2C modules. Enumeration
@@ -502,13 +527,16 @@ def load_wifi_credentials():
         return creds
     return None
 
-def save_wifi_credentials(ssid, password, script_url=None, module_firmware=None):
+def save_wifi_credentials(ssid, password, script_url=None, module_firmware=None,
+                          product_id=None):
     """Store copy first (power-safe on FRAM), then the file (atomic write into
     /data). Returns False only when NEITHER took it — e.g. the CIRCUITPY drive
     is visible to a PC (settings.toml NOKNOK_USB_DRIVE = 1) and there is no
-    FRAM; the caller must not pretend provisioning worked."""
+    FRAM; the caller must not pretend provisioning worked.
+    product_id (the manifest id, optional — older apps don't send it) rides
+    along so the app can identify the installed product later (DEV-34)."""
     creds = {"ssid": ssid, "password": password, "script_url": script_url,
-             "module_firmware": module_firmware}
+             "module_firmware": module_firmware, "product_id": product_id}
     in_store = nk.store().set(WIFI_STORE_KEY, creds)
     in_file  = nk.write_json_atomic(WIFI_CREDENTIALS_FILE, creds)
     log("[storage] credentials saved (store=%s file=%s)" % (in_store, in_file)
@@ -563,7 +591,18 @@ def product_script_exists():
 # ── WiFi ──────────────────────────────────────────────────────────────────────
 
 def connect_wifi(ssid, password):
-    """Join a WiFi network. Returns True on success."""
+    """Join a WiFi network. Returns True on success.
+
+    gc.collect() first — NOT optional. Bench-proven 17 Sep 2026 (CircuitPython
+    10.3.0, Pico 2 W): right after a cold boot the compile of code.py +
+    noknok.py leaves the heap full of uncollected garbage (~180 KB free,
+    fragmented), the WiFi driver's allocation fails silently and every join
+    times out with "Unknown failure 1" — retries, radio power-cycling and
+    waiting do not help because nothing allocates while a join waits, so the
+    automatic GC never runs. One collect (→ ~360 KB free) and the join takes
+    3.6 s. Without this every power-on of a shipped brain came up offline."""
+    import gc
+    gc.collect()
     log(f"[wifi] Connecting to '{ssid}'...")
     try:
         wifi.radio.connect(ssid, password, timeout=WIFI_TIMEOUT_S)
@@ -644,8 +683,195 @@ def download_and_save_script(script_url=None):
 
 # ── HTTP routes ────────────────────────────────────────────────────────────────
 
+# ── Message handlers — the ops (DEV-34) ───────────────────────────────────────
+# Each takes plain Python values and returns the reply dict; the HTTP routes
+# below and the /rpc dispatcher both call them, so the app gets the same
+# answer whichever door it uses. None of them touches the network as a client
+# (the DEV-32 rule: no download after a Conductor has existed).
+
+def _device_state():
+    if not load_wifi_credentials():
+        return "unprovisioned"
+    if product_script_exists() and _crash_count() >= CRASH_MAX:
+        return "parked"
+    return "provisioned"
+
+def _h_hello(args, msg):
+    """Who am I, what am I running, can you reach me later. Open op."""
+    creds = load_wifi_credentials() or {}
+    url = creds.get("script_url") or ""
+    try:
+        import noknok_usb
+        usb_v = getattr(noknok_usb, "__version__", None)
+    except Exception:
+        usb_v = None
+    return {
+        "device": "".join("%02x" % b for b in microcontroller.cpu.uid),
+        "name": rpc.device_name(),
+        "state": _device_state(),
+        "product": {"id": creds.get("product_id"),
+                    "script": url.rsplit("/", 1)[-1] if url else None,
+                    "script_url": url or None},
+        "versions": {"code": CODE_VERSION,
+                     "noknok": getattr(nk, "__version__", None),
+                     "noknok_usb": usb_v,
+                     "rpc": rpc.__version__,
+                     "circuitpython": sys.version.split(" on ")[0]},
+        "online": bool(wifi.radio.connected),
+        "ap": bool(wifi.radio.ap_active),
+        "carrier": "wifi",
+        "uptime": round(time.monotonic(), 1),
+        "ops": rpc.dispatcher().ops(),
+    }
+
+def _h_status(args, msg):
+    """Phase-1 subset of `status` (DEV-36 adds per-module firmware state):
+    event history, crash strikes, storage mode, memory. `since` (int) skips
+    the first N events so the app can page."""
+    import gc
+    ev = events()
+    since = int(args.get("since") or 0)
+    c = nk.conductor()
+    modules = []
+    if c is not None:
+        for m in c._registry.values():
+            modules.append({"type": type(m).__name__.replace("Noknok", "").lower(),
+                            "uid": getattr(m, "_uid_hex", None) or getattr(m, "serial", None),
+                            "fw": getattr(m, "firmware_version", None)})
+    return {
+        "state": _device_state(),
+        "strikes": _crash_count(),
+        "store": nk.store().backend,
+        "drive_visible": nk.usb_drive_visible(),
+        "mem_free": gc.mem_free(),
+        "ip": str(wifi.radio.ipv4_address) if wifi.radio.connected else None,
+        "modules": modules,
+        "events": ev[since:],
+        "events_total": len(ev),
+    }
+
+def _h_reboot(args, msg):
+    """Reply first, reset after the response has gone out (deferred)."""
+    log("[rpc] reboot requested by the app")
+    def _reboot():
+        time.sleep(0.5)                  # let the reply leave the radio first
+        microcontroller.reset()
+    rpc.defer(_reboot)
+    return {"rebooting": True}
+
+def _h_factory_reset(args, msg):
+    """Same wipe as the knob-hold gesture (noknok.factory_reset), deferred so
+    the app gets its reply before the brain drops off the network."""
+    log("[rpc] factory reset requested by the app")
+    event("[RESET] factory reset via app")
+    rpc.defer(lambda: nk.factory_reset(delay=0.5))
+    return {"resetting": True}
+
+def _do_roles_assign(role_id, module_type, exclude):
+    """Detect which module the customer touches and (if role_id) save the
+    role in one go. Blocks up to ~20 s. Returns the reply dict."""
+    log(f"[roles] assign role_id='{role_id}' type='{module_type}' "
+        f"exclude={len(exclude)} module(s)")
+    c = get_conductor()
+    if c is None:                       # no bus / noknok.py — degrade, never 500
+        return {"timeout": True}
+    try:
+        uid = c.detect_interaction(module_type, timeout=20, exclude=exclude)
+    except Exception as e:
+        log(f"[roles] detect_interaction error: {e}")
+        uid = None
+    if not uid:
+        log(f"[roles] assign timed out for type='{module_type}'")
+        return {"timeout": True}
+    saved = False
+    if role_id:
+        try:
+            saved = bool(c.append_role(role_id, uid))
+        except Exception as e:
+            log(f"[roles] append_role error: {e}")
+    log(f"[roles] assigned role_id='{role_id}' uid={uid} saved={saved}")
+    return {"uid": uid, "type": module_type, "saved": saved}
+
+def _do_firmware_check(module_firmware):
+    """Installed firmware per module. At AP time there is no internet, so this
+    cannot reach the registry and only reports what is installed; the real
+    check is the headless post-WiFi pass (resolved:false says so)."""
+    c = get_conductor()
+    if c is None:
+        return {"update_needed": False, "resolved": False, "modules": []}
+    try:
+        report = c.firmware_report(module_firmware or {})
+    except Exception as e:
+        log(f"[fw] firmware check error: {e}")
+        report = []
+    slim = [{"type": r["type"], "installed": r["installed"],
+             "required": r["required"], "needs_update": r["needs_update"]}
+            for r in report]
+    log(f"[fw] firmware check — {len(slim)} module(s) present; version "
+        f"resolution needs internet, deferred to the post-WiFi pass")
+    return {"update_needed": any(r["needs_update"] for r in report),
+            "resolved": False, "modules": slim}
+
+def _do_provision(ssid, password, script_url, module_firmware, product_id):
+    """Two situations, one op:
+    - On the setup AP: hand the credentials to run_ap_provisioning()'s loop,
+      which stops the AP, verifies the join, saves and hard-resets (as today).
+    - On home WiFi (product running): a product switch. ssid/password may be
+      omitted to keep the current network. Save, drop product.py, hard-reset;
+      the boot path downloads the new script before any Conductor exists."""
+    if wifi.radio.ap_active:
+        if not ssid:
+            return {"ok": False, "error": "ssid required"}
+        pending["ssid"]            = ssid
+        pending["password"]        = password or ""
+        pending["script_url"]      = script_url or ""
+        pending["module_firmware"] = module_firmware
+        pending["product_id"]      = product_id
+        pending["ready"]           = True
+        log(f"[ap] Credentials received for '{ssid}' "
+            f"(module_firmware: {'yes' if module_firmware else 'none'}, "
+            f"product_id: {product_id or 'none'})")
+        return {"accepted": True, "mode": "setup"}
+    creds = load_wifi_credentials() or {}
+    if not ssid:
+        ssid, password = creds.get("ssid"), creds.get("password")
+    if not ssid:
+        return {"ok": False, "error": "ssid required"}
+    if not script_url:
+        return {"ok": False, "error": "script_url required"}
+    if not save_wifi_credentials(ssid, password or "", script_url,
+                                 module_firmware, product_id):
+        return {"ok": False, "error": "cannot save (filesystem read-only, no store)"}
+    event(f"[CFG] product switch via app -> {product_id or script_url.rsplit('/', 1)[-1]}")
+    def _switch():
+        time.sleep(0.5)                  # let the reply leave the radio first
+        nk.remove(PRODUCT_SCRIPT_FILE, _LEGACY_PRODUCT_FILE)   # forces the download
+        _set_crash_count(0)
+        microcontroller.reset()
+    rpc.defer(_switch)
+    return {"accepted": True, "mode": "switch", "rebooting": True}
+
+def register_ops():
+    """Register every op on the brain's dispatcher (idempotent)."""
+    d = rpc.dispatcher()
+    d.register("hello", _h_hello)
+    d.register("status", _h_status)
+    d.register("reboot", _h_reboot)
+    d.register("factory_reset", _h_factory_reset)
+    d.register("roles.assign", lambda a, m: _do_roles_assign(
+        a.get("role_id"), a.get("module_type") or "", list(a.get("exclude") or [])))
+    d.register("firmware.check", lambda a, m: _do_firmware_check(a.get("module_firmware")))
+    d.register("provision", lambda a, m: _do_provision(
+        a.get("ssid"), a.get("password"), a.get("script_url"),
+        a.get("module_firmware"), a.get("product_id")))
+
+def _json(request, obj):
+    return Response(request, json.dumps(obj), content_type="application/json")
+
+
 def register_routes(server):
-    """Attach all routes to the given adafruit_httpserver Server."""
+    """Attach the legacy HTTP routes to the given adafruit_httpserver Server.
+    They are adapters: form fields in, the same handler functions as /rpc."""
 
     @server.route("/")
     def _root(request: Request):
@@ -660,6 +886,7 @@ def register_routes(server):
         url  = _url_decode(form.get("script_url") or "").strip() if form else ""
         mf_raw = (_url_decode(form.get("module_firmware") or "").strip()
                   if form else "")
+        pid  = _url_decode(form.get("product_id") or "").strip() if form else ""
 
         if not ssid:
             # No network name entered — show the form again
@@ -675,15 +902,9 @@ def register_routes(server):
             except Exception as e:
                 log(f"[ap] module_firmware parse failed ({e}) — ignoring")
 
-        # Store credentials; the main loop will act on them after the
-        # success page has been delivered to the browser.
-        pending["ssid"]            = ssid
-        pending["password"]        = pw
-        pending["script_url"]      = url
-        pending["module_firmware"] = module_firmware
-        pending["ready"]           = True
-        log(f"[ap] Credentials received for '{ssid}' "
-            f"(module_firmware: {'yes' if module_firmware else 'none'})")
+        # Hand over to the provisioning loop (adapter over the `provision` op);
+        # it acts after the success page has been delivered to the browser.
+        _do_provision(ssid, pw, url, module_firmware, pid or None)
         return Response(request, HTML_SUCCESS, content_type="text/html")
 
     # ── Firmware version check (v0.10) ───────────────────────────────────────
@@ -700,36 +921,7 @@ def register_routes(server):
             module_firmware = json.loads(mf_raw) if mf_raw else {}
         except Exception:
             module_firmware = {}
-
-        c = get_conductor()
-        if c is None:
-            return Response(request,
-                            json.dumps({"update_needed": False, "modules": []}),
-                            content_type="application/json")
-        try:
-            report = c.firmware_report(module_firmware)
-        except Exception as e:
-            log(f"[fw] /firmware/check error: {e}")
-            report = []
-
-        # NOTE: this runs while the phone is on the noknok-setup AP, so the Pico
-        # has NO internet and cannot reach the module registry to find out what
-        # the current firmware is. It can only report what is installed. So
-        # update_needed is always False here and `resolved` says why — the real
-        # check runs headlessly after the WiFi join, in check_and_flash_modules().
-        # (Manifests carry a floor, not a version, so firmware_report() finds no
-        # required version and reports nothing pending — the same answer.)
-        update_needed = any(r["needs_update"] for r in report)
-        slim = [{"type": r["type"], "installed": r["installed"],
-                 "required": r["required"], "needs_update": r["needs_update"]}
-                for r in report]
-        log(f"[fw] /firmware/check — {len(slim)} module(s) present; version "
-            f"resolution needs internet, deferred to the post-WiFi pass")
-        return Response(request,
-                        json.dumps({"update_needed": update_needed,
-                                    "resolved": False,
-                                    "modules": slim}),
-                        content_type="application/json")
+        return _json(request, _do_firmware_check(module_firmware))
 
     # ── Role assignment endpoints (v0.8) ─────────────────────────────────────
     # Called by the noknok app BEFORE /connect, while the phone is on the
@@ -753,28 +945,10 @@ def register_routes(server):
         exclude = [u.strip() for u in exclude_raw.split(",") if u.strip()] \
             if exclude_raw else []
 
-        log(f"[roles] /roles/detect type='{module_type}' "
-            f"exclude={len(exclude)} module(s)")
-
-        c = get_conductor()
-        if c is None:
-            # No bus / noknok.py — degrade gracefully, never 500.
-            return Response(request, json.dumps({"timeout": True}),
-                            content_type="application/json")
-
-        try:
-            uid = c.detect_interaction(module_type, timeout=20, exclude=exclude)
-        except Exception as e:
-            log(f"[roles] detect_interaction error: {e}")
-            uid = None
-
-        if uid:
-            log(f"[roles] detected uid={uid} for type='{module_type}'")
-            body = json.dumps({"uid": uid, "type": module_type})
-        else:
-            log(f"[roles] detect timed out for type='{module_type}'")
-            body = json.dumps({"timeout": True})
-        return Response(request, body, content_type="application/json")
+        # Detect only (no role_id) — the legacy two-step flow.
+        res = _do_roles_assign(None, module_type, exclude)
+        res.pop("saved", None)
+        return _json(request, res)
 
     @server.route("/roles/save", POST)
     def _roles_save(request: Request):
@@ -828,35 +1002,7 @@ def register_routes(server):
         exclude = [u.strip() for u in exclude_raw.split(",") if u.strip()] \
             if exclude_raw else []
 
-        log(f"[roles] /roles/assign role_id='{role_id}' type='{module_type}' "
-            f"exclude={len(exclude)} module(s)")
-
-        c = get_conductor()
-        if c is None:
-            return Response(request, json.dumps({"timeout": True}),
-                            content_type="application/json")
-
-        try:
-            uid = c.detect_interaction(module_type, timeout=20, exclude=exclude)
-        except Exception as e:
-            log(f"[roles] detect_interaction error: {e}")
-            uid = None
-
-        if not uid:
-            log(f"[roles] assign timed out for type='{module_type}'")
-            return Response(request, json.dumps({"timeout": True}),
-                            content_type="application/json")
-
-        saved = False
-        if role_id:
-            try:
-                saved = bool(c.append_role(role_id, uid))
-            except Exception as e:
-                log(f"[roles] append_role error: {e}")
-                saved = False
-        log(f"[roles] assigned role_id='{role_id}' uid={uid} saved={saved}")
-        return Response(request, json.dumps({"uid": uid, "saved": saved}),
-                        content_type="application/json")
+        return _json(request, _do_roles_assign(role_id, module_type, exclude))
 
     # Captive-portal probe paths: serving the setup page (instead of the
     # expected 204/empty) makes iOS/Android/Windows show a "Sign in to
@@ -886,22 +1032,19 @@ def run_ap_provisioning():
         log(f"[ap] Hotspot started: '{AP_SSID}' — http://{ap_ip}")
 
         pool   = socketpool.SocketPool(wifi.radio)
-        server = Server(pool, debug=True)
+        # One listener on port 80 (plain http://192.168.4.1 must work): the
+        # /rpc carrier plus the legacy routes and captive-portal pages on the
+        # same adafruit_httpserver Server.
+        register_ops()
+        server = rpc.start_http(pool, port=80, logfn=log).server
         register_routes(server)
-        # Bind to 0.0.0.0 (all interfaces) on port 80.
-        # NOTE: adafruit_httpserver defaults to port 5000 — we MUST pass port=80
-        # so plain http://192.168.4.1 (no port) reaches the server.
-        server.start("0.0.0.0", port=80)
-        log(f"[ap] HTTP server listening — open http://{ap_ip}")
+        log(f"[ap] HTTP server listening — open http://{ap_ip}  (/rpc + legacy routes)")
 
         # Reset state and serve requests until credentials arrive
         pending["ready"] = False
         last_beat = time.monotonic()
         while not pending["ready"]:
-            try:
-                server.poll()
-            except Exception as e:
-                log(f"[http] poll error: {e}")
+            rpc.service(force=True)          # poll + deferred work (reboot etc.)
             now = time.monotonic()
             if now - last_beat > 5:
                 log("[ap] waiting for setup… (server alive)")
@@ -914,7 +1057,9 @@ def run_ap_provisioning():
         pw   = pending["password"]
         su   = pending["script_url"]
         mf   = pending["module_firmware"]
+        pid  = pending["product_id"]
 
+        rpc.stop_http()                          # listener dies with the AP
         wifi.radio.stop_ap()
         log("[ap] Hotspot stopped — attempting WiFi join")
 
@@ -937,7 +1082,7 @@ def run_ap_provisioning():
             # AP->STA transition (without a chip reset) leaves DNS broken.
             # A hardware reset brings the radio up clean in STA-only mode, and
             # main() will then connect + download on the fresh boot.
-            if save_wifi_credentials(ssid, pw, su, mf):
+            if save_wifi_credentials(ssid, pw, su, mf, pid):
                 log("[boot] Credentials saved — hardware reset into WiFi mode")
                 time.sleep(2)  # let the success page flush to the browser
                 microcontroller.reset()
@@ -947,10 +1092,6 @@ def run_ap_provisioning():
             # rather than reboot into a brain that has nothing saved.
             event("[CFG] provisioning NOT saved — filesystem read-only "
                   "(settings.toml NOKNOK_USB_DRIVE = 1?)")
-            try:
-                server.stop()
-            except Exception:
-                pass
             pending["ready"] = False
             time.sleep(1)
             # loop back to top -> start_ap again
@@ -959,10 +1100,6 @@ def run_ap_provisioning():
             # can retry. We do NOT supervisor.reload() here: a soft reload leaves
             # the CYW43 radio in a state where AP mode no longer works.
             log("[ap] WiFi join failed after 3 attempts — restarting hotspot for retry")
-            try:
-                server.stop()
-            except Exception:
-                pass
             pending["ready"] = False
             time.sleep(1)
             # loop back to top -> start_ap again
@@ -1704,6 +1841,25 @@ def run_product(connected):
         supervisor.reload()
 
 
+def start_app_channel():
+    """Home-WiFi /rpc + mDNS for the product's lifetime (DEV-34). After this,
+    noknok.py's drivers pump the channel between module transactions, so the
+    product answers the app without a line of its own. Called only once all
+    network *client* work (OTA downloads) is over — the DEV-32 rule — and
+    never on an offline brain (AP-on-demand is DEV-35). Best-effort."""
+    if not wifi.radio.connected:
+        return
+    try:
+        register_ops()
+        rpc.start_http(socketpool.SocketPool(wifi.radio), port=80, logfn=log)
+        rpc.start_mdns(80, log)
+        nk.set_service_hook(rpc.service)
+        log("[rpc] app channel up — http://%s/rpc  (%s.local)"
+            % (wifi.radio.ipv4_address, rpc.device_name()))
+    except Exception as e:
+        log(f"[rpc] app channel NOT started (ignored): {e!r}")
+
+
 def safe_idle(connected):
     """Parked after CRASH_MAX crashes. Two ways out, neither needing a laptop:
     hold the knob for the factory-reset gesture (DEV-7 — this used to be dead
@@ -1735,16 +1891,36 @@ def safe_idle(connected):
     knob = c.knob[0] if (c is not None and c.knob) else None
     if knob is None:
         log("[crash] no knob on the bus — power-cycle to retry")
+    # Parked is exactly when the app must still get through (the "stopped"
+    # card, DEV-36): the channel comes up after the re-fetch above (no more
+    # client traffic) and this loop pumps it.
+    start_app_channel()
     while True:
         if knob is not None:
             try:
                 c.check_factory_reset(knob.read())
             except Exception:
                 pass
-        time.sleep(0.1)
+        rpc.service()
+        time.sleep(0.05)
 
 
 def main():
+    # ── Cold-boot WiFi workaround (17 Sep 2026, CircuitPython 10.3.0, Pico 2 W) ──
+    # After a POWER-ON or hard reset every WiFi join times out ("Unknown
+    # failure 1", never associates), 3/3 attempts, however long the timeout;
+    # after a soft reload the same code joins in 3 s. Bench-bisected: a tiny
+    # code.py joins fine cold, but a multi-second compile freeze right after the
+    # radio's cold init (this file + noknok.py are ~230 KB of source) leaves it
+    # wedged, and nothing from Python un-wedges it — not waiting, not
+    # radio.enabled off/on, not stop_station(). Only a VM reset does. So on the
+    # power-on run we do the fresh-start bookkeeping and reload once; the
+    # second run joins. Costs ~3 s per power-on. Real fix = no boot-time
+    # compile (precompiled .mpy / frozen modules, DEV-38) — then drop this.
+    if _is_fresh_start():
+        _set_crash_count(0)              # a power cycle always grants three fresh tries
+        print("[boot] power-on — reloading once (cold-boot WiFi workaround, see main())")
+        supervisor.reload()
     log_new_boot()
     log("[boot] noknok Pico W — starting")
     # DEV-18: say which filesystem mode boot.py chose, and sweep any .tmp left
@@ -1756,8 +1932,6 @@ def main():
         else "owned by the PC",
         nk.store().backend))
     nk.clean_tmp()
-    if _is_fresh_start():
-        _set_crash_count(0)                  # a power cycle always grants three fresh tries
 
     creds = load_wifi_credentials()
     if not creds:
@@ -1806,6 +1980,7 @@ def main():
                 log(f"[fw] check_and_flash_modules error (ignored): {e!r}")
             _release_conductor()
             alert_customer()
+            start_app_channel()              # after the last download, before the product
             run_product(connected=True)
         else:
             log("[boot] product.py missing — will download")

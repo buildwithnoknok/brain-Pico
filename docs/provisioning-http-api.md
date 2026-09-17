@@ -15,10 +15,11 @@ portal setup page). This is the app ↔ brain contract.
   Values are URL-decoded server-side (`+` → space, `%XX` → byte).
 - **JSON-in-a-field:** where a field carries structured data (e.g. `module_firmware`)
   it is a JSON **string** inside the form field, not a JSON request body.
-- **When:** all the `POST` endpoints below are called by the app **while the phone
+- **When:** the form endpoints below are called by the app **while the phone
   is on the `noknok-setup` AP**, before `/connect` hands the Pico onto home WiFi.
-  They are transport-agnostic in code, so they could later be served on home WiFi
-  unchanged.
+  Since code.py 0.17 the brain also serves **`POST /rpc`** (JSON, see below) on the
+  AP *and* on home WiFi for the product's whole lifetime — that is the channel new
+  app code uses; the form endpoints are adapters over the same handlers.
 
 ## Endpoints
 
@@ -135,21 +136,59 @@ the serial console and the event history in the runtime Store (`events()` in
 with the bench marker `/debug_log` present. There is no live channel back to
 the phone by this point, since it is long off the setup AP.
 
-## Planned
+## `POST /rpc` — Device Protocol v1 (DEV-34, since code.py 0.17)
 
-### `POST /settings`  — NOT YET IMPLEMENTED
-Push product configuration to the device so the app can configure a running product
-(colour, brightness, sundown length, …). Intended contract:
+One JSON message protocol, transport-agnostic (spec: Confluence 113868802 §2). The
+form endpoints above are now thin **adapters** over the same handlers; new app code
+uses `/rpc` only. Served **on the setup AP and on home WiFi for the product's whole
+lifetime**, advertised as **`noknok-XXXX.local`** (mDNS, `XXXX` = last two bytes of
+the MCU id; `hello` returns the name). Implementation: `software/noknok_rpc.py`
+(dispatcher + HTTP carrier + servicing), ops registered in `code.py`.
 
-| Field | Value |
-|-------|-------|
-| `settings` | JSON object stored in the runtime Store under `settings` (product-tagged) |
+- **Request:** `POST /rpc`, body `application/json`:
+  `{"id": <client-chosen>, "op": "<name>", "args": {...}}`. `token` is reserved
+  (pairing = DEV-35; v1 is open, like the AP today).
+- **Reply:** `{"id": <echoed>, "ok": true, ...fields}` or
+  `{"id": <echoed>, "ok": false, "error": "<code>", "detail": "..."}`. Unknown op →
+  `"error": "unknown op: x"`; malformed body → `"bad json"`, `id: null`.
+- **While a product runs** it is answered between module transactions (noknok.py's
+  drivers pump the channel, throttled to 50 ms; ~1 ms idle, 10–100 ms per request,
+  ≤ 240 ms when a phone stalls mid-request — soak, DEV-34 comment 10829). A product
+  idling in `time.sleep()` should use `c.sleep()`; otherwise replies wait for its next
+  module read. **Offline brains have no channel** (AP-on-demand = DEV-35).
+- Expect **~0.4 s round trip** for now (two-segment response, see DEV-34 follow-up).
 
-Superseded by the Device Protocol v1 `settings.get/set/reset` ops (DEV-34, Confluence
-113868802). Constraint carried over from DEV-18: **settings values live in the runtime
-Store (FRAM / nvm), never in a file** — the product reads them through `c.settings`.
-Convention: product-tagged, `{"product":"<manifest-id>", ...values...}`; a product ignores
-values whose tag isn't its own (stale after a switch). App-side, one blob per device.
+| op | args | reply fields | notes |
+|----|------|--------------|-------|
+| `hello` | — | `device`, `name`, `state` (`unprovisioned` / `provisioned` / `parked`), `product{id,script,script_url}`, `versions{code,noknok,noknok_usb,rpc,circuitpython}`, `online`, `ap`, `carrier`, `uptime`, `ops[]` | open, cheap — call first |
+| `status` | `since` (int, optional) | `state`, `strikes`, `store` (`fram`/`nvm`), `drive_visible`, `mem_free`, `ip`, `modules[{type,uid,fw}]`, `events[]`, `events_total` | phase-1 subset; DEV-36 adds firmware state |
+| `roles.assign` | `role_id`, `module_type`, `exclude[]` | `uid`, `type`, `saved` / `timeout` | = `/roles/assign`; blocks ≤ 20 s |
+| `firmware.check` | `module_firmware{}` | as `/firmware/check` | AP time only: `resolved:false` |
+| `provision` | `ssid`, `password`, `script_url`, `module_firmware`, `product_id` | `accepted`, `mode` (`setup` / `switch`), `rebooting` | on the AP = `/connect`; on home WiFi = **product switch**: `ssid`/`password` optional (keeps the network), saves, drops `product.py`, reboots; the boot path downloads the new script |
+| `reboot` | — | `rebooting: true` | reply first, reset 0.5 s later |
+| `factory_reset` | — | `resetting: true` | same wipe as the knob-hold gesture |
+| `settings.get/set/reset` | — | — | **next** (c.settings, DEV-34) |
+
+`product_id` (the manifest id) is new and optional on `/connect` and `provision`; it is
+stored with the credentials so the app can fetch the right `config_schema` later.
+
+Bench: `tools/rpc_call.py <host> <op> ['{json args}']` from the Pi; the smallest product
+that exercises the channel is `software/bench_rpc_product.py` (put as `/data/product.py`).
+
+### Boot note — reload on power-on (17 Sep 2026)
+`main()` reloads itself once on every power-on / hard reset. CircuitPython 10.3.0 on the
+Pico 2 W never associates after a cold boot when a multi-second compile (this file +
+noknok.py) freezes the VM right after the radio's cold init; a soft reload joins in 3 s.
+Bisected on the bench, nothing from Python un-wedges the radio. Costs ~3 s per power-on.
+Real fix: no boot-time compile (precompiled `.mpy` / frozen modules, DEV-38).
+
+### Settings — where they live (constraint from DEV-18)
+**Settings values live in the runtime Store (FRAM / nvm), never in a file** — the product
+reads them through `c.settings`. Convention: product-tagged,
+`{"product":"<manifest-id>", ...values...}`; a product ignores values whose tag isn't its
+own (stale after a switch). App-side, one blob per device. Design for the **nvm** backend
+(FRAM undecided): 79 ms blocking write, finite endurance → write on change only, debounced
+on idle (5–10 s), never in a product's hot loop.
 
 ## Related on-device data
 
