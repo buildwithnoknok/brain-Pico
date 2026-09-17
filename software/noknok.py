@@ -595,7 +595,14 @@ def store():
 
 SETTINGS_KEY        = "settings"
 DEVICE_SETTINGS_KEY = "device_settings"
-SETTINGS_IDLE_S     = 5.0
+SETTINGS_IDLE_S     = 5.0      # flush this long after the last change ...
+SETTINGS_MAX_WAIT_S = 60.0     # ... or at the latest this long after the first (knob held forever)
+SETTINGS_MIN_GAP_S  = 30.0     # never two nvm flushes closer than this (flash wear: ~100k erases)
+SETTINGS_RETRY_S    = 60.0     # after a failed write, wait this long before trying again
+SETTINGS_MAX_KEYS   = 32
+SETTINGS_MAX_KEY    = 32       # characters
+SETTINGS_MAX_STR    = 256      # characters per string value
+SETTINGS_MAX_BYTES  = 1024     # JSON size of all values of one scope
 
 def product_tag():
     """What the current product is called in the Store: the manifest id the app
@@ -604,9 +611,63 @@ def product_tag():
         or store().get("wifi") or {}
     pid = creds.get("product_id")
     if pid:
-        return str(pid)
+        return str(pid)[:64]
     url = creds.get("script_url") or ""
-    return url.rsplit("/", 1)[-1] if url else "unknown"
+    return url.rsplit("/", 1)[-1][:64] if url else "unknown"
+
+
+def _check_value(key, value, default=None):
+    """Why a (key, value) is not acceptable, or None if it is. Settings are
+    scalars only (every config_schema type is one); a value's type must match
+    the declared default's, so a phone that sends "abc" for a slider cannot
+    crash the product three times and park it (bool is checked apart from
+    numbers — Python's bool is an int)."""
+    if not isinstance(key, str) or not key or len(key) > SETTINGS_MAX_KEY:
+        return "bad key"
+    if isinstance(value, bool):
+        kind = "bool"
+    elif isinstance(value, (int, float)):
+        kind = "number"
+    elif isinstance(value, str):
+        if len(value) > SETTINGS_MAX_STR:
+            return "string too long"
+        kind = "string"
+    elif value is None:
+        kind = "null"
+    else:
+        return "must be a boolean, number or string"
+    if default is not None:
+        want = ("bool" if isinstance(default, bool) else
+                "number" if isinstance(default, (int, float)) else
+                "string" if isinstance(default, str) else None)
+        if want is not None and kind != want:
+            return "expected %s" % want
+        # A default that looks like a colour or a time fixes the format too.
+        if kind == "string":
+            if _looks_like_color(default) and not _looks_like_color(value):
+                return "expected #RRGGBB"
+            if _looks_like_time(default) and not _looks_like_time(value):
+                return "expected HH:MM"
+    elif kind == "null":
+        return "null not allowed"
+    return None
+
+def _looks_like_color(s):
+    if not isinstance(s, str) or len(s) != 7 or s[0] != "#":
+        return False
+    try:
+        int(s[1:], 16)
+        return True
+    except ValueError:
+        return False
+
+def _looks_like_time(s):
+    if not isinstance(s, str) or len(s) != 5 or s[2] != ":":
+        return False
+    try:
+        return 0 <= int(s[0:2]) <= 23 and 0 <= int(s[3:5]) <= 59
+    except ValueError:
+        return False
 
 
 class Settings:
@@ -617,7 +678,10 @@ class Settings:
         self._defs  = {}
         self._seq   = 0
         self._dirty = False
-        self._last_change = 0.0
+        self._first_change = 0.0    # when the current dirty period began
+        self._last_change  = 0.0
+        self._last_flush   = -1e9
+        self._error = None          # last write failure, shown in snapshot()
         self._cbs   = []
         self._pending = {}          # app-side changes not yet delivered to on_change
         rec = store().get(key)
@@ -631,14 +695,20 @@ class Settings:
 
     # ── product API ──────────────────────────────────────────────────────────
     def defaults(self, defs):
-        """Declare defaults; fills in any key that has no value yet."""
-        added = False
+        """Declare defaults; fills in any key that has no value yet. Values of
+        the wrong type (a stale record, an old app) are replaced by the default."""
+        touched = False
         for k, v in defs.items():
-            self._defs[k] = v
-            if k not in self._vals:
+            if _check_value(k, v) is not None:
+                print("[settings] default %r rejected: %s" % (k, _check_value(k, v)))
+                continue
+            if self._defs.get(k) != v or k not in self._defs:
+                self._defs[k] = v
+                touched = True
+            if k not in self._vals or _check_value(k, self._vals[k], v) is not None:
                 self._vals[k] = v
-                added = True
-        if added or self._defs != (store().get(self._key) or {}).get("defaults"):
+                touched = True
+        if touched:
             self._mark()
         return self
 
@@ -646,8 +716,16 @@ class Settings:
         return self._vals.get(key, self._defs.get(key, default))
 
     def set(self, key, value):
-        """Device-side change. Persisted after SETTINGS_IDLE_S of quiet."""
-        if self._vals.get(key) == value and key in self._vals:
+        """Device-side change (a knob, the product). Persisted later — see
+        _tick(). Returns True if the value changed, False if equal or rejected."""
+        why = _check_value(key, value, self._defs.get(key))
+        if why is not None:
+            print("[settings] set %r rejected: %s" % (key, why))
+            return False
+        if key in self._vals and self._vals[key] == value:
+            return False
+        if key not in self._vals and len(self._vals) >= SETTINGS_MAX_KEYS:
+            print("[settings] set %r rejected: too many keys" % (key,))
             return False
         self._vals[key] = value
         self._mark()
@@ -675,43 +753,73 @@ class Settings:
         self._mark()
         return dict(self._vals)
 
-    def flush(self):
-        """Write now if anything changed. Returns True if a write happened."""
+    def flush(self, force=False):
+        """Write now if anything changed (force ignores the wear gap — used
+        before a reboot). Returns True if the record is now on the Store."""
         if not self._dirty:
+            return True
+        now = time.monotonic()
+        if not force and now - self._last_flush < SETTINGS_MIN_GAP_S:
             return False
-        self._seq += 1
         rec = {"product": self._tag, "values": self._vals,
-               "defaults": self._defs, "seq": self._seq}
+               "defaults": self._defs, "seq": self._seq + 1}
+        if len(json.dumps(self._vals)) > SETTINGS_MAX_BYTES:
+            self._error = "values too large"
+            self._last_flush = now                  # back off, don't spin
+            return False
         ok = store().set(self._key, rec)
-        self._dirty = not ok
+        self._last_flush = now
+        if ok:
+            self._seq += 1
+            self._dirty = False
+            self._error = None
+        else:
+            self._error = "store write failed"      # retried after SETTINGS_RETRY_S
+            self._last_flush = now + SETTINGS_RETRY_S - SETTINGS_MIN_GAP_S
         return ok
 
     # ── app side (called by the settings.* ops) ──────────────────────────────
     def apply_remote(self, values):
-        """Merge values sent by the app; queue them for on_change."""
-        changed = {}
+        """Merge values sent by the app. Returns (changed, rejected) — rejected
+        maps key -> reason, so the app can show why. Rejected values never
+        reach the product."""
+        changed, rejected = {}, {}
         for k, v in values.items():
-            if self._vals.get(k) != v or k not in self._vals:
+            why = _check_value(k, v, self._defs.get(k))
+            if why is None and k not in self._vals and len(self._vals) >= SETTINGS_MAX_KEYS:
+                why = "too many keys"
+            if why is not None:
+                rejected[k] = why
+                continue
+            if k not in self._vals or self._vals[k] != v:
                 self._vals[k] = v
                 changed[k] = v
         if changed:
             self._mark()
             self._pending.update(changed)
-        return changed
+        return changed, rejected
 
     def snapshot(self):
-        return {"product": self._tag, "values": dict(self._vals),
-                "defaults": dict(self._defs), "seq": self._seq,
-                "dirty": self._dirty}
+        out = {"product": self._tag, "values": dict(self._vals),
+               "defaults": dict(self._defs), "seq": self._seq,
+               "dirty": self._dirty}
+        if self._error:
+            out["error"] = self._error
+        return out
 
     # ── internals ────────────────────────────────────────────────────────────
     def _mark(self):
+        now = time.monotonic()
+        if not self._dirty:
+            self._first_change = now
         self._dirty = True
-        self._last_change = time.monotonic()
+        self._last_change = now
 
     def _tick(self):
         """Called from the servicing hook: deliver app-side changes, then flush
-        once the values have been quiet for SETTINGS_IDLE_S."""
+        once the values have been quiet for SETTINGS_IDLE_S — or, if they never
+        go quiet, SETTINGS_MAX_WAIT_S after the first change — but never two
+        nvm writes closer than SETTINGS_MIN_GAP_S."""
         if self._pending:
             changed, self._pending = self._pending, {}
             for cb in self._cbs:
@@ -719,9 +827,11 @@ class Settings:
                     cb(changed)
                 except Exception as e:
                     print("[settings] on_change callback failed: %r" % (e,))
-        if self._dirty and time.monotonic() - self._last_change >= SETTINGS_IDLE_S:
-            self.flush()
-
+        if self._dirty:
+            now = time.monotonic()
+            if (now - self._last_change >= SETTINGS_IDLE_S
+                    or now - self._first_change >= SETTINGS_MAX_WAIT_S):
+                self.flush()
 _settings_by_key = {}
 
 def settings(scope="product"):
@@ -741,7 +851,10 @@ def install_defaults(tag, defaults):
     config_defaults so device and app agree from first boot. Same product
     (same tag) keeps its values and only gains new keys; a different product
     starts from these defaults. Immediate Store write; returns True on success."""
-    defaults = dict(defaults or {})
+    defaults = {k: v for k, v in dict(defaults or {}).items()
+                if _check_value(k, v) is None}          # scalars only, sane sizes
+    if len(defaults) > SETTINGS_MAX_KEYS:
+        defaults = dict(list(defaults.items())[:SETTINGS_MAX_KEYS])
     rec = store().get(SETTINGS_KEY)
     if isinstance(rec, dict) and rec.get("product") == tag:
         values = dict(rec.get("values") or {})
@@ -761,6 +874,17 @@ def _settings_tick():
             s._tick()
         except Exception:
             pass
+
+def flush_settings():
+    """Write every dirty scope now, ignoring the wear gap. Call before any
+    reset / reload so the last few seconds of changes are not lost."""
+    ok = True
+    for s in _settings_by_key.values():
+        try:
+            ok = s.flush(force=True) and ok
+        except Exception:
+            ok = False
+    return ok
 
 def usb_drive_visible():
     """True when settings.toml asks boot.py to show the CIRCUITPY drive

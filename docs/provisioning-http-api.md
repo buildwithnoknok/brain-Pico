@@ -164,10 +164,20 @@ the MCU id; `hello` returns the name). Implementation: `software/noknok_rpc.py`
 | `status` | `since` (int, optional) | `state`, `strikes`, `store` (`fram`/`nvm`), `drive_visible`, `mem_free`, `ip`, `modules[{type,uid,fw}]`, `events[]`, `events_total` | phase-1 subset; DEV-36 adds firmware state |
 | `roles.assign` | `role_id`, `module_type`, `exclude[]` | `uid`, `type`, `saved` / `timeout` | = `/roles/assign`; blocks ≤ 20 s |
 | `firmware.check` | `module_firmware{}` | as `/firmware/check` | AP time only: `resolved:false` |
-| `provision` | `ssid`, `password`, `script_url`, `module_firmware`, `product_id` | `accepted`, `mode` (`setup` / `switch`), `rebooting` | on the AP = `/connect`; on home WiFi = **product switch**: `ssid`/`password` optional (keeps the network), saves, drops `product.py`, reboots; the boot path downloads the new script |
-| `reboot` | — | `rebooting: true` | reply first, reset 0.5 s later |
-| `factory_reset` | — | `resetting: true` | same wipe as the knob-hold gesture |
-| `settings.get/set/reset` | — | — | **next** (c.settings, DEV-34) |
+| `provision` | `ssid`, `password`, `script_url`, `module_firmware`, `product_id`, `config_defaults` | `accepted`, `mode` (`setup` / `switch`), `rebooting` | on the AP = `/connect`; on home WiFi = **product switch**: the network stays (a different `ssid` is refused — use setup mode), the request is parked, the brain reboots, downloads + compiles the new script **before** touching anything, and only on success replaces `product.py`, saves the new product and installs its `config_defaults`. A bad URL / dead uplink keeps product, settings and firmware as they were (`[CFG] product switch FAILED` event). |
+| `reboot` | — | `rebooting: true` | flushes settings, replies, resets 0.5 s later |
+| `factory_reset` | — | `resetting: true` | same wipe as the knob-hold gesture (both settings scopes too) |
+| `settings.get` | `scope` (`product` default / `device`) | `product`, `values`, `defaults`, `seq`, `dirty`, `error?` | poll `seq` to pick up knob-driven changes |
+| `settings.set` | `scope`, `values{}` | `changed{}`, `rejected{key: reason}`, `values`, `seq` | values are validated against the declared defaults' types (+ `#RRGGBB` / `HH:MM` formats); `ok:false, error:"rejected"` when nothing was accepted |
+| `settings.reset` | `scope` | `values`, `seq` | back to the product's defaults |
+
+**Limits that protect the brain:** request body ≤ 4 KB (`body too large`); settings: ≤ 32 keys,
+key ≤ 32 chars, string ≤ 256 chars, all values ≤ 1 KB JSON; scalars only (no arrays/objects).
+**Write policy (nvm wear + power cuts):** a scope is written after 5 s without changes, at the
+latest 60 s after the first change, never two writes closer than 30 s; forced before any
+reboot / switch / crash reload. **Link:** the servicing slot watches the WiFi link every 30 s
+and re-joins with backoff (30 s → 5 min, ≤ 5 s blocking per attempt), restarting the carrier;
+`status.link` reports `drops` / `rejoins` / `backoff`.
 
 `product_id` (the manifest id) is new and optional on `/connect` and `provision`; it is
 stored with the credentials so the app can fetch the right `config_schema` later.

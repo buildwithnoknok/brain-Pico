@@ -405,6 +405,7 @@ PRODUCT_SCRIPT_FILE   = nk.DATA_DIR + "/product.py"
 _LEGACY_WIFI_FILE     = "wifi.json"
 _LEGACY_PRODUCT_FILE  = "product.py"
 WIFI_STORE_KEY        = "wifi"       # recovery copy in the Store (FRAM / nvm)
+SWITCH_STORE_KEY      = "switch"     # pending product switch {"script_url"} (DEV-34)
 WIFI_TIMEOUT_S        = 15
 
 # Shared state: the /connect handler fills this, the main loop acts on it.
@@ -746,6 +747,7 @@ def _h_status(args, msg):
         "drive_visible": nk.usb_drive_visible(),
         "mem_free": gc.mem_free(),
         "ip": str(wifi.radio.ipv4_address) if wifi.radio.connected else None,
+        "link": rpc.link_stats(),
         "modules": modules,
         "events": ev[since:],
         "events_total": len(ev),
@@ -755,6 +757,7 @@ def _h_reboot(args, msg):
     """Reply first, reset after the response has gone out (deferred)."""
     log("[rpc] reboot requested by the app")
     def _reboot():
+        nk.flush_settings()              # the last few seconds of changes
         time.sleep(0.5)                  # let the reply leave the radio first
         microcontroller.reset()
     rpc.defer(_reboot)
@@ -834,9 +837,14 @@ def _h_settings_set(args, msg):
     values = args.get("values")
     if not isinstance(values, dict):
         raise rpc.RpcError("values must be an object")
-    changed = s.apply_remote(values)
-    log("[rpc] settings.set %s: %s" % (scope, changed))
-    return {"scope": scope, "changed": changed, "values": s.all(), "seq": s.seq}
+    changed, rejected = s.apply_remote(values)
+    log("[rpc] settings.set %s: changed=%s rejected=%s" % (scope, changed, rejected))
+    out = {"scope": scope, "changed": changed, "rejected": rejected,
+           "values": s.all(), "seq": s.seq}
+    if rejected and not changed:
+        out["ok"] = False
+        out["error"] = "rejected"
+    return out
 
 def _h_settings_reset(args, msg):
     scope, s = _settings_for(args)
@@ -868,20 +876,24 @@ def _do_provision(ssid, password, script_url, module_firmware, product_id,
             f"product_id: {product_id or 'none'})")
         return {"accepted": True, "mode": "setup"}
     creds = load_wifi_credentials() or {}
-    if not ssid:
-        ssid, password = creds.get("ssid"), creds.get("password")
-    if not ssid:
-        return {"ok": False, "error": "ssid required"}
-    if not script_url:
+    if ssid and ssid != creds.get("ssid"):
+        return {"ok": False, "error": "network change needs setup mode",
+                "detail": "a product switch keeps the current WiFi; use the setup AP to change it"}
+    if not script_url or not str(script_url).startswith("http"):
         return {"ok": False, "error": "script_url required"}
-    if not save_wifi_credentials(ssid, password or "", script_url,
-                                 module_firmware, product_id):
-        return {"ok": False, "error": "cannot save (filesystem read-only, no store)"}
-    _install_settings(config_defaults)
-    event(f"[CFG] product switch via app -> {product_id or script_url.rsplit('/', 1)[-1]}")
+    # Nothing is saved yet. The request is parked in the Store; the boot path
+    # downloads + compiles the new script BEFORE any Conductor exists (DEV-32
+    # rule) and only on success replaces product.py, saves the new product
+    # in the credentials and installs its defaults. A bad URL or a dead uplink
+    # leaves the customer with the product, settings and firmware they had.
+    req = {"script_url": script_url, "module_firmware": module_firmware,
+           "product_id": product_id, "config_defaults": config_defaults}
+    if not nk.store().set(SWITCH_STORE_KEY, req):
+        return {"ok": False, "error": "cannot save (store write failed)"}
+    event(f"[CFG] product switch requested -> {product_id or script_url.rsplit('/', 1)[-1]}")
     def _switch():
+        nk.flush_settings()
         time.sleep(0.5)                  # let the reply leave the radio first
-        nk.remove(PRODUCT_SCRIPT_FILE, _LEGACY_PRODUCT_FILE)   # forces the download
         _set_crash_count(0)
         microcontroller.reset()
     rpc.defer(_switch)
@@ -1894,6 +1906,7 @@ def run_product(connected):
               f"strike {strikes}/{CRASH_MAX}")
         if _flash_logging_enabled():
             flush_log_ring("product crash")  # bench only: a runtime FAT write (DEV-18)
+        nk.flush_settings()                  # keep the customer's last changes
         # Always reload — a clean VM releases the I2C pins the product held. If
         # this was the third strike, main() sees the count and parks instead of
         # running the product again.
@@ -1902,16 +1915,42 @@ def run_product(connected):
         supervisor.reload()
 
 
+def _h_bench_wifi_drop(args, msg):
+    """Bench only (NOKNOK_WATCHDOG = 1): power the radio off for a few seconds
+    to exercise the link watch + rejoin + carrier restart path."""
+    secs = float(args.get("seconds") or 8)
+    def _drop():
+        log("[bench] dropping the WiFi link for %.0f s" % secs)
+        wifi.radio.enabled = False
+        end = time.monotonic() + secs
+        while time.monotonic() < end:
+            rpc._feed()                  # keep the bench watchdog quiet meanwhile
+            time.sleep(0.5)
+        wifi.radio.enabled = True
+    rpc.defer(_drop)
+    return {"dropping": secs}
+
 def start_app_channel():
     """Home-WiFi /rpc + mDNS for the product's lifetime (DEV-34). After this,
     noknok.py's drivers pump the channel between module transactions, so the
     product answers the app without a line of its own. Called only once all
     network *client* work (OTA downloads) is over — the DEV-32 rule — and
     never on an offline brain (AP-on-demand is DEV-35). Best-effort."""
-    if not wifi.radio.connected:
-        return
     try:
         register_ops()
+        creds = load_wifi_credentials() or {}
+        if creds.get("ssid"):
+            # Lets the servicing slot re-join after a router reboot (and bring
+            # the carrier up on a brain that booted offline) — rate-limited,
+            # bounded, never inside a module read.
+            rpc.set_wifi_credentials(creds["ssid"], creds.get("password") or "", 80)
+        if str(nk.env("NOKNOK_WATCHDOG", "0")) == "1":
+            rpc.arm_watchdog(8, log)
+            rpc.dispatcher().register("bench.wifi_drop", _h_bench_wifi_drop)
+        nk.set_service_hook(rpc.service)
+        if not wifi.radio.connected:
+            log("[rpc] offline — app channel will come up if the network appears")
+            return
         rpc.start_http(socketpool.SocketPool(wifi.radio), port=80, logfn=log)
         # mDNS is opt-in until proven over hours: the first long run with it on
         # (17 Sep 2026) ended in a hard hang after ~30 min idle — no serial, no
@@ -1921,13 +1960,6 @@ def start_app_channel():
             rpc.start_mdns(80, log)
         else:
             log("[mdns] off (NOKNOK_MDNS != 1) — reach the brain by IP")
-        # Bench watchdog (NOKNOK_WATCHDOG = 1): a hang anywhere in the product
-        # or the channel becomes a reset, recorded as a [WDT] event at the next
-        # boot. Not for the field — a product that sleeps > 8 s without a
-        # module read would trip it.
-        if str(nk.env("NOKNOK_WATCHDOG", "0")) == "1":
-            rpc.arm_watchdog(8, log)
-        nk.set_service_hook(rpc.service)
         log("[rpc] app channel up — http://%s/rpc  (%s)"
             % (wifi.radio.ipv4_address, rpc.device_name()))
     except Exception as e:
@@ -2049,6 +2081,24 @@ def main():
         except Exception as e:
             log(f"[ntp] setup error (ignored): {e}")
 
+        # Pending product switch (provision over home WiFi): fetch + compile the
+        # new script BEFORE any Conductor exists (DEV-32 rule) and only then
+        # replace the running one. A failure keeps the old product and says so.
+        switch = nk.store().get(SWITCH_STORE_KEY)
+        if isinstance(switch, dict) and switch.get("script_url"):
+            nk.store().delete(SWITCH_STORE_KEY)          # one attempt per request
+            if download_and_save_script(switch["script_url"]):
+                # Only now does the brain "become" the new product.
+                save_wifi_credentials(creds["ssid"], creds.get("password") or "",
+                                      switch["script_url"], switch.get("module_firmware"),
+                                      switch.get("product_id"))
+                creds = load_wifi_credentials() or creds
+                _install_settings(switch.get("config_defaults"))
+                event("[CFG] product switched -> %s" % switch["script_url"].rsplit("/", 1)[-1])
+            else:
+                event("[CFG] product switch FAILED (download) — keeping the current product")
+                _field_alerts.append("product switch failed")
+
         if product_script_exists():
             # Bring connected modules up to current firmware BEFORE handing off
             # to the product (includes the parked-module rescue). Best-effort;
@@ -2076,6 +2126,7 @@ def main():
             log("[boot] offline — running the product without updates")
             rescue_offline()
             alert_customer()
+            start_app_channel()          # hook only; carrier comes up if the network appears
             run_product(connected=False)
         else:
             log("[boot] offline and no product.py — offering setup "

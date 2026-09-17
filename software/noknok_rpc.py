@@ -35,6 +35,13 @@ __version__ = "0.1"
 
 SERVICE_INTERVAL = 0.05     # s between carrier polls from the implicit hook
 SOCKET_TIMEOUT   = 0.2      # s a stalled client may hold poll() (default lib: 1 s)
+MAX_BODY         = 4096     # bytes; a settings.set is ~100, a provision ~600
+LINK_CHECK_S     = 30       # how often service() looks at the WiFi link
+LINK_JOIN_S      = 5        # blocking budget for one rejoin attempt
+
+
+class BodyTooLarge(Exception):
+    pass
 
 
 class RpcError(Exception):
@@ -121,13 +128,15 @@ class HttpCarrier:
 
         @srv.route("/rpc", POST)
         def _rpc(request: Request):
-            body = self._full_body(request)
             try:
+                body = self._full_body(request)
                 if isinstance(body, (bytes, bytearray, memoryview)):
                     body = bytes(body).decode("utf-8")
                 msg = json.loads(body)
+            except BodyTooLarge as e:
+                reply = {"id": None, "ok": False, "error": "body too large", "limit": MAX_BODY}
             except Exception as e:
-                self.log("[rpc] bad json (%r): %r" % (e, body[:80] if body else body))
+                self.log("[rpc] bad json (%r)" % (e,))
                 reply = {"id": None, "ok": False, "error": "bad json"}
             else:
                 reply = d.dispatch(msg)
@@ -154,6 +163,8 @@ class HttpCarrier:
             need = int(request.headers.get("Content-Length") or 0)
         except Exception:
             need = 0
+        if need > MAX_BODY or len(body) > MAX_BODY:
+            raise BodyTooLarge()
         if len(body) >= need:
             return body
         conn = getattr(request, "connection", None)
@@ -204,6 +215,68 @@ _next     = 0.0
 _busy     = False
 _deferred = []
 _logfn    = print
+_err_next = 0.0             # rate limit for poll-error log lines
+_link     = {"ssid": None, "password": None, "next": 0.0, "was_up": True,
+             "drops": 0, "rejoins": 0, "port": 80, "backoff": LINK_CHECK_S}
+
+def set_wifi_credentials(ssid, password, port=80):
+    """Let service() re-join the home network after a router reboot and bring
+    the HTTP carrier back (Sam #6). Rate-limited (LINK_CHECK_S), bounded
+    (LINK_JOIN_S), only from the servicing slot — never inside a module read."""
+    _link["ssid"], _link["password"], _link["port"] = ssid, password, port
+
+def _watch_link(now):
+    """Called from service(): note drops, rejoin once per LINK_CHECK_S."""
+    if not _link["ssid"] or now < _link["next"]:
+        return
+    try:
+        import wifi
+        up = bool(wifi.radio.connected)
+    except Exception:
+        return
+    if up:
+        _link["next"] = now + LINK_CHECK_S
+        _link["backoff"] = LINK_CHECK_S
+        if not _link["was_up"]:
+            _logfn("[wifi] link is back")
+        _link["was_up"] = True
+        if _carrier is None or _carrier.server is None:
+            _restart_http()                 # first time online, or after a drop
+        return
+    if _link["was_up"]:
+        _link["drops"] += 1
+        _logfn("[wifi] link DOWN — rejoin with backoff (%d s .. 300 s)" % LINK_CHECK_S)
+    _link["was_up"] = False
+    # Each failed attempt blocks the product for up to LINK_JOIN_S, so a brain
+    # whose router is off for hours must not pay that every 30 s: back off
+    # 30 → 60 → 120 → 240 → 300 s.
+    backoff = _link.get("backoff", LINK_CHECK_S)
+    _link["next"] = now + backoff
+    _link["backoff"] = min(300, backoff * 2)
+    _link["rejoins"] += 1
+    try:
+        import gc
+        gc.collect()
+        wifi.radio.connect(_link["ssid"], _link["password"] or "", timeout=LINK_JOIN_S)
+        _logfn("[wifi] rejoined — %s" % wifi.radio.ipv4_address)
+        _link["was_up"] = True
+        _link["backoff"] = LINK_CHECK_S
+        _restart_http()
+    except Exception as e:
+        _logfn("[wifi] rejoin failed: %r" % (e,))
+
+def _restart_http():
+    """The listener does not survive a lost link — rebuild it."""
+    try:
+        import wifi, socketpool
+        start_http(socketpool.SocketPool(wifi.radio), _link["port"], _logfn)
+        _logfn("[rpc] carrier restarted on %s" % wifi.radio.ipv4_address)
+    except Exception as e:
+        _logfn("[rpc] carrier restart failed: %r" % (e,))
+
+def link_stats():
+    return {"drops": _link["drops"], "rejoins": _link["rejoins"],
+            "backoff": _link.get("backoff")}
 
 def start_http(pool, port=80, logfn=print):
     """Bind the HTTP carrier (setup AP or home WiFi). Returns the carrier."""
@@ -232,23 +305,24 @@ def service(force=False):
     """Pump pending messages. Non-blocking, throttled, re-entrancy-safe; a
     no-op when no carrier is up (offline product) — so it is always safe to
     call, from a driver, a sleep, or a loop."""
-    global _next, _busy
+    global _next, _busy, _err_next
     if _busy:
         return
     _feed()                                  # bench watchdog, if armed
-    if _carrier is None and not _deferred:
-        return
     now = time.monotonic()
     if not force and now < _next:
         return
     _next = now + SERVICE_INTERVAL
     _busy = True
     try:
+        _watch_link(now)
         if _carrier is not None:
             try:
                 _carrier.poll()
             except Exception as e:
-                _logfn("[rpc] poll error: %r" % (e,))
+                if now >= _err_next:         # one line per 10 s, not one per poll
+                    _err_next = now + 10
+                    _logfn("[rpc] poll error: %r" % (e,))
     finally:
         _busy = False
     while _deferred:
