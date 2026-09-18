@@ -769,7 +769,7 @@ class Settings:
         if not force and now - self._last_flush < SETTINGS_MIN_GAP_S:
             return False
         rec = {"product": self._tag, "values": self._vals,
-               "defaults": self._defs, "seq": self._seq + 1}
+               "defaults": self._defs, "seq": self._seq}
         if len(json.dumps(self._vals)) > SETTINGS_MAX_BYTES:
             self._error = "values too large"
             self._last_flush = now                  # back off, don't spin
@@ -777,7 +777,6 @@ class Settings:
         ok = store().set(self._key, rec)
         self._last_flush = now
         if ok:
-            self._seq += 1
             self._dirty = False
             self._error = None
         else:
@@ -816,11 +815,15 @@ class Settings:
 
     # ── internals ────────────────────────────────────────────────────────────
     def _mark(self):
+        """Every change bumps seq at once (the app polls it to notice knob
+        turns within its 3 s cycle); the Store write follows its own, slower
+        policy (_tick) and just records the seq it saw."""
         now = time.monotonic()
         if not self._dirty:
             self._first_change = now
         self._dirty = True
         self._last_change = now
+        self._seq += 1
 
     def _tick(self):
         """Called from the servicing hook: deliver app-side changes, then flush
