@@ -5,8 +5,9 @@
 #   - Hold any LED Button or Knob button while plugging in the power and keep
 #     holding: once the modules are found (~5 s) every LED Button lights white
 #     and a buzzer (if any) clicks — "I see you"; hold 3 s more and the LEDs
-#     flash, the buzzer confirms and the brain wipes + reboots into the setup
-#     AP. Release earlier and the boot carries on untouched.
+#     flash 3x and go DARK, the buzzer plays two rising notes, and the brain
+#     wipes + reboots into the setup AP. Dark = accepted, let go. Release
+#     earlier and the boot carries on untouched.
 #   - Runs ONLY on the power-on run (the one the cold-boot workaround reloads
 #     anyway) and BEFORE the reload, so the Conductor it needs never exists in
 #     the process that later downloads — the DEV-32 rule holds. Costs ~3-4 s
@@ -1947,15 +1948,23 @@ def _boot_hold_reset_check():
                 return
 
         # Confirm, then wipe. factory_reset() hard-resets; we never return.
+        # The sequence ends DARK on purpose: a reset does not power-cycle the
+        # modules, so whatever the LEDs show last is what the customer keeps
+        # seeing through the reboot — "went dark" reads as "done, let go",
+        # "stayed white" read as "did it take?" (bench, 18 Sep).
         for _ in range(3):
             for b in c.ledbutton:
                 b.led_off()
-            time.sleep(0.12)
+            time.sleep(0.15)
             for b in c.ledbutton:
                 b.set_color(255, 255, 255)
-            time.sleep(0.12)
+            time.sleep(0.15)
+        for b in c.ledbutton:
+            b.led_off()
         for z in c.buzzer:
-            z.play(1320, 250, 80)
+            z.play(1320, 120, 80)             # two rising notes = accepted
+            time.sleep(0.15)
+            z.play(1760, 200, 80)
         event("[RESET] factory reset via boot-hold")
         nk.factory_reset(delay=0.4)
     except Exception as e:

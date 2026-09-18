@@ -94,7 +94,8 @@ handled, because it is the first point at which the Pico has internet:
 
 0. **Boot-hold factory reset** (power-on run only, code.py 0.18): if an LED
    Button or Knob button is held from power-on, feedback after ~5 s (LED
-   Buttons white, buzzer click); still held 3 s later → the same wipe as the
+   Buttons white, buzzer click); still held 3 s later → 3 flashes, LEDs dark, two
+   rising notes, then the same wipe as the
    `factory_reset` op, then reboot into the setup AP. Otherwise the boot
    continues. Skipped on a factory-fresh device (nothing to reset).
 1. Join home WiFi, download `product.py` if missing.

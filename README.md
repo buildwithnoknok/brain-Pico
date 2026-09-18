@@ -234,7 +234,8 @@ Core:
 - **Factory reset by boot-hold (code.py 0.18)** — the one reset gesture every product shares:
   hold any LED Button or Knob button **while plugging in the power** and keep holding. After
   ~5 s (modules found) every LED Button lights white and a buzzer clicks; hold **3 s more** and
-  the LEDs flash, the buzzer confirms, and the brain wipes credentials, product, roles and
+  the LEDs flash 3× and go **dark** (dark = accepted, let go), the buzzer plays two rising
+  notes, and the brain wipes credentials, product, roles and
   settings and reboots into the `noknok-setup` AP. Release earlier → normal boot. It runs only
   on the power-on run, before the cold-boot reload, so no Conductor ever exists in the process
   that downloads (DEV-32). A product with nothing pressable resets from the app (`factory_reset`
