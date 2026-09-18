@@ -92,6 +92,11 @@ the page is delivered.)
 **What happens after the reset**, in order — this is where firmware is actually
 handled, because it is the first point at which the Pico has internet:
 
+0. **Boot-hold factory reset** (power-on run only, code.py 0.18): if an LED
+   Button or Knob button is held from power-on, feedback after ~5 s (LED
+   Buttons white, buzzer click); still held 3 s later → the same wipe as the
+   `factory_reset` op, then reboot into the setup AP. Otherwise the boot
+   continues. Skipped on a factory-fresh device (nothing to reset).
 1. Join home WiFi, download `product.py` if missing.
 2. If a firmware check completed less than 24 h ago (time kept in
    `microcontroller.nvm`), skip to step 4 with the cache as the only image
@@ -166,7 +171,7 @@ the MCU id; `hello` returns the name). Implementation: `software/noknok_rpc.py`
 | `firmware.check` | `module_firmware{}` | as `/firmware/check` | AP time only: `resolved:false` |
 | `provision` | `ssid`, `password`, `script_url`, `module_firmware`, `product_id`, `config_defaults` | `accepted`, `mode` (`setup` / `switch`), `rebooting` | on the AP = `/connect`; on home WiFi = **product switch**: the network stays (a different `ssid` is refused — use setup mode), the request is parked, the brain reboots, downloads + compiles the new script **before** touching anything, and only on success replaces `product.py`, saves the new product and installs its `config_defaults`. A bad URL / dead uplink keeps product, settings and firmware as they were (`[CFG] product switch FAILED` event). |
 | `reboot` | — | `rebooting: true` | flushes settings, replies, resets 0.5 s later |
-| `factory_reset` | — | `resetting: true` | same wipe as the knob-hold gesture (both settings scopes too) |
+| `factory_reset` | — | `resetting: true` | same wipe as the boot-hold gesture (both settings scopes too); the only reset path for a product with nothing pressable |
 | `settings.get` | `scope` (`product` default / `device`) | `product`, `values`, `defaults`, `seq`, `dirty`, `error?` | poll `seq` to pick up knob-driven changes |
 | `settings.set` | `scope`, `values{}` | `changed{}`, `rejected{key: reason}`, `values`, `seq` | values are validated against the declared defaults' types (+ `#RRGGBB` / `HH:MM` formats); `ok:false, error:"rejected"` when nothing was accepted |
 | `settings.reset` | `scope` | `values`, `seq` | back to the product's defaults |

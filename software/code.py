@@ -1,5 +1,22 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.17 (reachable by the app after setup — DEV-34 dispatcher + /rpc)
+# Version: 0.18 (factory reset by boot-hold — one gesture for every product)
+#
+# v0.18 changes (Sue): factory reset by BOOT-HOLD.
+#   - Hold any LED Button or Knob button while plugging in the power and keep
+#     holding: once the modules are found (~5 s) every LED Button lights white
+#     and a buzzer (if any) clicks — "I see you"; hold 3 s more and the LEDs
+#     flash, the buzzer confirms and the brain wipes + reboots into the setup
+#     AP. Release earlier and the boot carries on untouched.
+#   - Runs ONLY on the power-on run (the one the cold-boot workaround reloads
+#     anyway) and BEFORE the reload, so the Conductor it needs never exists in
+#     the process that later downloads — the DEV-32 rule holds. Costs ~3-4 s
+#     per power-on, and nothing on a device with no credentials and no product
+#     (nothing to reset, so the check is skipped).
+#   - Why: products no longer have to reserve a gesture for the reset. The
+#     Smart Lamp Mini has one button and both of its gestures are taken; the
+#     runtime knob-hold (Conductor.check_factory_reset) stays available for
+#     products that still want it. A product with nothing pressable resets
+#     from the app (the factory_reset op).
 #
 # v0.17 changes (Sue): DEV-34 phase 1, the protocol dispatcher.
 #   - One message protocol (noknok_rpc.py, Confluence 113868802 §2): every
@@ -251,7 +268,7 @@ from adafruit_httpserver import Server, Request, Response, POST
 import noknok as nk          # filesystem policy helpers (DEV-18) + settings.toml
 import noknok_rpc as rpc     # Device Protocol v1: dispatcher + /rpc carrier (DEV-34)
 
-CODE_VERSION = "0.17"
+CODE_VERSION = "0.18"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -1878,6 +1895,80 @@ def check_and_flash_modules(module_firmware):
             _field_alerts.append("update failed %s %s" % (r["type"], r["uid"]))
     _mark_ota_checked()
 
+# ── Factory reset by boot-hold (v0.18) ────────────────────────────────────────
+# "Hold any button while plugging in" — the one reset gesture every product
+# shares, so product scripts need not reserve one. It needs enumerated modules
+# (a module is not addressable before enumeration), hence a Conductor, and a
+# Conductor before a download breaks the DEV-32 rule — so this runs only on
+# the power-on run, which reloads into a fresh process right after (see the
+# cold-boot workaround in main()). That fresh process has never had a Conductor.
+BOOT_HOLD_S      = 3.0          # hold this long AFTER the modules were found
+BOOT_HOLD_POLL_S = 0.05
+
+def _boot_hold_reset_check():
+    """Wipe + reboot into the setup AP if a button is held from power-on.
+    Best-effort: any error means a normal boot, never a stuck one."""
+    if not (load_wifi_credentials() or product_script_exists()):
+        return                      # factory-fresh: nothing to reset, save the 3 s
+    c = None
+    try:
+        from noknok import Conductor
+        c = Conductor()
+        if c.enumerate() == 0:      # I2C only: USB modules have nothing to press
+            return
+        pressables = list(c.ledbutton) + list(c.knob)
+        if not pressables:
+            return
+
+        def held():
+            for m in pressables:
+                st = m.read()
+                if st is not None and st.pressed:
+                    return True
+            return False
+
+        if not held():
+            return                  # the normal power-on
+
+        # Seen: feedback on everything that can give it, then keep watching.
+        print("[reset] button held at power-on — keep holding %.0f s to factory-reset"
+              % BOOT_HOLD_S)
+        for b in c.ledbutton:
+            b.set_color(255, 255, 255)
+        for z in c.buzzer:
+            z.play(880, 60, 60)
+        deadline = time.monotonic() + BOOT_HOLD_S
+        while time.monotonic() < deadline:
+            time.sleep(BOOT_HOLD_POLL_S)
+            if not held():
+                print("[reset] released — normal boot")
+                for b in c.ledbutton:
+                    b.led_off()
+                return
+
+        # Confirm, then wipe. factory_reset() hard-resets; we never return.
+        for _ in range(3):
+            for b in c.ledbutton:
+                b.led_off()
+            time.sleep(0.12)
+            for b in c.ledbutton:
+                b.set_color(255, 255, 255)
+            time.sleep(0.12)
+        for z in c.buzzer:
+            z.play(1320, 250, 80)
+        event("[RESET] factory reset via boot-hold")
+        nk.factory_reset(delay=0.4)
+    except Exception as e:
+        print(f"[reset] boot-hold check skipped: {e!r}")
+    finally:
+        # Free the pins; the reload that follows starts a fresh VM anyway.
+        try:
+            if c is not None:
+                c.i2c.deinit()
+        except Exception:
+            pass
+
+
 # ── Main flow ──────────────────────────────────────────────────────────────────
 
 def run_product(connected):
@@ -2025,6 +2116,7 @@ def main():
     # compile (precompiled .mpy / frozen modules, DEV-38) — then drop this.
     if _is_fresh_start():
         _set_crash_count(0)              # a power cycle always grants three fresh tries
+        _boot_hold_reset_check()         # v0.18: button held from power-on? wipe + AP
         print("[boot] power-on — reloading once (cold-boot WiFi workaround, see main())")
         supervisor.reload()
     log_new_boot()

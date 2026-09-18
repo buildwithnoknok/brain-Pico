@@ -231,10 +231,17 @@ Core:
 - Dynamic I2C addressing: modules boot at staging address `0x7F` and are assigned runtime
   addresses; `noknok_state.json` caches the UID→address map so reboots re-find modules without
   re-enumerating (and self-heals if hardware changed).
-- **`Conductor.check_factory_reset(knob_status)`** — call once per product loop, passing the
-  `KnobStatus` you already read. Hold the Knob button ~5 s to wipe `wifi.json`, `product.py` and
-  `noknok_roles.json` and reboot into the `noknok-setup` AP, so the app can install a different
-  product. `noknok_state.json` is deliberately **kept** (a soft reset doesn't power-cycle the
+- **Factory reset by boot-hold (code.py 0.18)** — the one reset gesture every product shares:
+  hold any LED Button or Knob button **while plugging in the power** and keep holding. After
+  ~5 s (modules found) every LED Button lights white and a buzzer clicks; hold **3 s more** and
+  the LEDs flash, the buzzer confirms, and the brain wipes credentials, product, roles and
+  settings and reboots into the `noknok-setup` AP. Release earlier → normal boot. It runs only
+  on the power-on run, before the cold-boot reload, so no Conductor ever exists in the process
+  that downloads (DEV-32). A product with nothing pressable resets from the app (`factory_reset`
+  op). Product scripts no longer need to reserve a gesture for this.
+- **`Conductor.check_factory_reset(knob_status)`** — the optional *runtime* gesture: call once
+  per product loop, passing the `KnobStatus` you already read. Hold the Knob button ~5 s for
+  the same wipe as above. `noknok_state.json` is deliberately **kept** (a soft reset doesn't power-cycle the
   modules, so they keep their addresses).
 - **`Conductor.detect_interaction(module_type, timeout, exclude)`** — return the UID of the
   module the customer interacts with (knob turn/press, LED-button press). Guides them with
