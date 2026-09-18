@@ -849,8 +849,7 @@ def _h_settings_set(args, msg):
 
 def _h_settings_reset(args, msg):
     scope, s = _settings_for(args)
-    values = s.reset()
-    s.apply_remote(values)              # the product hears about it like any app change
+    values = s.reset()                  # queues the differences for on_change
     log("[rpc] settings.reset %s" % scope)
     return {"scope": scope, "values": values, "seq": s.seq}
 

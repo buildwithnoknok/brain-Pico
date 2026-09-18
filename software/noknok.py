@@ -748,8 +748,15 @@ class Settings:
         return callback
 
     def reset(self):
-        """Back to defaults (app 'Reset to defaults' / provisioning)."""
+        """Back to defaults (app 'Reset to defaults'). Everything that actually
+        changes is handed to on_change like an app-side change, so the product
+        repaints."""
+        old = self._vals
         self._vals = dict(self._defs)
+        changed = {k: v for k, v in self._vals.items()
+                   if k not in old or old[k] != v}
+        if changed:
+            self._pending.update(changed)
         self._mark()
         return dict(self._vals)
 
