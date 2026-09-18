@@ -34,7 +34,9 @@ import time
 __version__ = "0.1"
 
 SERVICE_INTERVAL = 0.05     # s between carrier polls from the implicit hook
-SOCKET_TIMEOUT   = 0.2      # s a stalled client may hold poll() (default lib: 1 s)
+SOCKET_TIMEOUT   = 1.0      # s a stalled client may hold poll(). 0.2 s dropped the
+                            # bodies of phone requests (18 Sep): a phone's body
+                            # packet can trail its headers by hundreds of ms.
 MAX_BODY         = 4096     # bytes; a settings.set is ~100, a provision ~600
 LINK_CHECK_S     = 30       # how often service() looks at the WiFi link
 LINK_JOIN_S      = 5        # blocking budget for one rejoin attempt
@@ -136,7 +138,13 @@ class HttpCarrier:
             except BodyTooLarge as e:
                 reply = {"id": None, "ok": False, "error": "body too large", "limit": MAX_BODY}
             except Exception as e:
-                self.log("[rpc] bad json (%r)" % (e,))
+                snippet = body[:100] if isinstance(body, (str, bytes)) else body
+                self.log("[rpc] bad json (%r): %r len=%s ct=%r cl=%r" % (
+                    e, snippet, len(body) if body else 0,
+                    request.headers.get("Content-Type"),
+                    request.headers.get("Content-Length")))
+                _last_bad["body"] = repr(snippet)
+                _last_bad["error"] = repr(e)
                 reply = {"id": None, "ok": False, "error": "bad json"}
             else:
                 reply = d.dispatch(msg)
@@ -150,7 +158,7 @@ class HttpCarrier:
         self.server = srv
         return srv
 
-    BODY_GRACE = 0.3        # s to wait for the rest of a body that is still in flight
+    BODY_GRACE = 1.0        # s to wait for the rest of a body that is still in flight
 
     def _full_body(self, request):
         """The request body, complete. adafruit_httpserver hands over whatever
@@ -210,6 +218,7 @@ class HttpCarrier:
 
 # ── Servicing ────────────────────────────────────────────────────────────────
 
+_last_bad = {}              # last unparseable request, for `status` (diagnostics)
 _carrier  = None
 _next     = 0.0
 _busy     = False
@@ -278,10 +287,24 @@ def link_stats():
     return {"drops": _link["drops"], "rejoins": _link["rejoins"],
             "backoff": _link.get("backoff")}
 
+def no_power_save(logfn=print):
+    """Keep the radio awake. In power-save mode the CYW43 only listens every
+    beacon interval, so the second packet of a request (a phone sends headers
+    and body separately) trails by hundreds of ms — bodies were arriving empty
+    and every reply took ~0.4 s. A mains-powered product has no reason to save
+    radio power."""
+    try:
+        import wifi
+        wifi.radio.power_management = wifi.PowerManagement.NONE
+        logfn("[wifi] power management off (low latency)")
+    except Exception as e:
+        logfn("[wifi] power management not settable (%r)" % (e,))
+
 def start_http(pool, port=80, logfn=print):
     """Bind the HTTP carrier (setup AP or home WiFi). Returns the carrier."""
     global _carrier, _logfn
     _logfn = logfn
+    no_power_save(logfn)
     stop_http()
     _carrier = HttpCarrier(dispatcher(), logfn)
     _carrier.start(pool, port)

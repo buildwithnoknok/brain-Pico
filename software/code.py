@@ -748,6 +748,7 @@ def _h_status(args, msg):
         "mem_free": gc.mem_free(),
         "ip": str(wifi.radio.ipv4_address) if wifi.radio.connected else None,
         "link": rpc.link_stats(),
+        "last_bad_request": rpc._last_bad,
         "modules": modules,
         "events": ev[since:],
         "events_total": len(ev),
