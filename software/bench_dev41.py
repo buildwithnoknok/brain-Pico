@@ -7,6 +7,9 @@
 #
 # Pass = every step prints "ok" with module error 0 and the screen shows what the
 # step says. Nothing here needs firmware beyond display v0.2.0.
+# NOTE: the module's error byte is STICKY on fw 0.5.0 (never cleared), so start
+# from a freshly power-cycled display; a stale non-zero value fails every step.
+# A value of 4 appearing mid-run = the rare I2C lost-command race (DEV-41 notes).
 
 import time
 import board
@@ -103,6 +106,38 @@ ART = ["#......#......#.",
        ".......#........"]
 step("image (ASCII art x4)",
      lambda: d.image(Bitmap.from_rows(ART), x=8, y=20, w=64, color=WHITE), 2.0)
+
+# 6b. A real 1-bit .bmp decoded ON THE PICO (built in RAM, no file write needed):
+#     exercises struct/seek/classmethod on CircuitPython and the size cap.
+def s_bmp():
+    import io, struct
+    rows = ["#........#", ".#......#.", "..#....#..", "..#....#..", ".#......#.", "#........#"]
+    w, h = 10, 6
+    stride = ((w + 31) // 32) * 4
+    pix = bytearray()
+    for r in reversed(rows):                              # BMP rows are bottom-up
+        b = bytearray(stride)
+        for x, ch in enumerate(r):
+            if ch == "#":
+                b[x >> 3] |= 0x80 >> (x & 7)
+        pix += b
+    off = 14 + 40 + 8
+    hdr = b"BM" + struct.pack("<IHHI", off + len(pix), 0, 0, off)
+    dib = struct.pack("<IiiHHIIiiII", 40, w, h, 1, 1, 0, len(pix), 2835, 2835, 2, 2)
+    pal = bytes([0, 0, 0, 0, 255, 255, 255, 0])
+    bm = Bitmap.from_bmp(io.BytesIO(hdr + dib + pal + pix))
+    if bm.rows() != rows:
+        raise ValueError("bmp rows decoded wrong: %r" % bm.rows())
+    big = struct.pack("<IiiHHIIiiII", 40, 4000, 4000, 1, 1, 0, 0, 0, 0, 2, 2)
+    try:
+        Bitmap.from_bmp(io.BytesIO(hdr + big + pal + pix))
+        raise ValueError("size cap did not trigger")
+    except ValueError as e:
+        if "too big" not in str(e):
+            raise
+    d.image(bm, x=0, y=0, w=80, color=CYAN)               # 10x6 -> 80x48
+    return "bmp decoded + size cap ok; look: cyan X"
+step("bmp decode on Pico", s_bmp, 2.0)
 
 # 7. Regions: a live value, an icon slot, right/center alignment.
 def s_regions():
