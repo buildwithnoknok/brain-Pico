@@ -18,15 +18,13 @@
 #   buzzer / knob / LED button onto the bus to borrow its pull-ups, otherwise
 #   the bus won't come up at all.
 #
-# ── What works today vs. what needs Sam's stage-2 firmware ───────────────────
-#   Works on display firmware v0.1.0:  clear, rect, backlight, on/off/sleep,
-#                                      info, version
-#   Needs stage-2 firmware (text/blit): text, size, color, bg, demo
-#   The text commands will simply report an error until that firmware is on the
-#   module — nothing here will crash or hang.
+# ── Firmware needed ──────────────────────────────────────────────────────────
+#   Everything here works on display firmware v0.2.0 or later (v0.5.0 is
+#   current). Icons, images, print and regions are rendered on the Pico and
+#   sent over the existing 1bpp blit, so they need no firmware support at all.
 
 import time
-from noknok import Conductor, COLORS, rgb565     # noqa: F401  (rgb565 handy in REPL)
+from noknok import Conductor, COLORS, rgb565, icon_names   # noqa: F401
 
 BANNER = """
 ========================================
@@ -49,7 +47,17 @@ Commands:
   info            ask the module its size, colour depth, fonts, icons
   version         installed firmware version
   demo            a quick showcase of sizes and colours
+  demo2           the DEV-41 showcase: print, icons, image, regions
   status          show the current text settings
+
+The easy way (DEV-41):
+  p <text>        d.print(): next line each time, wraps, scrolls when full
+  icon <name> [x y] [size]     draw a built-in icon, e.g.  icon wifi 60 2
+  icons           list the icon names
+  image <path> [x y] [w]       draw a 1-bit .bmp from the Pico's flash
+  region <name> <x> <y> <w> <h> [size]   define a named box
+  set <name> text <words...>   |  set <name> icon <iconname>   |  set <name>
+                  update / wipe a named box (only that box is redrawn)
   help            this list
   q               quit
 
@@ -244,6 +252,83 @@ def main():
             run_demo(d)
             continue
 
+        if cmd == "demo2":
+            run_demo2(d)
+            continue
+
+        # ── DEV-41: print / icons / images / regions ─────────────────────────
+        if cmd == "p":
+            try:
+                y = d.print(line[2:])
+                print("  printed. Next line at y=%d." % y)
+            except Exception as e:
+                print("  Could not print that: %s" % e)
+            continue
+
+        if cmd == "icons":
+            print("  " + ", ".join(icon_names()))
+            continue
+
+        if cmd == "icon":
+            try:
+                name = args[0]
+                x = int(args[1]) if len(args) > 1 else state["x"]
+                y = int(args[2]) if len(args) > 2 else state["y"]
+                size = int(args[3]) if len(args) > 3 else None
+                state["y"] = d.icon(name, x=x, y=y, size=size,
+                                    color=state["color"], bg=state["bg"])
+                print("  icon drawn. Next line at y=%d." % state["y"])
+            except (IndexError, ValueError) as e:
+                print("  Usage: icon <name> [x y] [size]   e.g.  icon wifi 60 2")
+                print("  %s" % e)
+            continue
+
+        if cmd == "image":
+            try:
+                path = args[0]
+                x = int(args[1]) if len(args) > 1 else 0
+                y = int(args[2]) if len(args) > 2 else 0
+                w = int(args[3]) if len(args) > 3 else None
+                state["y"] = d.image(path, x=x, y=y, w=w,
+                                     color=state["color"], bg=state["bg"])
+                print("  image drawn. Next line at y=%d." % state["y"])
+            except (IndexError, ValueError, OSError) as e:
+                print("  Usage: image </path/file.bmp> [x y] [w]   (1-bit .bmp)")
+                print("  %s" % e)
+            continue
+
+        if cmd == "region":
+            try:
+                name = args[0]
+                x, y, w, h = [int(v) for v in args[1:5]]
+                size = int(args[5]) if len(args) > 5 else 16
+                d.region(name, x, y, w, h, size=size, color=state["color"])
+                print("  region %r = %d,%d %dx%d. Now: set %s text ..." % (name, x, y, w, h, name))
+            except (IndexError, ValueError) as e:
+                print("  Usage: region <name> <x> <y> <w> <h> [size]   e.g.  region temp 0 40 80 32 32")
+                print("  %s" % e)
+            continue
+
+        if cmd == "set":
+            try:
+                name = args[0]
+                kind = args[1] if len(args) > 1 else None
+                if kind == "text":
+                    d.set(name, text=" ".join(args[2:]))
+                elif kind == "icon":
+                    d.set(name, icon=args[2])
+                elif kind == "image":
+                    d.set(name, image=args[2])
+                elif kind is None:
+                    d.set(name)
+                else:
+                    raise ValueError("second word must be text, icon or image")
+                print("  region %r updated." % name)
+            except (IndexError, ValueError, OSError) as e:
+                print("  Usage: set <name> text <words>  |  set <name> icon <iconname>  |  set <name>")
+                print("  %s" % e)
+            continue
+
         # ── anything else = text to draw ─────────────────────────────────────
         try:
             state["y"] = d.text(line,
@@ -279,6 +364,55 @@ def run_demo(d):
         y += 2
 
     d.text("Any size!", size=13, x=2, y=y + 4, color=COLORS["lime"])
+    print("  Demo done.")
+
+
+def run_demo2(d):
+    """DEV-41 showcase: print() as a terminal, icons, an image, live regions."""
+    print("  Running the DEV-41 demo — watch the screen...")
+    d.clear(COLORS["black"])
+
+    # 1. as simple as print()
+    d.print("Hello World")
+    d.print("Temp:", 22.5, "C")
+    d.print("Big", size=24, color=COLORS["yellow"])
+    time.sleep(1.5)
+
+    # 2. every icon, 16 px, in a grid
+    d.clear(COLORS["black"])
+    names = icon_names()
+    for i, name in enumerate(names):
+        d.icon(name, x=4 + (i % 4) * 19, y=4 + (i // 4) * 19, color=COLORS["cyan"])
+    d.text("icons", size=8, x=2, y=90, color=COLORS["grey"])
+    time.sleep(1.5)
+
+    # 3. one icon at several sizes (host-scaled, no firmware icon store)
+    d.clear(COLORS["black"])
+    x = 0
+    for size in (16, 24, 32):
+        d.icon("wifi", x=x, y=4, size=size, color=COLORS["noknok"])
+        x += size + 4
+    d.icon("heart", x=8, y=48, size=64, color=COLORS["red"])
+    time.sleep(1.5)
+
+    # 4. regions: a live value that never flickers
+    d.clear(COLORS["black"])
+    d.region("title", 0, 0, 80, 16, size=16, align="center")
+    d.region("value", 0, 40, 80, 32, size=32, align="right", color=COLORS["yellow"])
+    d.region("net", 62, 140, 18, 18)
+    d.set("title", text="counter")
+    d.set("net", icon="wifi")
+    for n in range(0, 11):
+        d.set("value", text=str(n * 10))
+        time.sleep(0.15)
+    d.set("net", icon="check", color=COLORS["green"])
+
+    # 5. scrolling terminal
+    time.sleep(1.0)
+    d.clear(COLORS["black"])
+    for i in range(1, 13):
+        d.print("line", i)
+        time.sleep(0.12)
     print("  Demo done.")
 
 

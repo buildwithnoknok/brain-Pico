@@ -1,4 +1,4 @@
-# noknok.py  v1.8
+# noknok.py  v1.9
 # CircuitPython library for the noknok modular ecosystem
 # Raspberry Pi Pico — I2C master ("Conductor")
 #
@@ -46,6 +46,14 @@
 #             exposes the product's Conductor to the RPC handlers; the
 #             factory-reset wipe is a module function shared with the
 #             `factory_reset` op. No API removed; makers add zero lines.
+# v1.9 (Sue): DEV-41 — the Display for everyone. d.print() works like Python's
+#             print() (cursor, wrapping, scrolling); d.icon("wifi") draws from a
+#             built-in named icon set rendered on the Pico and blitted, so the
+#             module needs no icon store; d.image("/pic.bmp") draws a 1-bit BMP;
+#             d.region()/d.set() update a named box by name. New Bitmap class
+#             (ASCII-art or .bmp -> 1bpp). Fixed the native text sizes: the
+#             module has ONE 8x8 font scaled 1-8 (8..64 px), the old table
+#             assumed an 8x16 font and drew 16 px text 8 px tall.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -56,14 +64,17 @@
 #   c.buzzer[0].play(440, 500)                # or by type + index
 #   c.ledbutton[0].set_color(255, 0, 0)       # red LED on LED button module
 #   c.display[0].text("Hello", size=24)       # text on the display module
+#   c.display[0].print("Hello World")         # ...or just print() to it
+#   c.display[0].icon("wifi", x=60, y=2)      # built-in icon, any size
 
 import busio
 import board
 import time
 import json
 import os
+import struct
 
-__version__ = "1.8"
+__version__ = "1.9"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -2889,6 +2900,452 @@ class BdfFont:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# BITMAPS AND ICONS (DEV-41)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Everything the display shows beyond its own tiny font is rendered on the Pico
+# as a 1-bit-per-pixel picture and streamed to the module, which paints "on"
+# pixels in one colour and "off" pixels in another. That is what makes the
+# display unlimited: icons, logos, glyphs from any font — the module never has
+# to store any of it. Bitmap is that picture. Makers make one three ways:
+#
+#     Bitmap.from_rows(["..##..",         # draw it as ASCII art in your code
+#                       ".####.",
+#                       "..##.."])
+#     Bitmap.from_bmp("/pics/logo.bmp")   # a 1-bit .bmp saved by any paint app
+#     Bitmap(16, 16, packed_bytes)        # raw rows, MSB = leftmost pixel
+#
+# and hand it to d.icon(), d.image() or d.set().
+
+class Bitmap:
+    """
+    A 1-bit-per-pixel image: `width` x `height` pixels, rows packed MSB-first
+    and padded to whole bytes (exactly the layout the display module streams).
+
+        bm = Bitmap.from_rows(["#..#", ".##.", ".##.", "#..#"])
+        bm.get(1, 1)          -> True
+        bm.scaled(8, 8)       -> a new 8x8 Bitmap (nearest-neighbour)
+        bm.flipped()          -> upside down;  bm.rotated() -> 90° clockwise
+    """
+    __slots__ = ("width", "height", "row_bytes", "data")
+
+    def __init__(self, width, height, data=None):
+        self.width     = int(width)
+        self.height    = int(height)
+        self.row_bytes = (self.width + 7) // 8
+        n = self.row_bytes * self.height
+        if data is None:
+            self.data = bytearray(n)
+        else:
+            self.data = bytearray(data)
+            if len(self.data) < n:
+                raise ValueError("Bitmap needs %d bytes for %dx%d, got %d"
+                                 % (n, self.width, self.height, len(self.data)))
+
+    @classmethod
+    def from_rows(cls, rows, on="#"):
+        """Build from a list of strings, one per row; every `on` character is a
+        lit pixel, anything else is dark. Short rows are padded with dark."""
+        h = len(rows)
+        w = 0
+        for r in rows:
+            if len(r) > w:
+                w = len(r)
+        bm = cls(w, h)
+        for y in range(h):
+            row = rows[y]
+            base = y * bm.row_bytes
+            for x in range(len(row)):
+                if row[x] == on:
+                    bm.data[base + (x >> 3)] |= 0x80 >> (x & 7)
+        return bm
+
+    @classmethod
+    def from_bmp(cls, path, invert=False):
+        """
+        Load a 1-bit (monochrome) Windows .bmp file. Save one from any paint
+        program with "Monochrome bitmap" / "1-bit" as the colour mode.
+
+        The BRIGHTER of the file's two colours becomes the lit pixels — so draw
+        the picture in white on black (or black on white, it's detected) and
+        it shows up in whatever `color` you draw it with. `invert=True` swaps.
+        Only uncompressed 1-bit files are accepted; anything else raises
+        ValueError telling you why.
+        """
+        with open(path, "rb") as f:
+            hdr = f.read(54)
+            if len(hdr) < 54 or hdr[0:2] != b"BM":
+                raise ValueError("%s is not a .bmp file" % path)
+            data_off = struct.unpack("<I", hdr[10:14])[0]
+            dib      = struct.unpack("<I", hdr[14:18])[0]
+            w, h     = struct.unpack("<ii", hdr[18:26])
+            bpp      = struct.unpack("<H", hdr[28:30])[0]
+            comp     = struct.unpack("<I", hdr[30:34])[0]
+            if bpp != 1:
+                raise ValueError("%s is %d-bit; save it as a 1-bit (monochrome) "
+                                 "bitmap" % (path, bpp))
+            if comp != 0:
+                raise ValueError("%s is compressed; save it uncompressed" % path)
+            top_down = h < 0
+            h = -h if top_down else h
+            if w <= 0 or h <= 0 or w > 4096 or h > 4096:
+                raise ValueError("%s has an unusable size %dx%d" % (path, w, h))
+            # Palette: two BGRA entries right after the DIB header. Whichever is
+            # brighter is "lit", so both white-on-black and black-on-white work.
+            f.seek(14 + dib)
+            pal = f.read(8)
+            if len(pal) == 8:
+                lum0 = pal[0] + pal[1] + pal[2]
+                lum1 = pal[4] + pal[5] + pal[6]
+                if lum0 > lum1:
+                    invert = not invert
+            bm     = cls(w, h)
+            stride = ((w + 31) // 32) * 4          # BMP rows pad to 4 bytes
+            rb     = bm.row_bytes
+            for y in range(h):
+                src_row = y if top_down else (h - 1 - y)   # BMP is bottom-up
+                f.seek(data_off + src_row * stride)
+                row = f.read(rb)
+                if len(row) < rb:
+                    raise ValueError("%s ends early — corrupt file?" % path)
+                base = y * rb
+                if invert:
+                    for i in range(rb):
+                        bm.data[base + i] = row[i] ^ 0xFF
+                else:
+                    bm.data[base:base + rb] = row
+        return bm
+
+    def get(self, x, y):
+        """True if pixel (x, y) is lit. Off-image = False."""
+        if x < 0 or y < 0 or x >= self.width or y >= self.height:
+            return False
+        return bool(self.data[y * self.row_bytes + (x >> 3)] & (0x80 >> (x & 7)))
+
+    def set(self, x, y, on=True):
+        """Light (or clear) pixel (x, y). Off-image is ignored."""
+        if x < 0 or y < 0 or x >= self.width or y >= self.height:
+            return
+        i = y * self.row_bytes + (x >> 3)
+        if on:
+            self.data[i] |= 0x80 >> (x & 7)
+        else:
+            self.data[i] &= ~(0x80 >> (x & 7)) & 0xFF
+
+    def scaled(self, width, height):
+        """A new Bitmap resized to width x height (nearest-neighbour, so pixel
+        art stays crisp). Same size -> returns self."""
+        width, height = int(width), int(height)
+        if width == self.width and height == self.height:
+            return self
+        out = Bitmap(width, height)
+        sw, sh = self.width, self.height
+        for y in range(height):
+            sy    = (y * sh) // height
+            sbase = sy * self.row_bytes
+            obase = y * out.row_bytes
+            for x in range(width):
+                sx = (x * sw) // width
+                if self.data[sbase + (sx >> 3)] & (0x80 >> (sx & 7)):
+                    out.data[obase + (x >> 3)] |= 0x80 >> (x & 7)
+        return out
+
+    def cropped(self, width, height):
+        """The top-left width x height corner as a new Bitmap."""
+        width  = min(int(width), self.width)
+        height = min(int(height), self.height)
+        if width == self.width and height == self.height:
+            return self
+        out = Bitmap(width, height)
+        rb  = out.row_bytes
+        for y in range(height):
+            s = y * self.row_bytes
+            out.data[y * rb:(y + 1) * rb] = self.data[s:s + rb]
+        # bits past `width` in the last byte are ignored by every consumer
+        return out
+
+    def flipped(self):
+        """A new Bitmap mirrored top-to-bottom."""
+        out = Bitmap(self.width, self.height)
+        rb  = self.row_bytes
+        for y in range(self.height):
+            s = (self.height - 1 - y) * rb
+            out.data[y * rb:(y + 1) * rb] = self.data[s:s + rb]
+        return out
+
+    def rotated(self):
+        """A new Bitmap turned 90° clockwise (width and height swap)."""
+        out = Bitmap(self.height, self.width)
+        for y in range(self.height):
+            for x in range(self.width):
+                if self.get(x, y):
+                    out.set(self.height - 1 - y, x)
+        return out
+
+    def rows(self, on="#", off="."):
+        """The image as a list of strings — handy for printing to the REPL."""
+        return ["".join(on if self.get(x, y) else off for x in range(self.width))
+                for y in range(self.height)]
+
+    def __repr__(self):
+        return "Bitmap(%dx%d)" % (self.width, self.height)
+
+
+# Built-in icons, 16x16, drawn as ASCII art so anyone can read, copy and tweak
+# them. Decoded into a Bitmap on first use and cached. Add your own the same
+# way: ICONS["myicon"] = ["....", ...] and then d.icon("myicon").
+# arrow_down/left/right are derived from arrow_up (see icon_bitmap()).
+ICONS = {
+    "wifi": [
+        "................",
+        "....########....",
+        "..##........##..",
+        ".#............#.",
+        "#....######....#",
+        "....#......#....",
+        "...#........#...",
+        "......####......",
+        ".....#....#.....",
+        "................",
+        ".......##.......",
+        "......####......",
+        "......####......",
+        ".......##.......",
+        "................",
+        "................",
+    ],
+    "battery": [
+        "................",
+        "................",
+        "................",
+        ".############...",
+        ".#..........#...",
+        ".#.########.##..",
+        ".#.########..#..",
+        ".#.########..#..",
+        ".#.########..#..",
+        ".#.########.##..",
+        ".#..........#...",
+        ".############...",
+        "................",
+        "................",
+        "................",
+        "................",
+    ],
+    "battery_low": [
+        "................",
+        "................",
+        "................",
+        ".############...",
+        ".#..........#...",
+        ".#.##.......##..",
+        ".#.##........#..",
+        ".#.##........#..",
+        ".#.##........#..",
+        ".#.##.......##..",
+        ".#..........#...",
+        ".############...",
+        "................",
+        "................",
+        "................",
+        "................",
+    ],
+    "check": [
+        "................",
+        "................",
+        "................",
+        "..............#.",
+        ".............##.",
+        "............##..",
+        "...........##...",
+        "..........##....",
+        "..#......##.....",
+        "..##....##......",
+        "...##..##.......",
+        "....####........",
+        ".....##.........",
+        "................",
+        "................",
+        "................",
+    ],
+    "cross": [
+        "................",
+        "................",
+        "..##........##..",
+        "..###......###..",
+        "...###....###...",
+        "....###..###....",
+        ".....######.....",
+        "......####......",
+        "......####......",
+        ".....######.....",
+        "....###..###....",
+        "...###....###...",
+        "..###......###..",
+        "..##........##..",
+        "................",
+        "................",
+    ],
+    "warning": [
+        ".......##.......",
+        ".......##.......",
+        "......#..#......",
+        "......#..#......",
+        ".....#....#.....",
+        ".....#.##.#.....",
+        "....#..##..#....",
+        "....#..##..#....",
+        "...#...##...#...",
+        "...#...##...#...",
+        "..#..........#..",
+        "..#....##....#..",
+        ".#.....##.....#.",
+        ".#............#.",
+        "################",
+        "................",
+    ],
+    "play": [
+        "................",
+        "................",
+        "....#...........",
+        "....##..........",
+        "....###.........",
+        "....####........",
+        "....#####.......",
+        "....######......",
+        "....######......",
+        "....#####.......",
+        "....####........",
+        "....###.........",
+        "....##..........",
+        "....#...........",
+        "................",
+        "................",
+    ],
+    "pause": [
+        "................",
+        "................",
+        "....##....##....",
+        "....##....##....",
+        "....##....##....",
+        "....##....##....",
+        "....##....##....",
+        "....##....##....",
+        "....##....##....",
+        "....##....##....",
+        "....##....##....",
+        "....##....##....",
+        "....##....##....",
+        "....##....##....",
+        "................",
+        "................",
+    ],
+    "gear": [
+        "......####......",
+        "......####......",
+        "..##..####..##..",
+        "..############..",
+        "...##########...",
+        "..####....####..",
+        ".####......####.",
+        "######......####",
+        "######......####",
+        ".####......####.",
+        "..####....####..",
+        "...##########...",
+        "..############..",
+        "..##..####..##..",
+        "......####......",
+        "......####......",
+    ],
+    "arrow_up": [
+        "................",
+        ".......##.......",
+        "......####......",
+        ".....######.....",
+        "....########....",
+        "...##########...",
+        "..####.##.####..",
+        ".###...##...###.",
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
+        "................",
+        "................",
+    ],
+    "heart": [
+        "................",
+        "................",
+        "..###.....###...",
+        ".#####...#####..",
+        "###############.",
+        "###############.",
+        "###############.",
+        "###############.",
+        ".#############..",
+        "..###########...",
+        "...#########....",
+        "....#######.....",
+        ".....#####......",
+        "......###.......",
+        ".......#........",
+        "................",
+    ],
+    "bell": [
+        ".......##.......",
+        ".......##.......",
+        ".....######.....",
+        "....#......#....",
+        "...#........#...",
+        "...#........#...",
+        "...#........#...",
+        "...#........#...",
+        "...#........#...",
+        "..#..........#..",
+        "..#..........#..",
+        ".#............#.",
+        "################",
+        "................",
+        "......####......",
+        ".......##.......",
+    ],
+}
+
+_ICON_CACHE = {}
+
+
+def icon_names():
+    """Names you can pass to d.icon(), sorted."""
+    names = list(ICONS.keys()) + ["arrow_down", "arrow_left", "arrow_right"]
+    names.sort()
+    return names
+
+
+def icon_bitmap(name):
+    """The Bitmap for a built-in icon name (cached). Raises ValueError with the
+    list of valid names if it doesn't exist."""
+    bm = _ICON_CACHE.get(name)
+    if bm is not None:
+        return bm
+    if name in ICONS:
+        bm = Bitmap.from_rows(ICONS[name])
+    elif name == "arrow_down":
+        bm = icon_bitmap("arrow_up").flipped()
+    elif name == "arrow_right":
+        bm = icon_bitmap("arrow_up").rotated()
+    elif name == "arrow_left":
+        bm = icon_bitmap("arrow_up").rotated().rotated().rotated()
+    else:
+        raise ValueError("unknown icon %r — pick one of: %s"
+                         % (name, ", ".join(icon_names())))
+    _ICON_CACHE[name] = bm
+    return bm
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 class NoknokDisplay:
     """
     Driver for the noknok Display Module (noknokdisplay, MODULE_TYPE 0x05).
@@ -2904,25 +3361,40 @@ class NoknokDisplay:
         d = c.display[0]              # by discovery index
         d = c.role["screen"]          # by role name (after load_roles)
 
+    The simplest thing that works — it behaves like Python's print():
+        d.print("Hello World")                # next line each call, wraps,
+        d.print("Temp:", 22.5, "C")           # scrolls when the screen is full
+
     Everyday use:
         d.clear(BLACK)                        # wipe the screen
         d.text("Hello", size=16)              # text, any pixel size you like
         d.text("22.5 C", size=32, x=4, y=40, color=YELLOW)
+        d.icon("wifi", x=60, y=2)             # built-in icon (see icon_names())
+        d.image("/pics/logo.bmp", x=8, y=40)  # a 1-bit .bmp from your paint app
         d.fill_rect(0, 0, 80, 10, RED)        # a bar
         d.backlight(0.8)                      # 80 % brightness
         d.off() / d.on() / d.sleep()
         print(d.info())                       # 80x160, RGB565, ...
+
+    Named regions — define a box once, update it by name (only that box is
+    redrawn, so a live value never flickers):
+        d.region("temp", 0, 40, 80, 32, size=32, color=YELLOW, align="right")
+        d.region("net", 60, 0, 20, 16)
+        d.set("temp", text="22.5")            # later, as often as you like
+        d.set("net", icon="wifi")
 
     About `size`
     ------------
     `size` is the PIXEL HEIGHT of the text and it is ALWAYS exact — ask for 27
     and you get 27 pixels tall. Behind the scenes the library picks the fastest
     of three routes automatically; you never have to think about it:
-      1. sizes the module can draw itself (8, 16, 24, 32, 48, 64) -> one small
-         command, the module renders it (~2 ms).
+      1. multiples of 8 up to 64 -> the module scales its own 8x8 font: one
+         small command, ~2 ms. Blocky at big sizes, but fast.
       2. any other size -> the Pico scales its BUILT-IN 8x16 font and sends the
          finished pixels as a 1-bit-per-pixel blit. No font file needed.
       3. font="/fonts/mine.bdf" -> the Pico uses YOUR font, same blit path.
+    Prefer looks over speed? `d.native_text = False` sends every size through
+    route 2 (the 8x16 font is smoother than the module's doubled 8x8).
 
     About backgrounds
     -----------------
@@ -2945,7 +3417,7 @@ class NoknokDisplay:
     _CMD_CLEAR         = 0x01   # [0x01, colHi, colLo]
     _CMD_FILL_RECT     = 0x02   # [0x02, x, y, w, h, colHi, colLo]
     _CMD_DRAW_TEXT     = 0x03   # [0x03, x, y, style, fgHi, fgLo, bgHi, bgLo, chars...]
-    _CMD_DRAW_ICON     = 0x04   # [0x04, x, y, iconId, scale, fgHi, fgLo, bgHi, bgLo]
+    _CMD_DRAW_ICON     = 0x04   # reserved — icons are host-blitted (DEV-41)
     _CMD_BLIT_BEGIN    = 0x05   # [0x05, x, y, w, h, fgHi, fgLo, bgHi, bgLo, flags]
     _CMD_BLIT_DATA     = 0x06   # [0x06, <=64 bytes of 1bpp rows]
     _CMD_SET_BACKLIGHT = 0x10   # [0x10, level 0-255]
@@ -2956,19 +3428,22 @@ class NoknokDisplay:
     _MAX_BLIT_CHUNK = 64
     _MAX_TEXT_CHARS = 60
 
-    # Module-side fonts: index -> (cell width, cell height). Index 0 = the small
-    # 6x8 font, index 1 = the 8x16 font. Scale is an integer 1-4.
-    _MODULE_FONTS = {0: (6, 8), 1: (8, 16)}
+    # Module-side fonts: index -> (cell width, cell height). Firmware v0.2.0+
+    # has exactly ONE font, 8x8, and scales it by an integer 1-8 (it ignores
+    # the font-index bits of the style byte). Keep in step with the firmware.
+    _MODULE_FONTS = {0: (8, 8)}
 
     # Pixel heights the MODULE can render on its own: height -> (font index, scale).
     # Anything not in here is rendered on the Pico and blitted instead.
     _NATIVE_SIZES = {
         8:  (0, 1),
-        16: (1, 1),
+        16: (0, 2),
         24: (0, 3),
-        32: (1, 2),
-        48: (1, 3),
-        64: (1, 4),
+        32: (0, 4),
+        40: (0, 5),
+        48: (0, 6),
+        56: (0, 7),
+        64: (0, 8),
     }
 
     # Used only if GET_INFO never answers (very old firmware / bus trouble), so
@@ -2984,6 +3459,20 @@ class NoknokDisplay:
         self._bg        = BLACK   # last clear() colour = default text background
         self._backlight = None    # last level we set (0-255), for role_cue()
         self.auto_wait  = True    # wait for the module to finish before each draw
+        self.native_text = True   # False = never use the module's 8x8 font
+        # print() — a little terminal: lines drawn so far, whether the last
+        # print() left its line open (end=""), and the y below the last line.
+        self._term      = []      # [paragraph text, size, colour] per line
+        self._term_open = False
+        self._term_y    = 0
+        self.print_size  = 16     # defaults for print(); change them any time
+        self.print_color = WHITE
+        self.print_x     = 0      # left margin in pixels
+        # print() uses the Pico's 8x16 font: 10 columns at 16 px on this panel
+        # and a normal text shape. True = the module's square 8x8 font instead:
+        # ~5x faster to send, but only 5 columns at 16 px.
+        self.print_native = False
+        self._regions   = {}      # name -> dict, see region()
         # Filled in by Conductor.enumerate() via GET_VERSION; safe defaults here
         # so a hand-built instance never raises AttributeError.
         self.protocol_version = None
@@ -3115,8 +3604,12 @@ class NoknokDisplay:
         """
         Fill the whole screen with one colour and remember it as the default
         text background (so text() can cover its own footprint cleanly).
+        Also puts print() back at the top. Regions keep their definitions.
         """
         self._bg = color
+        self._term      = []
+        self._term_open = False
+        self._term_y    = 0
         c = rgb565(color)
         return self._draw([self._CMD_CLEAR, (c >> 8) & 0xFF, c & 0xFF])
 
@@ -3145,19 +3638,70 @@ class NoknokDisplay:
         h = min(h, dh - y, 255)
         return (x, y, max(0, w), max(0, h))
 
-    def icon(self, icon_id, x=0, y=0, scale=1, color=WHITE, bg="auto"):
+    # ── Icons and images (DEV-41: rendered on the Pico, streamed as 1bpp) ─────
+
+    def icon(self, name, x=0, y=0, scale=1, size=None, color=WHITE, bg="auto"):
         """
-        Draw one of the module's built-in icons.
-            d.icon(3, x=10, y=10, scale=2, color=GREEN)
-        `bg="auto"` = the last clear() colour, None = transparent.
-        (Needs display firmware with the icon set — see info().n_icons.)
+        Draw an icon. `name` is one of the built-in names (icon_names() lists
+        them: wifi, battery, battery_low, check, cross, warning, play, pause,
+        gear, arrow_up/down/left/right, heart, bell) or your own Bitmap.
+
+            d.icon("wifi", x=60, y=2)                    # 16x16
+            d.icon("battery_low", x=0, y=0, scale=2, color=RED)   # 32x32
+            d.icon("check", size=40, color=GREEN)        # any pixel height
+            d.icon(Bitmap.from_rows([...]), x=10, y=10)  # your own
+
+        `scale` is an integer multiplier of the icon's own size; `size` is an
+        exact pixel height and wins if both are given. Width follows the
+        icon's aspect ratio. `bg="auto"` = the last clear() colour (opaque, so
+        a changing icon replaces the old one cleanly); None = transparent.
+        Returns the y just below the icon, like text().
         """
+        bm = name if isinstance(name, Bitmap) else icon_bitmap(name)
+        h  = int(size) if size is not None else bm.height * max(1, int(scale))
+        w  = max(1, (bm.width * h) // max(1, bm.height))
+        self._blit_bitmap(bm, x, y, w, h, color, bg)
+        return int(y) + h
+
+    def image(self, source, x=0, y=0, w=None, h=None, color=WHITE, bg="auto",
+              invert=False):
+        """
+        Draw a picture: a path to a 1-bit .bmp file, or a Bitmap.
+
+            d.image("/pics/logo.bmp")                 # at its own size, top-left
+            d.image("/pics/logo.bmp", x=8, y=40, w=64) # resized, keeps aspect
+            d.image(bm, color=NOKNOK, bg=None)        # tinted, transparent
+
+        Lit pixels are drawn in `color`, dark ones in `bg` ("auto" = the last
+        clear() colour; None = transparent). Give `w` and/or `h` to resize —
+        one of them keeps the aspect ratio. Bigger than the panel is clipped.
+        Returns the y just below the picture, like text().
+        """
+        bm = source if isinstance(source, Bitmap) else Bitmap.from_bmp(source, invert)
+        if w is None and h is None:
+            w, h = bm.width, bm.height
+        elif h is None:
+            h = max(1, (bm.height * int(w)) // max(1, bm.width))
+        elif w is None:
+            w = max(1, (bm.width * int(h)) // max(1, bm.height))
+        self._blit_bitmap(bm, x, y, int(w), int(h), color, bg)
+        return int(y) + int(h)
+
+    def _blit_bitmap(self, bm, x, y, w, h, color, bg):
+        """Send a Bitmap to the panel at x,y, resized to w x h and clipped to
+        the panel. Negative x/y are clamped to 0 (the image is not shifted)."""
         fg = rgb565(color)
-        bgc, _ = self._bg_value(bg)
-        return self._draw([self._CMD_DRAW_ICON, int(x) & 0xFF, int(y) & 0xFF,
-                           int(icon_id) & 0xFF, max(1, min(4, int(scale))),
-                           (fg >> 8) & 0xFF, fg & 0xFF,
-                           (bgc >> 8) & 0xFF, bgc & 0xFF])
+        bgc, transparent = self._bg_value(bg)
+        x, y = max(0, int(x)), max(0, int(y))
+        cw = min(w, self.width - x, 255)
+        ch = min(h, self.height - y, 255)
+        if cw <= 0 or ch <= 0:
+            return True
+        if w != bm.width or h != bm.height:
+            bm = bm.scaled(w, h)
+        bm = bm.cropped(cw, ch)
+        return self._blit(x, y, cw, ch, fg, bgc, transparent,
+                          bm.data[:bm.row_bytes * ch])
 
     # ── Text ──────────────────────────────────────────────────────────────────
 
@@ -3183,8 +3727,32 @@ class NoknokDisplay:
                 | ((max(1, min(8, scale)) - 1) << 2)
                 | (0x80 if transparent else 0x00))
 
+    def _route(self, s, size, font, allow_native=None):
+        """Pick how to render text (see the class docstring) and how wide one
+        character cell is. Returns (native (font_index, scale) or None, cell_w)."""
+        if allow_native is None:
+            allow_native = self.native_text
+        native = None
+        if allow_native and font is None and size in self._NATIVE_SIZES \
+                and self._is_ascii(s.replace("\n", "")):
+            native = self._NATIVE_SIZES[size]
+        if native is not None:
+            font_index, scale = native
+            cell_w = self._MODULE_FONTS[font_index][0] * scale
+        elif font is not None:
+            cell_w = max(1, int(round(font.width * size / float(font.height))))
+        else:
+            cell_w = max(1, (size + 1) // 2)      # built-in font is 8 wide x 16 high
+        return native, cell_w
+
+    @staticmethod
+    def _line_height(size, line_gap=None):
+        gap = (size // 8) if line_gap is None else int(line_gap)
+        return size + max(0, gap)
+
     def text(self, s, size=16, color=WHITE, bg="auto", x=0, y=0,
-             font=None, wrap=True, line_gap=None):
+             font=None, wrap=True, line_gap=None, max_w=None, max_h=None,
+             native=None):
         """
         Draw text. `size` is the exact PIXEL HEIGHT — any size works.
 
@@ -3204,6 +3772,14 @@ class NoknokDisplay:
             font     — None = built-in font; or a BdfFont, or a path to a .bdf.
             wrap     — True (default) wraps to the panel width; False clips.
             line_gap — extra pixels between wrapped lines (default size // 8).
+            max_w,   — keep the text inside a box this wide / tall (pixels)
+            max_h      instead of the whole panel; lines that don't fit are
+                       not drawn. Regions use this.
+            native   — None = follow d.native_text; True/False = allow / forbid
+                       the module's own 8x8 font for this call. Note its
+                       cells are SQUARE (16 px text = 16 px wide = 5 columns
+                       on an 80 px panel); the Pico's 8x16 font is half as
+                       wide (10 columns) but slower to send.
 
         Returns the y coordinate just BELOW the last line drawn, so you can
         stack text:
@@ -3222,38 +3798,32 @@ class NoknokDisplay:
         if isinstance(font, str):
             font = BdfFont(font)
 
-        # Pick the render route (see the class docstring).
-        native = None
-        if font is None and size in self._NATIVE_SIZES \
-                and self._is_ascii(s.replace("\n", "")):
-            native = self._NATIVE_SIZES[size]
+        native, cell_w = self._route(s, size, font, native)
 
-        if native is not None:
-            font_index, scale = native
-            cell_w = self._MODULE_FONTS[font_index][0] * scale
-        elif font is not None:
-            cell_w = max(1, int(round(font.width * size / float(font.height))))
-        else:
-            cell_w = max(1, (size + 1) // 2)      # built-in font is 8 wide x 16 high
-
-        # Split into lines that fit the panel.
-        avail = max(1, self.width - int(x))
+        # Split into lines that fit the panel (or the box).
+        x, y  = int(x), int(y)
+        avail = self.width - x
+        if max_w is not None:
+            avail = min(avail, int(max_w))
+        avail = max(1, avail)
         lines = self._layout(s, cell_w, avail, wrap)
 
-        gap    = (size // 8) if line_gap is None else int(line_gap)
-        line_h = size + max(0, gap)
-        cur_y  = int(y)
+        line_h = self._line_height(size, line_gap)
+        bottom = self.height if max_h is None else min(self.height, y + int(max_h))
+        cur_y  = y
 
         for line in lines:
             if cur_y >= self.height:
                 break                              # off the bottom — stop
+            if max_h is not None and cur_y + size > bottom:
+                break                              # doesn't fit the box — stop
             if line:
                 if native is not None:
-                    self._text_native(int(x), cur_y, line, fg, bgc, transparent,
+                    self._text_native(x, cur_y, line, fg, bgc, transparent,
                                       native[0], native[1])
                 else:
-                    self._text_blit(int(x), cur_y, line, size, cell_w,
-                                    fg, bgc, transparent, font)
+                    self._text_blit(x, cur_y, line, size, cell_w,
+                                    fg, bgc, transparent, font, avail)
             cur_y += line_h
         return cur_y
 
@@ -3296,13 +3866,16 @@ class NoknokDisplay:
         payload.extend([ord(ch) & 0xFF for ch in line])
         return self._draw(payload)
 
-    def _text_blit(self, x, y, line, size, cell_w, fg, bg, transparent, font):
+    def _text_blit(self, x, y, line, size, cell_w, fg, bg, transparent, font,
+                   max_w=None):
         """Routes 2 and 3: render on the Pico, send the pixels.
 
         The glyphs are scaled with nearest-neighbour sampling so ANY pixel height
         is possible, packed 1 bit per pixel (rows padded to whole bytes) and sent
         as BLIT_BEGIN + as many BLIT_DATA chunks as it takes."""
         w = min(cell_w * len(line), max(0, self.width - x), 255)
+        if max_w is not None:
+            w = min(w, max(0, int(max_w)))
         h = min(size, max(0, self.height - y), 255)
         if w <= 0 or h <= 0:
             return True
@@ -3358,6 +3931,180 @@ class NoknokDisplay:
             if not self._send(bytes([self._CMD_BLIT_DATA]) + bytes(chunk)):
                 return False
         return True
+
+    # ── print(): the display as a little terminal (DEV-41) ────────────────────
+
+    def print(self, *args, sep=" ", end="\n", size=None, color=None):
+        """
+        Write to the display the way print() writes to the REPL.
+
+            d.print("Hello World")
+            d.print("Temp:", 22.5, "C")          # several values, joined by sep
+            d.print("Big", size=24, color=YELLOW)
+            d.print("loading", end="")           # stay on this line...
+            d.print(" done")                     # ...and continue it
+
+        Each call starts below the previous one; long lines wrap; when the
+        screen is full everything moves up one line (redrawn in place, no
+        blank-out flash). d.clear() starts again from the top. Defaults come
+        from d.print_size (16), d.print_color (white) and d.print_x (0).
+        At 16 px that is 10 columns x 8 lines on the 80x160 panel. Set
+        d.print_native = True for the module's own (square, faster) font.
+        Returns the y just below the last line.
+
+        For a value that changes often (a clock, a sensor) use a region —
+        d.set() redraws only that box instead of the whole terminal.
+        """
+        size  = self.print_size  if size  is None else int(size)
+        color = self.print_color if color is None else color
+        s = sep.join([str(a) for a in args]) + end
+
+        paras = s.split("\n")
+        open_after = paras[-1] != ""      # no trailing "\n" -> line stays open
+        if not open_after:
+            paras.pop()
+        if not paras:
+            return self._term_y            # print("", end="") draws nothing
+
+        # A line left open by the previous print() continues with this text.
+        if self._term_open and self._term:
+            last = self._term.pop()
+            paras[0] = last[0] + paras[0]
+        for p in paras:
+            self._term.append([p, size, color])
+        self._term_open = open_after
+        return self._term_draw(len(paras))
+
+    def _term_height(self, entry):
+        """Pixels one terminal entry takes on screen (it may wrap)."""
+        text, size, _ = entry
+        _, cell_w = self._route(text, size, None, self.print_native)
+        avail = max(1, self.width - self.print_x)
+        return len(self._layout(text, cell_w, avail, True)) * self._line_height(size)
+
+    def _term_draw(self, n_new):
+        """Redraw what print() needs: only the `n_new` newest entries when they
+        fit, everything when the screen has to scroll."""
+        heights = [self._term_height(e) for e in self._term]
+        total   = sum(heights)
+        drop    = 0
+        while total > self.height and drop < len(self._term) - 1:
+            total -= heights[drop]
+            drop  += 1
+        if drop:
+            del self._term[:drop]
+            heights = heights[drop:]
+            start = 0                      # scrolled: repaint every line
+        else:
+            start = len(self._term) - n_new
+        y = 0
+        for i in range(start):
+            y += heights[i]
+        x, w = self.print_x, self.width - self.print_x
+        for i in range(start, len(self._term)):
+            text, size, color = self._term[i]
+            band = min(heights[i], self.height - y)
+            if band <= 0:
+                break
+            # wipe the band first so a shorter line replaces a longer one
+            self.fill_rect(x, y, w, band, self._bg)
+            self.text(text, size=size, color=color, bg="auto", x=x, y=y,
+                      native=self.print_native)
+            y += heights[i]
+        if drop and y < self.height:        # old lines below the new end
+            self.fill_rect(x, y, w, self.height - y, self._bg)
+        self._term_y = y
+        return y
+
+    # ── Named regions: define a box once, update it by name (DEV-41) ──────────
+
+    def region(self, name, x, y, w, h, size=16, color=WHITE, bg="auto",
+               align="left"):
+        """
+        Define (or redefine) a named rectangle on the screen. Nothing is drawn
+        until d.set(name, ...) — which then wipes exactly this box and draws
+        the new content into it, so a live value updates without flicker and
+        without you tracking coordinates.
+
+            d.region("clock", 0, 0, 80, 32, size=32, align="center")
+            d.region("net", 62, 140, 18, 18)
+            d.set("clock", text="12:34")
+            d.set("net", icon="wifi")
+
+        size / color / align are the defaults d.set() uses for this box; bg is
+        the colour the box is wiped to ("auto" = the last clear() colour).
+        align is "left", "center" or "right".
+        """
+        x, y, w, h = self._clip(x, y, w, h)
+        if w <= 0 or h <= 0:
+            raise ValueError("region %r is off the panel" % name)
+        self._regions[name] = {"x": x, "y": y, "w": w, "h": h, "size": int(size),
+                               "color": color, "bg": bg, "align": align}
+        return name
+
+    def regions(self):
+        """Names of the regions defined so far."""
+        return list(self._regions.keys())
+
+    def set(self, name, text=None, icon=None, image=None, size=None,
+            color=None, align=None, bg=None):
+        """
+        Replace what a region shows. Give ONE of text / icon / image, or none
+        to just wipe the box. size / color / align override the region's
+        defaults for this update only.
+
+            d.set("temp", text="22.5")
+            d.set("temp", text="--", color=GREY)
+            d.set("net", icon="wifi")            # scaled to the box's `size`
+            d.set("art", image="/pics/cat.bmp")  # clipped to the box
+            d.set("temp")                        # wipe
+        """
+        r = self._regions.get(name)
+        if r is None:
+            raise ValueError("no region %r — define it with d.region() first; "
+                             "have: %s" % (name, ", ".join(self._regions.keys())))
+        x, y, w, h = r["x"], r["y"], r["w"], r["h"]
+        size  = r["size"]  if size  is None else int(size)
+        color = r["color"] if color is None else color
+        align = r["align"] if align is None else align
+        bg    = r["bg"]    if bg    is None else bg
+        # Regions are always opaque — that is what makes a replace-by-name
+        # clean on a panel with no frame buffer. "auto" = last clear() colour.
+        bg_col = self._bg if (bg is None or bg == "auto") else bg
+
+        self.fill_rect(x, y, w, h, bg_col)      # wipe the box
+
+        if text is not None:
+            text = str(text)
+            _, cell_w = self._route(text, size, None)
+            first = text.split("\n")[0]
+            cw = min(len(first) * cell_w, w)
+            self.text(text, size=size, color=color, bg=bg_col,
+                      x=x + self._align_offset(align, w, cw), y=y,
+                      max_w=w, max_h=h)
+        elif icon is not None:
+            bm = icon if isinstance(icon, Bitmap) else icon_bitmap(icon)
+            ih = min(size, h)
+            iw = max(1, (bm.width * ih) // max(1, bm.height))
+            iw = min(iw, w)
+            self._blit_bitmap(bm, x + self._align_offset(align, w, iw), y,
+                              iw, ih, color, bg_col)
+        elif image is not None:
+            bm = image if isinstance(image, Bitmap) else Bitmap.from_bmp(image)
+            iw, ih = min(bm.width, w), min(bm.height, h)
+            self._blit_bitmap(bm.cropped(iw, ih),
+                              x + self._align_offset(align, w, iw), y,
+                              iw, ih, color, bg_col)
+        return True
+
+    @staticmethod
+    def _align_offset(align, box_w, content_w):
+        """Left offset of content inside a box for align left/center/right."""
+        if align == "center":
+            return max(0, (box_w - content_w) // 2)
+        if align == "right":
+            return max(0, box_w - content_w)
+        return 0
 
     # ── Role assignment cue (the app's "which screen is this?" step) ──────────
 

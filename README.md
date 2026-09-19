@@ -25,6 +25,8 @@ over I2C.
 | `knob_test.py` | Knob module standalone test. |
 | `keyboard_test.py` | LED button module standalone test. |
 | `ledbutton_color_test.py` | Test one or many LED Buttons at once: a button press cycles that button's colour; number keys 1-9 set all to a colour (0 = off). Quick "is this module alive?" check + brightness comparison. |
+| `display_test.py` | Interactive Display bench tool: type text to draw it; `p` = print(), `icon`, `image`, `region`/`set`, `demo`/`demo2`. See *noknok Display* under *Current versions*. |
+| `../tools/display_sim.py` | Desktop simulator for the Display driver — a virtual module that decodes the I²C stream like the firmware and dumps the panel as ASCII art (66 checks). Needs `module-I2C-1.42-display` cloned next to this repo for the font. |
 
 ## Provisioning (PoC Step 1 — done)
 
@@ -217,7 +219,7 @@ Earlier features:
   audit trail). The post-flash re-enumerate deliberately does **not** wipe `noknok_state.json`,
   so modules that weren't flashed keep their addresses.
 
-**`noknok.py` v1.6** — Conductor library.
+**`noknok.py` v1.9** — Conductor library.
 
 DEV-31 additions (Sam), all bench-proven over I2C:
 `bootloader_version(entry)` — the fleet discriminator; `None` means the legacy monolithic
@@ -249,6 +251,35 @@ Core:
   light + sound: candidate LED buttons go amber, the picked one green, with ready/confirm
   buzzer beeps (best-effort). **`Conductor.append_role(role_id, uid)`** writes one entry to
   `noknok_roles.json`. **`load_roles()`** maps roles back to modules for the product to use.
+
+**noknok Display — `c.display[0]` (v1.9, DEV-41).** The module is a small GPU with no frame
+buffer and a 12 KB flash; everything beyond its own 8×8 font is rendered on the Pico and streamed
+as a 1-bit-per-pixel blit, so nothing below needs firmware support (v0.2.0+; v0.5.0 current).
+- **`d.print(...)`** — the display as a terminal, same arguments as Python's `print()` (`sep`,
+  `end=""` to continue a line) plus `size`/`color`. Wraps, scrolls in place when full (no
+  blank-out), `d.clear()` restarts at the top. Defaults `d.print_size`/`print_color`/`print_x`.
+  Uses the Pico's 8×16 font → 10 columns × 8 lines at 16 px; `d.print_native = True` sends the
+  module's square 8×8 font instead (≈5× less I²C traffic, 5 columns).
+- **`d.text(s, size=, color=, bg=, x=, y=, font=, wrap=, max_w=, max_h=, native=)`** — exact
+  pixel height, any size. Multiples of 8 (8…64) go to the module's own font by default;
+  anything else / a `.bdf` / `native=False` is rendered on the Pico. Returns the y below the
+  last line. **Fixed in v1.9:** the native table assumed a second 8×16 font the firmware
+  never had — 16 px text was drawn 8 px tall (32→16, 48→24, 64→32) and 24 px wrapped wrong.
+- **`d.icon(name, x=, y=, scale=|size=, color=, bg=)`** — built-in names (`icon_names()`):
+  `wifi battery battery_low check cross warning play pause gear arrow_up/down/left/right heart
+  bell`, 16×16, drawn as ASCII art in `ICONS` so anyone can add one (`ICONS["mine"] = [...]`).
+  Any size, unlimited icons, no firmware icon store. Firmware command `0x04` is unused.
+- **`d.image(path_or_Bitmap, x=, y=, w=, h=, color=, bg=, invert=)`** — a 1-bit `.bmp` from
+  any paint program (brighter palette colour = lit, auto-detected); resize keeps the aspect.
+- **`d.region(name, x, y, w, h, size=, color=, bg=, align=)`** + **`d.set(name, text=|icon=|image=)`**
+  — define a box once, update it by name; only that box is wiped and redrawn (opaque), so a
+  live value never flickers. `align` = left/center/right. `d.set(name)` wipes.
+- **`Bitmap`** — the 1bpp image type behind all of it: `Bitmap.from_rows([...])` (ASCII art),
+  `Bitmap.from_bmp(path)`, `.scaled()`, `.cropped()`, `.flipped()`, `.rotated()`, `.rows()`.
+- Bench: `display_test.py` (`p <text>`, `icon`, `icons`, `image`, `region`, `set`, `demo2`).
+  Desktop: `tools/display_sim.py` runs the driver against a virtual module that decodes the
+  I²C stream exactly like the firmware (its `font8x8.h` included) and prints the panel as
+  ASCII art — 66 checks, run it before touching the driver.
 
 ### Required CircuitPython libs (/lib)
 - `adafruit_httpserver/`
