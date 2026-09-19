@@ -26,7 +26,8 @@ over I2C.
 | `keyboard_test.py` | LED button module standalone test. |
 | `ledbutton_color_test.py` | Test one or many LED Buttons at once: a button press cycles that button's colour; number keys 1-9 set all to a colour (0 = off). Quick "is this module alive?" check + brightness comparison. |
 | `display_test.py` | Interactive Display bench tool: type text to draw it; `p` = print(), `icon`, `image`, `region`/`set`, `demo`/`demo2`. See *noknok Display* under *Current versions*. |
-| `../tools/display_sim.py` | Desktop simulator for the Display driver — a virtual module that decodes the I²C stream like the firmware and dumps the panel as ASCII art (66 checks). Needs `module-I2C-1.42-display` cloned next to this repo for the font. |
+| `bench_dev41.py` | Display hardware check (DEV-41): native sizes, print, icons, image, regions — 7 steps, prints timings + module error byte. Pins GP20/21 (Pi4RFID bench). |
+| `../tools/display_sim.py` | Desktop simulator for the Display driver — a virtual module that decodes the I²C stream like the firmware and dumps the panel as ASCII art (71 checks). Needs `module-I2C-1.42-display` cloned next to this repo for the font. |
 
 ## Provisioning (PoC Step 1 — done)
 
@@ -275,11 +276,24 @@ as a 1-bit-per-pixel blit, so nothing below needs firmware support (v0.2.0+; v0.
   — define a box once, update it by name; only that box is wiped and redrawn (opaque), so a
   live value never flickers. `align` = left/center/right. `d.set(name)` wipes.
 - **`Bitmap`** — the 1bpp image type behind all of it: `Bitmap.from_rows([...])` (ASCII art),
-  `Bitmap.from_bmp(path)`, `.scaled()`, `.cropped()`, `.flipped()`, `.rotated()`, `.rows()`.
-- Bench: `display_test.py` (`p <text>`, `icon`, `icons`, `image`, `region`, `set`, `demo2`).
+  `Bitmap.from_bmp(path_or_file)` (≤ 64 KB of pixels, else a clear ValueError instead of a
+  MemoryError mid-product), `.scaled()`, `.cropped()`, `.flipped()`, `.rotated()`, `.rows()`.
+- **`d.rotation(0-3)`** / **`d.orient(madctl, xoff, yoff, w, h)`** (bench calibration) — the
+  panel geometry is re-read, the screen cleared, print() reset and regions re-clipped (names
+  that fell off the panel are returned). Don't poke `0x11`/`0x14` with `_send()` any more.
+- **Robustness rules baked in:** every command — including each 64-byte blit chunk — waits
+  for the module's busy flag first (the module snapshots its 72-byte RX buffer when a command
+  *starts*, so back-to-back chunks could otherwise overwrite each other at 400 kHz); every
+  rectangle is clipped before it is sent (the firmware rejects a blit past the edge with
+  error 3); an unplugged module never raises — draws return False and `info()` falls back to
+  80×160. **Keep print() and regions apart:** a scrolling terminal repaints full-width bands,
+  so a region inside its path gets wiped.
+- Bench: `display_test.py` (`p <text>`, `icon`, `icons`, `image`, `region`, `set`, `demo2`);
+  `bench_dev41.py` = the 7-step hardware check (all passed 19 Sep 2026 on Pi4RFID, fw 0.5.0:
+  15 ms per region update, ≈75 ms per scrolling print() line, 16 ms per 16×16 icon).
   Desktop: `tools/display_sim.py` runs the driver against a virtual module that decodes the
   I²C stream exactly like the firmware (its `font8x8.h` included) and prints the panel as
-  ASCII art — 66 checks, run it before touching the driver.
+  ASCII art — 71 checks, run it before touching the driver.
 
 ### Required CircuitPython libs (/lib)
 - `adafruit_httpserver/`

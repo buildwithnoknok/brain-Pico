@@ -2960,60 +2960,76 @@ class Bitmap:
                     bm.data[base + (x >> 3)] |= 0x80 >> (x & 7)
         return bm
 
+    # Largest .bmp we will decode: 64 KB of pixels (e.g. 640x800 at 1 bpp). A
+    # bigger file would exhaust the Pico's RAM mid-product; the panel is 80x160
+    # anyway, so resize the picture on the PC instead.
+    MAX_BMP_BYTES = 65536
+
     @classmethod
-    def from_bmp(cls, path, invert=False):
+    def from_bmp(cls, source, invert=False):
         """
-        Load a 1-bit (monochrome) Windows .bmp file. Save one from any paint
+        Load a 1-bit (monochrome) Windows .bmp. Save one from any paint
         program with "Monochrome bitmap" / "1-bit" as the colour mode.
+        `source` is a path, or an already-open binary file / io.BytesIO (so a
+        picture can also be embedded in your script as bytes).
 
         The BRIGHTER of the file's two colours becomes the lit pixels — so draw
         the picture in white on black (or black on white, it's detected) and
         it shows up in whatever `color` you draw it with. `invert=True` swaps.
-        Only uncompressed 1-bit files are accepted; anything else raises
-        ValueError telling you why.
+        Only uncompressed 1-bit files up to MAX_BMP_BYTES of pixels are
+        accepted; anything else raises ValueError telling you why.
         """
-        with open(path, "rb") as f:
-            hdr = f.read(54)
-            if len(hdr) < 54 or hdr[0:2] != b"BM":
-                raise ValueError("%s is not a .bmp file" % path)
-            data_off = struct.unpack("<I", hdr[10:14])[0]
-            dib      = struct.unpack("<I", hdr[14:18])[0]
-            w, h     = struct.unpack("<ii", hdr[18:26])
-            bpp      = struct.unpack("<H", hdr[28:30])[0]
-            comp     = struct.unpack("<I", hdr[30:34])[0]
-            if bpp != 1:
-                raise ValueError("%s is %d-bit; save it as a 1-bit (monochrome) "
-                                 "bitmap" % (path, bpp))
-            if comp != 0:
-                raise ValueError("%s is compressed; save it uncompressed" % path)
-            top_down = h < 0
-            h = -h if top_down else h
-            if w <= 0 or h <= 0 or w > 4096 or h > 4096:
-                raise ValueError("%s has an unusable size %dx%d" % (path, w, h))
-            # Palette: two BGRA entries right after the DIB header. Whichever is
-            # brighter is "lit", so both white-on-black and black-on-white work.
-            f.seek(14 + dib)
-            pal = f.read(8)
-            if len(pal) == 8:
-                lum0 = pal[0] + pal[1] + pal[2]
-                lum1 = pal[4] + pal[5] + pal[6]
-                if lum0 > lum1:
-                    invert = not invert
-            bm     = cls(w, h)
-            stride = ((w + 31) // 32) * 4          # BMP rows pad to 4 bytes
-            rb     = bm.row_bytes
-            for y in range(h):
-                src_row = y if top_down else (h - 1 - y)   # BMP is bottom-up
-                f.seek(data_off + src_row * stride)
-                row = f.read(rb)
-                if len(row) < rb:
-                    raise ValueError("%s ends early — corrupt file?" % path)
-                base = y * rb
-                if invert:
-                    for i in range(rb):
-                        bm.data[base + i] = row[i] ^ 0xFF
-                else:
-                    bm.data[base:base + rb] = row
+        if hasattr(source, "read"):
+            return cls._from_bmp_file(source, "<bmp>", invert)
+        with open(source, "rb") as f:
+            return cls._from_bmp_file(f, source, invert)
+
+    @classmethod
+    def _from_bmp_file(cls, f, name, invert):
+        hdr = f.read(54)
+        if len(hdr) < 54 or hdr[0:2] != b"BM":
+            raise ValueError("%s is not a .bmp file" % name)
+        data_off = struct.unpack("<I", hdr[10:14])[0]
+        dib      = struct.unpack("<I", hdr[14:18])[0]
+        w, h     = struct.unpack("<ii", hdr[18:26])
+        bpp      = struct.unpack("<H", hdr[28:30])[0]
+        comp     = struct.unpack("<I", hdr[30:34])[0]
+        if bpp != 1:
+            raise ValueError("%s is %d-bit; save it as a 1-bit (monochrome) "
+                             "bitmap" % (name, bpp))
+        if comp != 0:
+            raise ValueError("%s is compressed; save it uncompressed" % name)
+        top_down = h < 0
+        h = -h if top_down else h
+        if w <= 0 or h <= 0:
+            raise ValueError("%s has an unusable size %dx%d" % (name, w, h))
+        if ((w + 7) // 8) * h > cls.MAX_BMP_BYTES:
+            raise ValueError("%s is %dx%d — too big for the Pico's RAM; resize it "
+                             "(the panel is only 80x160)" % (name, w, h))
+        # Palette: two BGRA entries right after the DIB header. Whichever is
+        # brighter is "lit", so both white-on-black and black-on-white work.
+        f.seek(14 + dib)
+        pal = f.read(8)
+        if len(pal) == 8:
+            lum0 = pal[0] + pal[1] + pal[2]
+            lum1 = pal[4] + pal[5] + pal[6]
+            if lum0 > lum1:
+                invert = not invert
+        bm     = cls(w, h)
+        stride = ((w + 31) // 32) * 4          # BMP rows pad to 4 bytes
+        rb     = bm.row_bytes
+        for y in range(h):
+            src_row = y if top_down else (h - 1 - y)   # BMP is bottom-up
+            f.seek(data_off + src_row * stride)
+            row = f.read(rb)
+            if len(row) < rb:
+                raise ValueError("%s ends early — corrupt file?" % name)
+            base = y * rb
+            if invert:
+                for i in range(rb):
+                    bm.data[base + i] = row[i] ^ 0xFF
+            else:
+                bm.data[base:base + rb] = row
         return bm
 
     def get(self, x, y):
@@ -3421,7 +3437,9 @@ class NoknokDisplay:
     _CMD_BLIT_BEGIN    = 0x05   # [0x05, x, y, w, h, fgHi, fgLo, bgHi, bgLo, flags]
     _CMD_BLIT_DATA     = 0x06   # [0x06, <=64 bytes of 1bpp rows]
     _CMD_SET_BACKLIGHT = 0x10   # [0x10, level 0-255]
+    _CMD_SET_ROTATION  = 0x11   # [0x11, rot 0-3]  (fw v0.3.0+)
     _CMD_DISPLAY       = 0x12   # [0x12, 0=off 1=on 2=sleep]
+    _CMD_SET_ORIENT    = 0x14   # [0x14, madctl, xoff, yoff, w, h]  bench calibration
     _CMD_GET_INFO      = 0x15   # [0x15] then read 5 bytes
 
     # The module's I2C receive buffer is 72 bytes, so one command must fit in it.
@@ -3597,6 +3615,47 @@ class NoknokDisplay:
     def sleep(self):
         """Put the panel into its low-power sleep state."""
         return self.display(2)
+
+    def rotation(self, rot):
+        """
+        Turn the picture: 0 = portrait (80x160, the default), 1 = landscape
+        (160x80), 2 = portrait upside down, 3 = landscape the other way.
+        Needs display firmware v0.3.0+. The screen is cleared, width/height
+        are re-read from the module, print() starts again at the top and
+        regions are re-clipped (ones that fall off the panel are dropped —
+        the dropped names are returned).
+        """
+        ok = self._send([self._CMD_SET_ROTATION, int(rot) & 0x03])
+        time.sleep(0.08)
+        return self._after_geometry_change(ok)
+
+    def orient(self, madctl, xoff, yoff, w, h):
+        """
+        BENCH CALIBRATION ONLY — raw panel MADCTL byte plus GRAM offsets and the
+        visible size, for finding the right values on a new panel or a reworked
+        board (the firmware's own guesses for rotations 1-3 are unverified).
+        Production code uses rotation(). Same clean-up as rotation().
+        """
+        ok = self._send([self._CMD_SET_ORIENT, int(madctl) & 0xFF,
+                         int(xoff) & 0xFF, int(yoff) & 0xFF,
+                         int(w) & 0xFF, int(h) & 0xFF])
+        time.sleep(0.08)
+        return self._after_geometry_change(ok)
+
+    def _after_geometry_change(self, ok):
+        """Re-read the panel size, wipe, and drop state that no longer fits."""
+        self.info(refresh=True)
+        self.clear(self._bg)                       # also resets print()
+        dropped = []
+        for name in list(self._regions.keys()):
+            r = self._regions[name]
+            x, y, w, h = self._clip(r["x"], r["y"], r["w"], r["h"])
+            if w <= 0 or h <= 0:
+                dropped.append(name)
+                del self._regions[name]
+            else:
+                r["x"], r["y"], r["w"], r["h"] = x, y, w, h
+        return dropped
 
     # ── Drawing ───────────────────────────────────────────────────────────────
 
@@ -3928,7 +3987,11 @@ class NoknokDisplay:
         step = self._MAX_BLIT_CHUNK
         for i in range(0, len(data), step):
             chunk = data[i:i + step]
-            if not self._send(bytes([self._CMD_BLIT_DATA]) + bytes(chunk)):
+            # _draw, not _send: the module snapshots its 72-byte RX buffer when
+            # it STARTS a command, so a chunk landing while the previous one is
+            # still being painted (transparent blits paint pixel by pixel) could
+            # be overwritten. One status poll per chunk (~0.3 ms) rules it out.
+            if not self._draw(bytes([self._CMD_BLIT_DATA]) + bytes(chunk)):
                 return False
         return True
 
@@ -3953,7 +4016,10 @@ class NoknokDisplay:
         Returns the y just below the last line.
 
         For a value that changes often (a clock, a sensor) use a region —
-        d.set() redraws only that box instead of the whole terminal.
+        d.set() redraws only that box instead of the whole terminal. But keep
+        the two apart: when print() scrolls it repaints full-width bands from
+        the top down, so a region inside the terminal's area gets wiped.
+        Put regions where the terminal never reaches, or use one or the other.
         """
         size  = self.print_size  if size  is None else int(size)
         color = self.print_color if color is None else color

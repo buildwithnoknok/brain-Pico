@@ -74,6 +74,7 @@ class VirtualPanel:
         self.font = load_font8x8()
         self.last_err = 0
         self.log = []                       # every command, for assertions
+        self.reads = 0                      # status/info reads, for assertions
         # blit state
         self._blit_left = 0
         self._blit = None
@@ -189,6 +190,11 @@ class VirtualPanel:
             out.append("".join(line))
         return "\n".join(out)
 
+    def resize(self, w, h):
+        """Pretend the module switched orientation (new size, blank frame)."""
+        self.w, self.h = w, h
+        self.px = [[0] * w for _ in range(h)]
+
     def count(self, color):
         return sum(1 for row in self.px for c in row if c == color)
 
@@ -220,6 +226,7 @@ class FakeI2C:
     def readfrom_into(self, addr, buf):
         if addr != self.address:
             raise OSError("no device at 0x%02X" % addr)
+        self.panel.reads += 1
         if self._pending and len(buf) >= len(self._pending):
             buf[:len(self._pending)] = self._pending
             self._pending = None
@@ -398,6 +405,37 @@ def _checks():
         check("unknown region raises", False)
     except ValueError:
         check("unknown region raises", True)
+
+    # 7b. hardening: every BLIT_DATA chunk is preceded by a status read (wait_ready)
+    d.clear(BLACK)
+    reads_before = p.reads
+    log_len = len(p.log)
+    d.icon("heart", size=64)                      # 8 data chunks
+    n_chunks = sum(1 for c in p.log[log_len:] if c[0] == 0x06)
+    check("blit polls status before each chunk (%d chunks)" % n_chunks,
+          n_chunks >= 8 and p.reads - reads_before >= n_chunks)
+    # from_bmp: file-like source + size cap
+    import io
+    bm2 = Bitmap.from_bmp(io.BytesIO(hdr + dib + pal + pix))
+    check("from_bmp accepts a file-like object", bm2.rows() == rows)
+    big = struct.pack("<IiiHHIIiiII", 40, 4000, 4000, 1, 1, 0, 0, 2835, 2835, 2, 2)
+    try:
+        Bitmap.from_bmp(io.BytesIO(hdr + big + pal + pix))
+        check("from_bmp rejects an oversized image", False)
+    except ValueError as e:
+        check("from_bmp rejects an oversized image", "too big" in str(e))
+    # rotation(): geometry refresh, terminal reset, regions re-clipped / dropped
+    d.clear(BLACK)
+    d.print("x")
+    d.region("keep", 0, 0, 40, 20)
+    d.region("edge", 60, 120, 20, 40)             # off-panel in 160x80 landscape
+    p.resize(160, 80)                             # module answers new size
+    dropped = d.rotation(1)
+    check("rotation re-reads geometry", d.width == 160 and d.height == 80)
+    check("rotation resets print() and drops off-panel regions",
+          d._term == [] and dropped == ["edge"] and "keep" in d.regions(), dropped)
+    p.resize(80, 160)
+    d.rotation(0)
 
     # 7. native_text=False forces the blit path
     d.native_text = False
