@@ -83,7 +83,7 @@ def uhubctl(args, timeout=30):
 
 
 def find_pico_port():
-    """Locate the hub location + port the Pico is plugged into, e.g. ('1-1','4').
+    """Locate the hub the Pico is plugged into, e.g. ('1-1','4').
     Auto-detected so a replug into another socket does not silently break the run."""
     out = uhubctl([])
     loc = None
@@ -99,7 +99,16 @@ def find_pico_port():
 
 
 def power(loc, port, state):
-    uhubctl(["-l", loc, "-p", port, "-a", state])
+    """Switch the hub's power GANGED - all ports at once, NOT `-p <port>`.
+
+    Measured on Pi4RFID 28 Sep 2026 by comparing time.monotonic() across the cut:
+      uhubctl -l 1-1 -p 4 -a off   monotonic 903.7 -> 917.1   NO reset (data only)
+      uhubctl -l 1-1    -a off     monotonic 925.4 ->   9.1   REAL power cycle
+    The Raspberry Pi 4B advertises per-port switching (`ppps`) and happily reports
+    `Port 4: 0000 off`, but only the ganged switch is wired to VBUS. `port` is kept
+    for logging/diagnostics only - do not pass it to uhubctl.
+    """
+    uhubctl(["-l", loc, "-a", state])
 
 
 def wait_for_pico(timeout=45):
