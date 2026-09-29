@@ -54,6 +54,11 @@
 #             (ASCII-art or .bmp -> 1bpp). Fixed the native text sizes: the
 #             module has ONE 8x8 font scaled 1-8 (8..64 px), the old table
 #             assumed an 8x16 font and drew 16 px text 8 px tall.
+# v1.10 (Sue): DEV-46 — noknok LEDs 16x (RGBW, module type 0x06) in c.leds16,
+#             manifest type "usb_leds_16x". USB modules are now told apart by
+#             their 0xF0 type byte, not the PID (all noknok USB apps share
+#             0x4E4E) — before this, every USB module became an 8x NoknokLEDs.
+#             The 8x ring (c.leds) is unchanged.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -74,7 +79,7 @@ import json
 import os
 import struct
 
-__version__ = "1.9"
+__version__ = "1.10"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -1017,7 +1022,8 @@ class Conductor:
         self.knob      = []    # NoknokKnob instances
         self.ledbutton = []    # NoknokLedButton instances
         self.display   = []    # NoknokDisplay instances
-        self.leds      = []    # NoknokLEDs (USB) instances, populated by enumerate_usb()
+        self.leds      = []    # NoknokLEDs (USB, 8x RGB) instances, populated by enumerate_usb()
+        self.leds16    = []    # NoknokLEDs16 (USB, 16x RGBW) instances, ditto (DEV-46)
         self.role      = {}    # role_name → module object, populated by load_roles()
         self._registry = {}    # identity (I2C uid_hex / USB serial) → module object
 
@@ -1119,7 +1125,7 @@ class Conductor:
     # I2C modules carry a runtime address; USB modules are identified by serial.
     _FW_GROUPS     = (("buzzer", "buzzer"), ("knob", "knob"), ("ledbutton", "led_button"),
                       ("display", "display"))
-    _USB_FW_GROUPS = (("leds", "usb_leds"),)
+    _USB_FW_GROUPS = (("leds", "usb_leds"), ("leds16", "usb_leds_16x"))
 
     @staticmethod
     def _parse_semver(s):
@@ -1608,6 +1614,7 @@ class Conductor:
 
         print("Enumerating noknok USB modules...")
         self.leds = []
+        self.leds16 = []
         try:
             found = noknok_usb.discover(dp, dm)
         except Exception as e:
@@ -1617,6 +1624,8 @@ class Conductor:
         for serial, type_name, module in found:
             if type_name == "noknokleds":
                 self.leds.append(module)
+            elif type_name == "noknokleds16":
+                self.leds16.append(module)
             self._registry[serial] = module     # serial is already lower-case
             print("  %s  serial: %s  fw: %s"
                   % (type_name, serial, module.firmware_version))
@@ -1939,6 +1948,8 @@ class Conductor:
         "buzzer":     "buzzer",
         "leds":       "leds",
         "display":    "display",
+        "leds16":       "leds16",   # LEDs 16x (DEV-46); both spellings accepted
+        "usb_leds_16x": "leds16",
     }
 
     # Role-assignment method per module type: "input" = the customer interacts
@@ -1952,6 +1963,8 @@ class Conductor:
         "buzzer":     "output",
         "leds":       "output",
         "display":    "output",   # a display can't be "pressed" — cue-and-confirm
+        "leds16":       "output",
+        "usb_leds_16x": "output",
     }
 
     def _modules_for_type(self, module_type):

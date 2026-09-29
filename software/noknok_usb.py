@@ -13,8 +13,16 @@
 # Identity: each module reports a unique iSerialNumber built from its chip UID
 # (firmware v1.6+) - the USB counterpart of the I2C hardware UID. The Conductor
 # keys USB modules in its registry by this serial, exactly like I2C UIDs.
+#
+# Module TYPE: every noknok USB app shares one PID (0x4E4E), so the PID can NOT
+# pick the driver. discover() asks each device 0xF0 (identity) and dispatches on
+# the type byte of the [0x4E, 0x4E, type] reply - see _USB_TYPES below
+# (DEV-46; Ecosystem software/enumeration.md).
 
 import time
+import struct
+
+__version__ = "1.1"   # 1.1 = DEV-46: LEDs 16x + dispatch on the 0xF0 type byte
 
 try:
     import usb.core
@@ -95,14 +103,21 @@ class NoknokLEDs:
         (or None). For multiple modules use the Conductor's enumerate_usb().
         """
         ensure_host_port(dp, dm)
-        dev = usb.core.find(idVendor=vid, idProduct=pid)
-        if dev is None:
-            return None
-        try:
-            dev.set_configuration()
-        except Exception:
-            pass  # often already configured by the host stack
-        return cls(dev)
+        # Every noknok USB app shares the PID, so check the 0xF0 type byte too:
+        # NoknokLEDs.find() must not return a 16x ring, nor the other way round.
+        for dev in usb.core.find(find_all=True):
+            try:
+                if dev.idVendor != vid or dev.idProduct != pid:
+                    continue
+            except Exception:
+                continue
+            try:
+                dev.set_configuration()
+            except Exception:
+                pass  # often already configured by the host stack
+            if _probe_type(dev) == cls.MODULE_TYPE:
+                return cls(dev)
+        return None
 
     # -- LED control -----------------------------------------------------------
 
@@ -228,11 +243,180 @@ class NoknokLEDs:
         # Raw bulk OUT to the CDC data endpoint. No CDC line-coding required.
         self._dev.write(self._EP_OUT, bytes(data), timeout=1000)
 
+    def _query(self, cmd, n, timeout=300):
+        """Send a one-byte query and read up to `n` reply bytes. Returns the
+        bytes read (possibly fewer than n), or None on error/timeout."""
+        try:
+            self._send((cmd,))
+            buf = bytearray(n)
+            got = self._dev.read(self._EP_IN, buf, timeout=timeout)
+            return bytes(buf[:got])
+        except Exception:
+            return None
 
-# PID -> (driver class, type_name). Add future USB modules here.
-_USB_MODULES = {
-    NoknokLEDs.PID: (NoknokLEDs, "noknokleds"),
+
+class NoknokLEDs16(NoknokLEDs):
+    """
+    Driver for the noknok LEDs 16x module (16x SK6812 RGBW) over USB.
+
+    Same API as NoknokLEDs (8x), so code written for the 8x ring runs here too,
+    plus a white channel and a status read:
+
+        leds.set_all(255, 120, 0)              # all amber (white off)
+        leds.set_all(0, 0, 0, w=255)           # neutral white from the white die
+        leds.set_pixel(12, 0, 0, 255, w=40)    # inner LED 12: blue + a bit of white
+        leds.set_all_pixels([(255, 0, 0, 0)] * 12 + [(0, 0, 0, 255)] * 4)
+        leds.play_preset(leds.PRESET_SUNDOWN, speed=30, w=255)   # 30-min white fade
+        leds.temperature()                     # -> 42.6  (chip temperature, deg C)
+        leds.status()                          # -> dict, see status()
+
+    LED layout: 0-11 = outer ring clockwise, 12-15 = the 4 inner LEDs
+    anti-clockwise (looking at the LED side). Every colour call takes an
+    optional w= (white die, 0-255); leave it out and the call behaves exactly
+    like the 8x (white off). Needs firmware 2.2.0+ (the 0x06 type byte).
+    Protocol: module-usb-led-16x/firmware/readme.md.
+    """
+
+    LED_COUNT   = 16
+    MODULE_TYPE = 0x06
+
+    # -- LED control (RGBW) ----------------------------------------------------
+
+    def set_all(self, r, g, b, w=0):
+        """Set all 16 LEDs to one colour. R, G, B, W each 0-255."""
+        self._send((0x11, _clamp(r), _clamp(g), _clamp(b), _clamp(w)))
+
+    def set_pixel(self, index, r, g, b, w=0):
+        """Set a single LED (0-15) to a colour."""
+        self._send((0x12, int(index) & 0xFF, _clamp(r), _clamp(g), _clamp(b), _clamp(w)))
+
+    def fill(self, hex_color, w=0):
+        """Set all LEDs to a 24-bit hex colour (+ optional white), e.g. fill(0xFF8800)."""
+        self.set_all((hex_color >> 16) & 0xFF, (hex_color >> 8) & 0xFF,
+                     hex_color & 0xFF, w)
+
+    def white(self, level=255):
+        """All LEDs pure white from the white die only (0-255). Cooler and more
+        efficient than mixing R+G+B."""
+        self.set_all(0, 0, 0, level)
+
+    def set_all_pixels(self, pixels):
+        """
+        Set all 16 LEDs at once. `pixels` is an iterable of up to 16 tuples,
+        either (r, g, b) or (r, g, b, w); missing LEDs are turned off.
+        """
+        data = bytearray((0x14,))
+        for px in list(pixels)[:self.LED_COUNT]:
+            w = px[3] if len(px) > 3 else 0
+            data += bytes((_clamp(px[0]), _clamp(px[1]), _clamp(px[2]), _clamp(w)))
+        while len(data) < 1 + self.LED_COUNT * 4:
+            data += b"\x00\x00\x00\x00"
+        self._send(data)
+
+    def set_led(self, index, r, g, b, brightness=255, duration_ms=0, w=0):
+        """Like NoknokLEDs.set_led() (index 0-15 or 0xFF/"all"), plus white."""
+        idx = 0xFF if index == "all" else (int(index) & 0xFF)
+        d = int(duration_ms) & 0xFFFF
+        self._send((0x18, idx, _clamp(r), _clamp(g), _clamp(b), _clamp(w),
+                    _clamp(brightness), d & 0xFF, (d >> 8) & 0xFF))
+
+    def play_preset(self, preset, speed=0, r=0, g=0, b=0, w=0):
+        """Like NoknokLEDs.play_preset() (same presets, same SUNDOWN minutes
+        rule), plus a white base colour - e.g. sundown in warm white."""
+        self._send((0x21, int(preset) & 0xFF, int(speed) & 0xFF,
+                    _clamp(r), _clamp(g), _clamp(b), _clamp(w)))
+
+    def role_cue(self, on=True):
+        """Role-assignment cue: white die only (bright, but half the current of
+        R+G+B white). on=False clears it."""
+        if on:
+            self.white(255)
+        else:
+            self.off()
+
+    # -- status (power governor + temperature, firmware 2.1+) -------------------
+
+    # 0x30 GET_STATUS reply, layout v1 (16 bytes, little-endian):
+    #   u8 version | i16 temp 0.1 C | u16 VBUS mV | u16 CC1 mV | u16 CC2 mV |
+    #   u16 LED budget mA | u16 est. LED mA | u8 flags | u8 thermal % | u8 VBUS %
+    _STATUS_FMT = "<BhHHHHHBBB"
+
+    def status(self):
+        """
+        Read the module's power/temperature status (GET_STATUS 0x30). Returns a
+        dict, or None if the module didn't answer:
+
+            temp_c        chip (die) temperature, deg C (NOT housing/air)
+            vbus_mv       USB supply voltage, mV
+            cc1_mv/cc2_mv USB-C CC pin voltages (tell the source's current limit)
+            budget_ma     LED current budget (0 = LED power cut)
+            led_ma        estimated LED current of what is shown now
+            led_power     LED rail on
+            thermal_cut   LED power cut because the chip is too hot
+            vbus_cut      LED power cut because VBUS sagged too low
+            factory_cal   temperature uses the factory calibration word
+            thermal_pct   thermal dimming factor (100 = not dimmed)
+            vbus_pct      VBUS dimming factor (100 = not dimmed)
+            limited       True when heat is limiting the LEDs (cut or < 100 %)
+            layout        reply layout version (1)
+
+        Cheap (one USB round trip): fine every few seconds, not every frame.
+        """
+        raw = self._query(0x30, 16)
+        if raw is None or len(raw) < 16:
+            return None
+        (layout, temp, vbus, cc1, cc2, budget, led_ma,
+         flags, therm, vbus_pct) = struct.unpack(self._STATUS_FMT, raw)
+        # Layout v1 is the stable promise; a later layout may only APPEND bytes,
+        # so the first 16 still parse the same way.
+        return {
+            "layout":      layout,
+            "temp_c":      round(temp / 10, 1),
+            "vbus_mv":     vbus,
+            "cc1_mv":      cc1,
+            "cc2_mv":      cc2,
+            "budget_ma":   budget,
+            "led_ma":      led_ma,
+            "led_power":   bool(flags & 0x01),
+            "thermal_cut": bool(flags & 0x02),
+            "vbus_cut":    bool(flags & 0x04),
+            "factory_cal": bool(flags & 0x08),
+            "thermal_pct": therm,
+            "vbus_pct":    vbus_pct,
+            "limited":     bool(flags & 0x02) or therm < 100,
+        }
+
+    def temperature(self):
+        """Chip temperature in deg C (one decimal), or None if no answer."""
+        s = self.status()
+        return s["temp_c"] if s else None
+
+
+def _probe_type(dev, timeout=300):
+    """
+    Ask a noknok USB app its module type: send 0xF0, expect [0x4E, 0x4E, type].
+    Returns the type byte, or None if the device didn't answer (yet) or answered
+    something that isn't a noknok identity reply.
+    """
+    try:
+        dev.write(NoknokLEDs._EP_OUT, b"\xF0", timeout=1000)
+        buf = bytearray(3)
+        n = dev.read(NoknokLEDs._EP_IN, buf, timeout=timeout)
+    except Exception:
+        return None
+    if n == 3 and buf[0] == 0x4E and buf[1] == 0x4E:
+        return buf[2]
+    return None
+
+
+# Module type byte (0xF0 reply) -> (driver class, type_name). Add future USB
+# modules here. NOT keyed by PID: every noknok USB app shares PID 0x4E4E.
+_USB_TYPES = {
+    NoknokLEDs.MODULE_TYPE:   (NoknokLEDs,   "noknokleds"),     # 0x04 LEDs 8x
+    NoknokLEDs16.MODULE_TYPE: (NoknokLEDs16, "noknokleds16"),   # 0x06 LEDs 16x
 }
+
+APP_PID = 0x4E4E   # every noknok USB application (the bootloader is 0x4E42)
 
 _host_port = None
 
@@ -272,6 +456,7 @@ def discover(dp=None, dm=None, settle_sec=3, max_sec=20, empty_grace=6):
     """
     ensure_host_port(dp, dm)
     found = {}                          # serial(lower) -> (type_name, module)
+    skipped = set()                     # serials that answered an unknown type
     start = time.monotonic()
     last_new = None
     while True:
@@ -285,13 +470,9 @@ def discover(dp=None, dm=None, settle_sec=3, max_sec=20, empty_grace=6):
             break                       # found some, settled
         for d in usb.core.find(find_all=True):
             try:
-                if d.idVendor != NOKNOK_VID:
-                    continue
-                pid = d.idProduct
+                if d.idVendor != NOKNOK_VID or d.idProduct != APP_PID:
+                    continue            # not ours, or a module sitting in its bootloader
             except Exception:
-                continue
-            entry = _USB_MODULES.get(pid)
-            if entry is None:
                 continue
             try:
                 serial = d.serial_number
@@ -300,13 +481,23 @@ def discover(dp=None, dm=None, settle_sec=3, max_sec=20, empty_grace=6):
             if not serial:
                 continue
             key = serial.lower()
-            if key in found:
+            if key in found or key in skipped:
                 continue
-            cls, type_name = entry
             try:
                 d.set_configuration()
             except Exception:
                 pass
+            # The type byte picks the driver (the PID can't - it's shared).
+            mtype = _probe_type(d)
+            if mtype is None:
+                continue                # no answer yet - retried on the next pass
+            entry = _USB_TYPES.get(mtype)
+            if entry is None:
+                print("  USB module %s: unknown module type 0x%02X - skipped "
+                      "(newer module than this noknok_usb.py?)" % (key, mtype))
+                skipped.add(key)
+                continue
+            cls, type_name = entry
             mod = cls(d)
             mod._uid_hex = key
             v = mod.version()
