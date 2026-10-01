@@ -2670,6 +2670,51 @@ COLORS = {
 }
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# DISPLAY ORIENTATION
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Pass one of these to display.rotation(), by constant or by name:
+#
+#     from noknok import Conductor, LANDSCAPE
+#     d.rotation(LANDSCAPE)        # or d.rotation("landscape")
+#
+# The module BOOTS IN LANDSCAPE (display firmware v0.6.0+), so most products
+# never need to call this at all - set it once at the start only if you want a
+# different orientation. All four are bench-verified on rev 1.1 hardware.
+
+PORTRAIT          = 0      # 80x160
+LANDSCAPE         = 1      # 160x80  <- the module's boot default
+PORTRAIT_FLIPPED  = 2      # 80x160, 180 degrees from PORTRAIT
+LANDSCAPE_FLIPPED = 3      # 160x80, 180 degrees from LANDSCAPE
+
+ORIENTATIONS = {
+    "portrait":          PORTRAIT,
+    "landscape":         LANDSCAPE,
+    "portraitflipped":   PORTRAIT_FLIPPED,
+    "landscapeflipped":  LANDSCAPE_FLIPPED,
+    "portrait180":       PORTRAIT_FLIPPED,
+    "landscape180":      LANDSCAPE_FLIPPED,
+}
+
+
+def orientation(value):
+    """
+    Normalise an orientation to 0-3. Accepts a constant (0-3) or a name such as
+    "landscape" / "portrait_flipped" (case, spaces, hyphens and underscores are
+    all ignored), so product code can read however suits it.
+    """
+    if isinstance(value, str):
+        key = value.strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+        if key not in ORIENTATIONS:
+            raise ValueError("unknown orientation: %r (try %s)"
+                             % (value, ", ".join(sorted(ORIENTATIONS))))
+        return ORIENTATIONS[key]
+    v = int(value)
+    if not 0 <= v <= 3:
+        raise ValueError("orientation must be 0-3, got %r" % (value,))
+    return v
+
 def rgb565(color):
     """
     Convert a colour to the panel's 16-bit RGB565 value.
@@ -3631,14 +3676,20 @@ class NoknokDisplay:
 
     def rotation(self, rot):
         """
-        Turn the picture: 0 = portrait (80x160, the default), 1 = landscape
-        (160x80), 2 = portrait upside down, 3 = landscape the other way.
-        Needs display firmware v0.3.0+. The screen is cleared, width/height
+        Turn the picture. Takes a constant or a name:
+
+            PORTRAIT (0)   LANDSCAPE (1)   PORTRAIT_FLIPPED (2)
+            LANDSCAPE_FLIPPED (3)
+            or "portrait" / "landscape" / "portrait_flipped" / ...
+
+        The module BOOTS IN LANDSCAPE (160x80) on display firmware v0.4.0+, so
+        you only need this if you want something else. Needs v0.3.0+ (before v0.6.0
+        the module booted in PORTRAIT and all four values were unverified). The screen is cleared, width/height
         are re-read from the module, print() starts again at the top and
         regions are re-clipped (ones that fall off the panel are dropped —
         the dropped names are returned).
         """
-        ok = self._send([self._CMD_SET_ROTATION, int(rot) & 0x03])
+        ok = self._send([self._CMD_SET_ROTATION, orientation(rot)])
         time.sleep(0.08)
         return self._after_geometry_change(ok)
 
