@@ -325,6 +325,11 @@ as a 1-bit-per-pixel blit, so nothing below needs firmware support (v0.2.0+; v0.
   error 3); an unplugged module never raises — draws return False and `info()` falls back to
   80×160. **Keep print() and regions apart:** a scrolling terminal repaints full-width bands,
   so a region inside its path gets wiped.
+- **Plan a layout in the browser:** the [noknok Display Planner](https://buildwithnoknok.github.io/display-planner/)
+  draws the regions above to scale, converts any image into a 1-bit icon, and exports the
+  `d.region()` / `d.set()` / `ICONS[...]` code to paste here. Its preview is a port of this
+  driver's drawing rules, diffed against `tools/display_sim.py` on every change
+  ([source](https://github.com/buildwithnoknok/Ecosystem/tree/main/software/display-planner)).
 - Bench: `display_test.py` (`p <text>`, `icon`, `icons`, `image`, `region`, `set`, `demo2`);
   `bench_dev41.py` = the 7-step hardware check (all passed 19 Sep 2026 on Pi4RFID, fw 0.5.0:
   15 ms per region update, ≈75 ms per scrolling print() line, 16 ms per 16×16 icon).
