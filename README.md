@@ -14,7 +14,10 @@ over I2C.
 | `boot.py` | Runs first on power-up. Hides the CIRCUITPY drive and makes the filesystem read-only to the program (see [Filesystem policy](#filesystem-policy-dev-18)). Fails open. |
 | `settings.toml` | **The maker config file.** I2C/USB pins, drive visibility. Every key has the ecosystem-standard default built into the code — see [settings.toml](#settingstoml--maker-configuration). |
 | `code.py` | Provisioning brain + launcher. WiFi-AP setup on first boot, then connect + download + run the app-selected product script crash-safely on every boot. |
-| `noknok.py` | Conductor library — module discovery/enumeration + drivers (Buzzer, Knob, LED Button, ...). Includes the factory-reset watchdog, the runtime `Store` (FRAM / nvm) and the setup-time file helpers (`writable()`, `write_atomic()`). |
+| `noknok.py` | Conductor library — module discovery/enumeration + drivers (Buzzer, Knob, LED Button, Display, ...). Includes the factory-reset watchdog, the runtime `Store` (FRAM / nvm), `c.settings` and the setup-time file helpers (`writable()`, `write_atomic()`). **Ships to the Pico as `noknok.mpy`** — see [Precompiled libraries](#precompiled-libraries-mpy). |
+| `noknok_rpc.py` | Device Protocol v1 (DEV-34): op dispatcher + the `POST /rpc` carrier the app talks to. Imported by `code.py` on every boot. |
+| `noknok_usb.py` | USB modules: host port, discovery (driver chosen by the `0xF0` type byte — every noknok USB app shares PID `0x4E4E`), `NoknokLEDs` (8×), `NoknokLEDs16` (16× RGBW, `status()`/`temperature()`), USB OTA flasher. Imported only by products that use USB modules. |
+| `../tools/build_mpy.ps1` | Precompiles the libraries to `.mpy` with Adafruit's `mpy-cross` (must match the Pico's CircuitPython version). |
 | `bench_fs_policy.py` / `bench_store.py` / `bench_yank.py` | DEV-18 bench scripts: filesystem read-only outside a window; Store round-trip + stable addresses; board-guided power-yank test (beeps, then a tone = pull the cable). |
 | `lib/` | Pinned CircuitPython libraries the brain needs (see `lib/README.md`). |
 | `module_flasher.py` | I2C OTA flasher — streams a module application `.bin` to the CH32V003 bootloader (`ModuleFlasher`). Shared by the bench tool and (later) the provisioning flow. |
@@ -28,6 +31,10 @@ over I2C.
 | `display_test.py` | Interactive Display bench tool: type text to draw it; `p` = print(), `icon`, `image`, `region`/`set`, `demo`/`demo2`. See *noknok Display* under *Current versions*. |
 | `bench_dev41.py` | Display hardware check (DEV-41): native sizes, print, icons, image, regions — 7 steps, prints timings + module error byte. Pins GP20/21 (Pi4RFID bench). |
 | `../tools/display_sim.py` | Desktop simulator for the Display driver — a virtual module that decodes the I²C stream like the firmware and dumps the panel as ASCII art (71 checks). Needs `module-I2C-1.42-display` cloned next to this repo for the font. |
+| `bench_dev46.py` | LEDs 8× + 16× on one hub behind the Pico (DEV-46): driver dispatch, white channel, `status()`, 300-frame burst, firmware report + roles. |
+| `bench_info_settings.py` | Read-only `info` settings on the Pico (live temperature, read-only rejects, no Store writes). |
+| `bench_lamp16.py` | Runs a real product script (`/lamp16_product.py`) unmodified and plays the app between its loop turns — product + settings test **without WiFi**. |
+| `../tools/usb_sim.py` / `../tools/usb_hw_leds16.py` | USB driver on the desktop: fake USB bus (39 checks) / the real driver against a module plugged straight into a Pi or PC via its CDC port (fast-host stress test). |
 
 ## Provisioning (PoC Step 1 — done)
 
@@ -35,6 +42,21 @@ First boot: Pico starts a WiFi AP `noknok-setup` and serves a captive-portal set
 The user (or the noknok app) enters their home WiFi; the Pico saves it, hard-resets into WiFi
 mode, downloads the product script from GitHub over HTTPS, saves it as `product.py`, and runs
 it. Subsequent boots reconnect to WiFi and re-run the product directly.
+
+**Setup troubleshooting** (from the first full phone setup, 2 Oct 2026 — hardening in DEV-47):
+- *App: "Could not reach the device"* — Android keeps mobile data as the default network while
+  the phone is on the no-internet `noknok-setup` hotspot, so requests leave over LTE. App
+  1.5.1+ routes itself over the hotspot (`bindProcessToNetwork`); older apps need mobile data off.
+- *Serial: `No network with that ssid`* — the WiFi name is exact (case, dashes). After three
+  failed joins the brain reopens `noknok-setup` for a retry — no replug needed.
+- *Serial: `CANNOT save /data/product.py`* — the program cannot write because the drive is
+  visible: read `boot_out.txt` (see *Fail open*).
+- **⚠ After the setup AP has been started, the station has no internet until a HARD reset.**
+  Starting the AP takes the network stack's default route; off-subnet traffic then fails
+  *instantly* with `EHOSTUNREACH` / DNS `-2` while the LAN (router, other devices) still
+  works — it looks exactly like "the router blocks the Pico". `stop_ap()` and soft reloads do
+  not clear it. Power-cycle or `microcontroller.reset()`. Open bug, DEV-47.
+- Diagnosis rule: an error that comes back in **0.00 s** is the Pico's own stack, not the router.
 
 **Note:** BLE was the original plan but is not supported on RP2350 in CircuitPython 10.x —
 provisioning uses WiFi AP instead. Full process, test steps, and gotchas are documented in
@@ -96,9 +118,13 @@ shows up on a PC as a drive again (fail-open, below), so recovery is always poss
    copy, `product.py` and the cache are re-downloaded, and DEV-38 covers the rest.
    `noknok.writable()` / `noknok.write_atomic()` are the only way to write, and they are
    for these moments only.
-5. **Fail open.** If `settings.toml` has no `NOKNOK_USB_DRIVE` key, or `code.py` /
-   `noknok.py` are missing, or `boot.py` raises, the drive stays visible. `boot.py` can
-   never lock a brain out.
+5. **Fail open.** If `settings.toml` has no `NOKNOK_USB_DRIVE` key, or `code.py` / a
+   library `code.py` always imports (`noknok`, `noknok_rpc` — as `.mpy` **or** `.py`) is
+   missing, or `boot.py` raises, the drive stays visible. `boot.py` can never lock a brain
+   out. **A visible drive means the program cannot write**: provisioning then fails to save the
+   downloaded product. If saves fail, read `boot_out.txt` — `fail-open` names the reason.
+   (2 Oct 2026: an old `boot.py` that only knew `noknok.py` failed open on an `.mpy` brain
+   exactly like this.)
 
 **Maker / bench mode** (`NOKNOK_USB_DRIVE = 1`): the drive is visible and a PC may write
 it; the program then cannot write the filesystem (the Store still works), and provisioning
@@ -220,7 +246,18 @@ Earlier features:
   audit trail). The post-flash re-enumerate deliberately does **not** wipe `noknok_state.json`,
   so modules that weren't flashed keep their addresses.
 
-**`noknok.py` v1.9** — Conductor library.
+**`noknok.py` v1.11** — Conductor library.
+
+DEV-46 (Oct 2026):
+- **v1.10 — LEDs 16x** (`c.leds16`, manifest type `usb_leds_16x`, module type `0x06`): the
+  same calls as the 8× ring plus an optional `w=` (white die) on every colour call,
+  `white(level)`, `status()` (chip temperature, VBUS, CC, LED budget/current, thermal and
+  VBUS cut flags, dimming factors) and `temperature()`. USB modules are now told apart by the
+  `0xF0` type byte — before, every USB module became an 8× `NoknokLEDs`. `c.leds` is unchanged.
+- **v1.11 — read-only `info` settings:** `c.settings.info(id, fn)` shows a live value on the
+  app's settings page (config_schema type `info`). Computed on every `settings.get`, never
+  stored, never in `seq`; the app cannot set it. Example: the Multicolor Lamp 16x shows the
+  ring's temperature and whether it is dimming itself.
 
 DEV-31 additions (Sam), all bench-proven over I2C:
 `bootloader_version(entry)` — the fleet discriminator; `None` means the legacy monolithic
@@ -301,11 +338,31 @@ as a 1-bit-per-pixel blit, so nothing below needs firmware support (v0.2.0+; v0.
 - `adafruit_connection_manager.mpy`
 - `adafruit_ntp.mpy` (optional — enables wall-clock timestamps)
 
+### Precompiled libraries (.mpy)
+
+The Pico compiles every imported `.py` in RAM. `noknok.py` is ~190 KB of source; its parse
+tree needs large *contiguous* heap blocks, and on 2 Oct 2026 it no longer fit: `code.py` died
+at `import noknok` with a MemoryError while 325 KB were free (the network libraries loaded
+first had fragmented the heap) and the brain never started its setup AP. A `.mpy` is already
+compiled — `noknok.py` 184 KB → `noknok.mpy` 45 KB — so it loads with a fraction of the RAM.
+
+- Build: `tools/build_mpy.ps1` → `C:\Users\chris\noknok\pico-deploy\mpy\` (`noknok`,
+  `noknok_rpc`, `noknok_usb`, `module_flasher`). `code.py` and `boot.py` stay `.py`.
+- **`mpy-cross` must match the Pico's CircuitPython version** (10.3.1 → mpy v6.3). Official
+  builds: `adafruit-circuit-python.s3.amazonaws.com` → `bin/mpy-cross/`. Upgrading
+  CircuitPython means rebuilding.
+- **On the Pico, a `.py` wins over a `.mpy` of the same name** — never leave both.
+- The repo holds only the sources; `.mpy` files are build output. The factory image (DEV-38)
+  carries the `.mpy` set.
+- Safety net: `code.py` imports `noknok` first, while the heap is still unfragmented.
+
 ### Flash / test
-1. Copy `boot.py` + `settings.toml` + `code.py` + `noknok.py` + `noknok_usb.py` +
-   `module_flasher.py` + the libs to the Pico. On a fresh CircuitPython (no `boot.py` yet) the
+1. Build the `.mpy` set (above). Copy `boot.py` + `settings.toml` + `code.py` + the four
+   `.mpy` files + the libs to the Pico. On a fresh CircuitPython (no `boot.py` yet) the
    CIRCUITPY drive is visible — drag and drop. Afterwards the drive is hidden: push files over
-   the REPL (`tools/pico.py put`, Thonny) or set `NOKNOK_USB_DRIVE = 1` first.
+   the REPL (`tools/pico.py put`, Thonny) or set `NOKNOK_USB_DRIVE = 1` first. If the drive
+   is visible *and* you need the program to write (the drive stayed visible by mistake), mount
+   it on the bench Pi and copy there.
    Write `.py` files **without a BOM** — CircuitPython errors on a leading byte-order mark.
 2. **Power-cycle** the Pico (the radio is not reset by a soft reboot; a power cycle also returns
    the I2C modules to their `0x7F` staging address).
@@ -330,8 +387,8 @@ collision. Hence: connect one module, tell it the type, flash, swap in the next.
 ### Prerequisites — files on the CIRCUITPY root
 | File | From |
 |------|------|
-| `noknok.py` | this folder |
-| `module_flasher.py` | this folder |
+| `noknok.mpy` | `tools/build_mpy.ps1` (or `noknok.py` from this folder on a Pico that runs nothing else) |
+| `module_flasher.mpy` | `tools/build_mpy.ps1` (or `module_flasher.py`) |
 | `bench_flash.py` | this folder |
 | `buzzer_firmware.bin` | `module-I2C-buzzer/firmware/bin/` |
 | `knob_firmware.bin` | `module-I2C-knob/firmware/bin/` |

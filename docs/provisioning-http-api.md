@@ -20,6 +20,18 @@ portal setup page). This is the app ↔ brain contract.
   Since code.py 0.17 the brain also serves **`POST /rpc`** (JSON, see below) on the
   AP *and* on home WiFi for the product's whole lifetime — that is the channel new
   app code uses; the form endpoints are adapters over the same handlers.
+- **⚠ Client requirement — route over the hotspot.** `noknok-setup` has no internet, so
+  Android (and iOS) keep mobile data as the default network while the phone is joined to
+  it; a plain HTTP request to `192.168.4.1` then leaves over LTE and never arrives. A client
+  must bind its traffic to the WiFi network for the whole setup (Android:
+  `ConnectivityManager.bindProcessToNetwork` on a WiFi `NetworkRequest` *without* the
+  INTERNET capability — app 1.5.1+, `MainActivity.kt`; iOS: `NEHotspotConfiguration` /
+  per-request interface binding, not built yet), re-bind before each request (the phone
+  reconnects when the brain restarts its hotspot) and unbind once `/connect` succeeded.
+- **`/connect` answers before the WiFi join.** HTTP 200 means "credentials received and
+  saved", not "joined": the brain then stops the hotspot and tries the home WiFi 3×. On
+  failure it reopens `noknok-setup`; the app does not learn why yet (DEV-47 adds a
+  `setup_result`). A wrong name shows on the serial console as `No network with that ssid`.
 
 ## Endpoints
 
@@ -197,6 +209,16 @@ Pico 2 W never associates after a cold boot when a multi-second compile (this fi
 noknok.py) freezes the VM right after the radio's cold init; a soft reload joins in 3 s.
 Bisected on the bench, nothing from Python un-wedges the radio. Costs ~3 s per power-on.
 Real fix: no boot-time compile (precompiled `.mpy` / frozen modules, DEV-38).
+*2 Oct 2026:* the libraries now ship as `.mpy` (README → *Precompiled libraries*) — that was
+forced by a boot MemoryError, not by this bug. Whether the reload can go needs a cold-boot
+test on CircuitPython 10.3.1 with the `.mpy` set; until then it stays.
+
+### Known bug — no internet after the setup AP was up (DEV-47)
+Once `code.py` has started the `noknok-setup` AP in a power session, the station loses its
+default route: every off-subnet connection fails at once (`EHOSTUNREACH`, DNS `-2`) while
+the LAN works. `stop_ap()` and soft reloads do not restore it; a hard reset does. Consequence
+today: after any failed download / save the brain falls back to the AP and every later retry
+in that session fails as "no internet". Retries must go through `microcontroller.reset()`.
 
 ### Settings — where they live (constraint from DEV-18)
 **Settings values live in the runtime Store (FRAM / nvm), never in a file** — the product
