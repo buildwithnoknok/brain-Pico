@@ -254,6 +254,13 @@
 #   adafruit_requests.mpy
 #   adafruit_connection_manager.mpy
 
+# noknok FIRST, while the heap is still empty and unfragmented: compiling a
+# large .py (noknok.py is ~190 KB of source) needs big contiguous blocks for the
+# parse tree. Imported after the network libraries it hit a MemoryError at boot
+# with 325 KB free (2 Oct 2026) — the brain never reached its WiFi. Shipping
+# precompiled .mpy (tools/build_mpy.ps1, DEV-38) avoids the on-device compile.
+import noknok as nk          # filesystem policy helpers (DEV-18) + settings.toml
+import noknok_rpc as rpc     # Device Protocol v1: dispatcher + /rpc carrier (DEV-34)
 import json
 import os
 import sys
@@ -266,8 +273,6 @@ import ssl
 import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
-import noknok as nk          # filesystem policy helpers (DEV-18) + settings.toml
-import noknok_rpc as rpc     # Device Protocol v1: dispatcher + /rpc carrier (DEV-34)
 
 CODE_VERSION = "0.18"
 
