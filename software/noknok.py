@@ -59,6 +59,10 @@
 #             their 0xF0 type byte, not the PID (all noknok USB apps share
 #             0x4E4E) — before this, every USB module became an 8x NoknokLEDs.
 #             The 8x ring (c.leds) is unchanged.
+# v1.11 (Sue): DEV-46 — read-only "info" settings: c.settings.info(id, fn)
+#             shows a live value (e.g. the LEDs 16x temperature) on the app's
+#             settings page. Computed on each settings.get, never stored;
+#             the app cannot set it.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -79,7 +83,7 @@ import json
 import os
 import struct
 
-__version__ = "1.10"
+__version__ = "1.11"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -700,6 +704,8 @@ class Settings:
         self._error = None          # last write failure, shown in snapshot()
         self._cbs   = []
         self._pending = {}          # app-side changes not yet delivered to on_change
+        self._info  = {}            # read-only id -> provider (DEV-46), RAM only
+        self._info_failed = set()   # providers that raised (logged once)
         rec = store().get(key)
         if isinstance(rec, dict) and (tag is None or rec.get("product") == tag):
             self._vals = dict(rec.get("values") or {})
@@ -734,6 +740,9 @@ class Settings:
     def set(self, key, value):
         """Device-side change (a knob, the product). Persisted later — see
         _tick(). Returns True if the value changed, False if equal or rejected."""
+        if key in self._info:
+            print("[settings] set %r rejected: read-only info field" % (key,))
+            return False
         why = _check_value(key, value, self._defs.get(key))
         if why is not None:
             print("[settings] set %r rejected: %s" % (key, why))
@@ -749,6 +758,46 @@ class Settings:
 
     def update(self, values):
         return any([self.set(k, v) for k, v in values.items()])
+
+    # ── read-only info fields (config_schema type "info", DEV-46) ────────────
+    def info(self, key, provider):
+        """Show a live, read-only value on the app's settings page, e.g.
+
+            c.settings.info("temperature", lambda: c.leds16[0].temperature())
+
+        `key` = the id of a config_schema entry with "type": "info".
+        `provider` = a function returning a number, string, bool or None, or
+        a plain constant. It is called fresh every time the app asks (about
+        every 3 s while the page is open) — never stored, never written to
+        flash, never passed to on_change. Keep it quick (one module read).
+        If it raises, the app shows the value as empty."""
+        if not isinstance(key, str) or not key or len(key) > SETTINGS_MAX_KEY:
+            print("[settings] info %r rejected: bad key" % (key,))
+            return self
+        if key not in self._info and len(self._info) >= SETTINGS_MAX_KEYS:
+            print("[settings] info %r rejected: too many info fields" % (key,))
+            return self
+        self._info[key] = provider
+        self._info_failed.discard(key)
+        return self
+
+    def info_values(self):
+        """Evaluate every info provider now. id -> scalar value or None."""
+        out = {}
+        for k, p in self._info.items():
+            try:
+                v = p() if callable(p) else p
+            except Exception as e:
+                if k not in self._info_failed:
+                    self._info_failed.add(k)
+                    print("[settings] info %r failed: %r" % (k, e))
+                v = None
+            if not (v is None or isinstance(v, (bool, int, float, str))):
+                v = str(v)
+            if isinstance(v, str) and len(v) > SETTINGS_MAX_STR:
+                v = v[:SETTINGS_MAX_STR]
+            out[k] = v
+        return out
 
     def all(self):
         return dict(self._vals)
@@ -807,7 +856,7 @@ class Settings:
         reach the product."""
         changed, rejected = {}, {}
         for k, v in values.items():
-            why = _check_value(k, v, self._defs.get(k))
+            why = "read-only" if k in self._info else _check_value(k, v, self._defs.get(k))
             if why is None and k not in self._vals and len(self._vals) >= SETTINGS_MAX_KEYS:
                 why = "too many keys"
             if why is not None:
@@ -825,6 +874,8 @@ class Settings:
         out = {"product": self._tag, "values": dict(self._vals),
                "defaults": dict(self._defs), "seq": self._seq,
                "dirty": self._dirty}
+        if self._info:
+            out["info"] = self.info_values()     # live, read-only (DEV-46)
         if self._error:
             out["error"] = self._error
         return out
