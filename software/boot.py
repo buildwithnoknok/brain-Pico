@@ -22,8 +22,9 @@
 #     then power-cycle. Switch back by editing settings.toml on the PC.
 #
 #   Fail open
-#     If settings.toml has no NOKNOK_USB_DRIVE key, or code.py / noknok.py are
-#     missing, or anything here raises, the drive stays VISIBLE. A damaged
+#     If settings.toml has no NOKNOK_USB_DRIVE key, or code.py / a library it
+#     always imports (noknok, noknok_rpc - as .mpy or .py) is missing, or
+#     anything here raises, the drive stays VISIBLE. A damaged
 #     brain therefore always shows up on a PC and can be recovered (DEV-38:
 #     one-file recovery image). This file can never lock a brain out.
 #
@@ -36,8 +37,25 @@ import storage
 try:
     v = os.getenv("NOKNOK_USB_DRIVE")                      # int 0/1, or None if absent
     hide = v is not None and int(v) == 0                   # absent key -> visible
-    for required in ("code.py", "noknok.py"):
-        os.stat(required)                                  # missing -> OSError -> visible
+    os.stat("code.py")                                     # missing -> OSError -> visible
+    # The libraries code.py imports on EVERY boot (without them code.py dies,
+    # so the brain must fail open to be recoverable). Optional, lazily imported
+    # ones (noknok_usb, module_flasher) are deliberately not checked. Each ships
+    # precompiled (.mpy, tools/build_mpy.ps1) or as source on a maker's brain -
+    # either counts. Checking only noknok.py made an .mpy brain fail open:
+    # drive visible, every program write refused, the product download saved
+    # nowhere (2 Oct 2026).
+    for lib in ("noknok", "noknok_rpc"):
+        found = False
+        for ext in (".mpy", ".py"):
+            try:
+                os.stat(lib + ext)
+                found = True
+                break
+            except OSError:
+                pass
+        if not found:
+            raise OSError("%s library missing" % lib)
     if hide:
         storage.disable_usb_drive()
         # Bench-proven 15 Sep 2026: with the drive disabled CircuitPython makes
