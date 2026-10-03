@@ -14,7 +14,7 @@ over I2C.
 | `boot.py` | Runs first on power-up. Hides the CIRCUITPY drive and makes the filesystem read-only to the program (see [Filesystem policy](#filesystem-policy-dev-18)). Fails open. |
 | `settings.toml` | **The maker config file.** I2C/USB pins, drive visibility. Every key has the ecosystem-standard default built into the code — see [settings.toml](#settingstoml--maker-configuration). |
 | `code.py` | Provisioning brain + launcher. WiFi-AP setup on first boot, then connect + download + run the app-selected product script crash-safely on every boot. |
-| `noknok.py` | Conductor library — module discovery/enumeration + drivers (Buzzer, Knob, LED Button, Display, ...). Includes the factory-reset watchdog, the runtime `Store` (FRAM / nvm), `c.settings` and the setup-time file helpers (`writable()`, `write_atomic()`). **Ships to the Pico as `noknok.mpy`** — see [Precompiled libraries](#precompiled-libraries-mpy). |
+| `noknok.py` | Conductor library — module discovery/enumeration + drivers (Buzzer, Knob, LED Button, Display, ...). Includes the factory-reset watchdog, the runtime `Store` (nvm; optional I2C FRAM), `c.settings` and the setup-time file helpers (`writable()`, `write_atomic()`). **Ships to the Pico as `noknok.mpy`** — see [Precompiled libraries](#precompiled-libraries-mpy). |
 | `noknok_rpc.py` | Device Protocol v1 (DEV-34): op dispatcher + the `POST /rpc` carrier the app talks to. Imported by `code.py` on every boot. |
 | `noknok_usb.py` | USB modules: host port, discovery (driver chosen by the `0xF0` type byte — every noknok USB app shares PID `0x4E4E`), `NoknokLEDs` (8×), `NoknokLEDs16` (16× RGBW, `status()`/`temperature()`), USB OTA flasher. Imported only by products that use USB modules. |
 | `../tools/build_mpy.ps1` | Precompiles the libraries to `.mpy` with Adafruit's `mpy-cross` (must match the Pico's CircuitPython version). |
@@ -95,13 +95,20 @@ shows up on a PC as a drive again (fail-open, below), so recovery is always poss
    (With the drive hidden CircuitPython would otherwise leave it *writable*; the explicit
    remount is the guarantee.)
 2. **Runtime data lives in the Store, never on the FAT.** `noknok.store()` is a small
-   CRC-checked record on an **I2C FRAM** at 0x50 when the PicoHub has one
-   ([DEV-40](https://noknokdev.atlassian.net/browse/DEV-40): byte-atomic writes, no wear,
-   genuinely power-safe; two slots written alternately) and otherwise in
-   `microcontroller.nvm` (one 4 KB flash sector — a cut mid-write loses the record, which
-   is acceptable only because every key is self-healing). Keys: module state (UID →
-   address/type/bootloader), roles, the event history (`[FW]/[CRASH]/…`, replaces
-   `noknok_events.txt`), a WiFi-credentials copy, and product settings (DEV-34).
+   CRC-checked record. Keys: module state (UID → address/type/bootloader), roles, the event
+   history (`[FW]/[CRASH]/…`, replaces `noknok_events.txt`), a WiFi-credentials copy, and
+   product settings (DEV-34).
+   **On shipping hardware the backend is `microcontroller.nvm`** — one 4 KB flash sector,
+   one record at a fixed offset. It never touches the FAT, so a power cut can never damage
+   the filesystem, but **a cut during a Store write loses the record**: the brain comes back
+   with module state re-enumerated, the event history empty and **product settings back to
+   their defaults**. Every key is deliberately self-healing for that reason; credentials
+   also live in `/data/wifi.json`. Bench-measured write: ~79 ms.
+   An **I2C FRAM at 0x50** (byte-atomic, wear-free, two slots written alternately — genuinely
+   power-safe) is still implemented in `noknok.py` and would remove that last loss, but no
+   noknok board fits one: the PicoHub FRAM story (DEV-40) was **cancelled**. The backend is
+   probed only when `settings.toml` has `NOKNOK_FRAM = 1` *and* a chip answers at 0x50, so a
+   maker who wires one up gets it; `0x50–0x57` stays reserved ecosystem-wide for exactly that.
 3. **Stable module addresses.** Enumeration gives a known module its previous address, so
    the state record only changes when hardware changes — it used to be rewritten on most
    power-ons because modules were numbered in arrival order.
@@ -114,7 +121,9 @@ shows up on a PC as a drive again (fail-open, below), so recovery is always poss
    blocks (four 1 KB clusters each, possibly from different files) are still shared, so a
    setup-time cut can in the worst case still reach the system files. A true second
    partition or frozen system files would remove that; both need a custom CircuitPython
-   build and are scored on DEV-37. Recovery today: `wifi.json` is rebuilt from the Store
+   build, which noknok does not maintain (the ESP32-S3 spike that would have evaluated it,
+   DEV-37, was cancelled — CircuitPython on the Pico 2 W ships the launch, ADR-001).
+   Recovery today: `wifi.json` is rebuilt from the Store
    copy, `product.py` and the cache are re-downloaded, and DEV-38 covers the rest.
    `noknok.writable()` / `noknok.write_atomic()` are the only way to write, and they are
    for these moments only.
@@ -172,7 +181,7 @@ OTA interval, mDNS name) move here under [DEV-39](https://noknokdev.atlassian.ne
 ## Current versions & features (PoC v1)
 
 **`code.py` v0.16** — provisioning + launcher + module firmware OTA. 15 Sep 2026: **no filesystem
-writes while a product runs (DEV-18)** — read-only by default, runtime data in the Store (FRAM / nvm),
+writes while a product runs (DEV-18)** — read-only by default, runtime data in the Store (nvm),
 setup-time writes into `/data`, `settings.toml` for pins and drive visibility; see the two sections above. Field-hardened 12 Sep 2026:
 - **Bootloader updates over the air (DEV-31).** The registry names the current stage-1
   (`module-I2C-bootloader/firmware/index.json`); it is cached like any image, and before the
