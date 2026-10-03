@@ -152,6 +152,18 @@ these. noknok hardware (PicoHub) follows the Ecosystem standard and ships the de
 | `NOKNOK_I2C_FREQ` | `100000` | `noknok.Conductor()` |
 | `NOKNOK_USB_DP` / `NOKNOK_USB_DM` | `"GP16"` / `"GP17"` (D+ = lower GPIO of a consecutive pair) | `noknok_usb` host port |
 | `NOKNOK_USB_DRIVE` | `0` = hidden (shipped) · `1` = visible (maker/bench) | `boot.py` |
+| `NOKNOK_MDNS` | `0` = off (default) · `1` = advertise `noknok-XXXX.local` | `code.py` app channel |
+| `NOKNOK_FRAM` | `1` = probe the I2C FRAM at 0x50, `0` = nvm only | `noknok.store()` |
+| `NOKNOK_WATCHDOG` | `0` = off (default) · `1` = **bench only**, 8 s hardware watchdog fed by the app-channel pump, plus the `bench.wifi_drop` op | `code.py` |
+
+⚠ `NOKNOK_WATCHDOG` is a diagnostic for unattended bench runs, never for a shipped brain or
+for a brain you also drive with `tools/pico.py`: Ctrl-C into the REPL stops the pump, the
+watchdog resets the board ~8 s later, and a reset landing mid-write corrupts the filesystem
+(it cost `/data` on the bench, 18 Sep 2026). After a watchdog reset the radio does not
+re-join either — that board needs a real power cycle. `NOKNOK_MDNS` is off by default
+because the app finds a brain by scanning the subnet; one unexplained idle hang while
+advertising has not been re-tested (see
+[DEV-70](https://noknokdev.atlassian.net/browse/DEV-70)).
 
 A missing key falls back to the default in code, so a brain without the file behaves like a
 factory unit — except drive visibility, which fails open to *visible*. More knobs (debug log,

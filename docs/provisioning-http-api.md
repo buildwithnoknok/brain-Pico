@@ -174,7 +174,15 @@ the MCU id; `hello` returns the name). Implementation: `software/noknok_rpc.py`
   ≤ 240 ms when a phone stalls mid-request — soak, DEV-34 comment 10829). A product
   idling in `time.sleep()` should use `c.sleep()`; otherwise replies wait for its next
   module read. **Offline brains have no channel** (AP-on-demand = DEV-35).
-- Expect **~0.4 s round trip** for now (two-segment response, see DEV-34 follow-up).
+- **Round trip ≈ 13 ms** on a quiet LAN (18 Sep 2026). ⚠ That depends on
+  `wifi.radio.power_management = NONE`, which `noknok_rpc.start_http()` sets
+  (`no_power_save()`). In the CYW43's default power-save mode the radio only listens every
+  beacon interval: a phone's request arrives as headers-then-body hundreds of ms apart, so
+  the round trip was ~0.4 s **and** bodies read with a short window came back empty — every
+  phone request answered `bad json`. Keep power management off, and keep `SOCKET_TIMEOUT` /
+  `BODY_GRACE` at 1 s; anyone shortening them again must re-test from a real phone, not
+  from curl (curl sends one packet and never reproduces it). `status.last_bad_request`
+  keeps the last unparseable body for exactly this diagnosis.
 
 | op | args | reply fields | notes |
 |----|------|--------------|-------|
@@ -185,7 +193,7 @@ the MCU id; `hello` returns the name). Implementation: `software/noknok_rpc.py`
 | `provision` | `ssid`, `password`, `script_url`, `module_firmware`, `product_id`, `config_defaults` | `accepted`, `mode` (`setup` / `switch`), `rebooting` | on the AP = `/connect`; on home WiFi = **product switch**: the network stays (a different `ssid` is refused — use setup mode), the request is parked, the brain reboots, downloads + compiles the new script **before** touching anything, and only on success replaces `product.py`, saves the new product and installs its `config_defaults`. A bad URL / dead uplink keeps product, settings and firmware as they were (`[CFG] product switch FAILED` event). |
 | `reboot` | — | `rebooting: true` | flushes settings, replies, resets 0.5 s later |
 | `factory_reset` | — | `resetting: true` | same wipe as the boot-hold gesture (both settings scopes too); the only reset path for a product with nothing pressable |
-| `settings.get` | `scope` (`product` default / `device`) | `product`, `values`, `defaults`, `seq`, `dirty`, `info?`, `error?` | poll `seq` to pick up knob-driven changes. `info{id: value}` (noknok.py 1.11+, only when the product registered any) = read-only live values (config_schema type `info`, e.g. a module temperature), computed on every call; they never change `seq`, so compare `info` itself to refresh |
+| `settings.get` | `scope` (`product` default / `device`) | `product`, `values`, `defaults`, `seq`, `dirty`, `info?`, `error?` | poll `seq` to pick up knob-driven changes — it bumps **in RAM on every change**, not when the record is written, so a knob turn or button press is visible within one poll (the app's 3 s). Tying it to the write made device-side changes show up only after 5–30 s. `info{id: value}` (noknok.py 1.11+, only when the product registered any) = read-only live values (config_schema type `info`, e.g. a module temperature), computed on every call; they never change `seq`, so compare `info` itself to refresh |
 | `settings.set` | `scope`, `values{}` | `changed{}`, `rejected{key: reason}`, `values`, `seq` | values are validated against the declared defaults' types (+ `#RRGGBB` / `HH:MM` formats); an `info` id is rejected as `read-only`; `ok:false, error:"rejected"` when nothing was accepted |
 | `settings.reset` | `scope` | `values`, `seq` | back to the product's defaults |
 
@@ -224,9 +232,12 @@ in that session fails as "no internet". Retries must go through `microcontroller
 **Settings values live in the runtime Store (FRAM / nvm), never in a file** — the product
 reads them through `c.settings`. Convention: product-tagged,
 `{"product":"<manifest-id>", ...values...}`; a product ignores values whose tag isn't its
-own (stale after a switch). App-side, one blob per device. Design for the **nvm** backend
-(FRAM undecided): 79 ms blocking write, finite endurance → write on change only, debounced
-on idle (5–10 s), never in a product's hot loop.
+own (stale after a switch). App-side, one blob per device. Design for the **nvm** backend —
+**the only one** now that the FRAM board revision is cancelled (DEV-40): 79 ms blocking
+write, finite endurance, and a single slot, so a power cut mid-write loses the whole record
+(it self-heals to empty → settings fall back to the product's defaults, roles and state are
+re-derived). Hence: write on change only, debounced on idle, never in a product's hot loop.
+The `fram` branch stays in `noknok.store()` for a future board, but no shipping brain has it.
 
 ## Related on-device data
 
