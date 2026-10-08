@@ -19,14 +19,19 @@ import time
 import board
 from noknok import Conductor
 
-# Versions + local images, taken from each module repo's firmware/index.json.
-# index.json is the source of truth for "what is current" (no git tags).
+# Versions + layouts + local images, taken from each module repo's
+# firmware/index.json (as of 8 Oct 2026). index.json is the source of truth for
+# "what is current" (no git tags) - re-copy these when an index changes.
+# `layout` (DEV-65): the flash layout the image is linked for. Conductor.update_all()
+# flashes an I2C module ONLY if its bootloader reports the same layout, and
+# refuses (never writes) otherwise - a wrong-layout image hangs the module until
+# SWD. USB modules have no layout (no stage-0 port yet).
 MANIFEST_FW = {
-    "buzzer":     {"version": "3.5.0", "url": "(local)"},
-    "knob":       {"version": "2.3.0", "url": "(local)"},
-    "led_button": {"version": "2.4.1", "url": "(local)"},
-    "display":    {"version": "0.5.0", "url": "(local)"},
-    "usb_leds":   {"version": "1.8.1", "url": "(local)"},
+    "buzzer":     {"version": "3.5.0", "layout": 2, "url": "(local)"},
+    "knob":       {"version": "2.3.0", "layout": 2, "url": "(local)"},
+    "led_button": {"version": "2.4.1", "layout": 2, "url": "(local)"},
+    "display":    {"version": "0.7.0", "layout": 2, "url": "(local)"},
+    "usb_leds":   {"version": "1.8.2", "url": "(local)"},
 }
 
 IMAGES = {
@@ -66,17 +71,23 @@ def run_bus(label, sda, scl, do_usb):
         except Exception as e:
             print("  (usb enumeration skipped: %s)" % e)
 
-    print("\n  installed vs current:")
-    report = c.firmware_report(MANIFEST_FW)
+    # read_layout=True asks each outdated I2C module for its bootloader layout, so
+    # a layout mismatch is shown here (BLOCKED) before anything is written.
+    print("\n  installed vs current (layout: installed/image):")
+    report = c.firmware_report(MANIFEST_FW, read_layout=True, strict_layout=True)
     for r in report:
-        print("    %-11s %-8s -> %-8s  %s"
-              % (r["type"], r["installed"], r["required"], r["reason"]))
+        print("    %-11s %-8s -> %-8s  L%s/L%s  %s"
+              % (r["type"], r["installed"], r["required"],
+                 r["layout_installed"], r["layout_image"], r["reason"]))
 
     todo = [r for r in report if r["needs_update"]]
-    if not todo:
+    blocked = [r for r in report if r["blocked"]]
+    if not todo and not blocked:
         print("  nothing to do on %s" % label)
     else:
-        print("\n  updating %d module(s)..." % len(todo))
+        print("\n  updating %d module(s), %d blocked..." % (len(todo), len(blocked)))
+        # update_all() enforces the layout gate itself; blocked modules are
+        # returned with updated=False and the reason, and are never written to.
         results = c.update_all(MANIFEST_FW, get_image, progress=progress)
         for r in results:
             print("    %-11s updated=%s  %s"

@@ -254,6 +254,15 @@ Earlier features:
   `Conductor.bootloader_layout()` compares them and the match is **exact**. Fails closed: a
   legacy bootloader (no `0xB1`), a stage-1 too old to say (byte 5 = 0), or an index with no
   layout is refused, never guessed at. Nothing host-side infers a layout from a version.
+  **The same gate lives in the library (DEV-65, noknok.py 1.12):** `Conductor.update_all()` flashes
+  an I2C module only if the manifest entry's `layout` equals its bootloader's, and otherwise
+  returns it with `updated=False` and a plain reason (`error`) without writing anything — so a
+  bench script or maker code that calls `update_all()` directly is protected too.
+  `firmware_report()` shows `layout_installed` / `layout_image` per module and sets `blocked`
+  (and clears `needs_update`) on a definite mismatch; `read_layout=True` reads an unknown layout
+  from the module, `strict_layout=True` also blocks what it cannot prove. `update_all(...,
+  check_layout=False)` switches the gate off — bench experiments only. Tests:
+  `tools/test_layout_gate.py` (host, tier S), `software/bench_dev65.py` (real modules, tier M).
 - **Parked-module rescue (DEV-31).** A module stuck in its bootloader at `0x7E` never answers
   the enumeration sweep, so it would otherwise be invisible — the product would simply start a
   module short. `get_conductor()` runs `rescue_parked_module()` **between** `Conductor()` and

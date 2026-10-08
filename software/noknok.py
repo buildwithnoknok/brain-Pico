@@ -63,6 +63,11 @@
 #             shows a live value (e.g. the LEDs 16x temperature) on the app's
 #             settings page. Computed on each settings.get, never stored;
 #             the app cannot set it.
+# v1.12 (Sue): DEV-65 — flash-layout gate in the library: firmware_report() shows
+#             layout_image / layout_installed / blocked per module, and
+#             update_all() refuses (fail closed) any I2C module whose bootloader
+#             layout is not EXACTLY the image's — a wrong-layout image hangs the
+#             module until SWD. update_all(check_layout=False) is bench-only.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -83,7 +88,7 @@ import json
 import os
 import struct
 
-__version__ = "1.11"
+__version__ = "1.12"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -1219,6 +1224,10 @@ class Conductor:
         proto         = getattr(m, "protocol_version", None)
         required      = spec.get("version")
         needs, reason = self._update_decision(installed, proto, required)
+        # Layout of the INSTALLED bootloader, only if already known (remembered on
+        # the module / in the saved state) - reading it costs a bootloader round
+        # trip, see _check_layout(). Legacy bootloader = 0, unknown = None.
+        lay_inst = self.layout_of(m.bootloader) if (bus == "i2c" and hasattr(m, "bootloader")) else None
         return {
             "type":         mf_key,
             "bus":          bus,            # "i2c" or "usb" — routes update_module()
@@ -1230,29 +1239,88 @@ class Conductor:
             "url":          spec.get("url"),
             "needs_update": needs,
             "reason":       reason,
+            "layout_image":     spec.get("layout"),   # flash layout the image is linked for
+            "layout_installed": lay_inst,             # flash layout the module's bootloader runs
+            "blocked":      None,           # plain reason string if the image must not be flashed
         }
 
-    def firmware_report(self, manifest_fw):
+    def _check_layout(self, r, read, strict):
+        """DEV-65: refuse an image the module's bootloader cannot run.
+
+        An app image is linked for ONE flash layout (where the app base is); the
+        CRC covers image bytes, not the link address, so a wrong-layout image
+        passes every check and then hangs the module - recoverable only by SWD.
+        The match is EXACT ("newer bootloader" is not "compatible") and the
+        bootloader states its own layout; nothing here infers it from a version.
+
+        Annotates report entry `r` in place: on a refusal sets r['blocked'] to a
+        plain reason, prefixes r['reason'] and clears r['needs_update'] (so
+        nothing downstream flashes it). Only entries with a pending I2C update
+        are checked (USB modules have no stage-0 port yet).
+          read   - an unknown installed layout may be read from the module now
+                   (enters its bootloader, re-enumerates; once per module).
+          strict - fail closed: unknown layout or an index without one is a refusal.
+        """
+        if not r["needs_update"] or r["bus"] != "i2c":
+            return
+        why = None
+        img = r["layout_image"]
+        inst = r["layout_installed"]
+        if inst is None and read and r["uid"]:
+            try:
+                inst = self.bootloader_layout(r)
+                r["layout_installed"] = inst
+            except Exception as ex:
+                why = "could not read the bootloader layout (%r)" % (ex,)
+        if why is None:
+            if inst == 0:
+                why = "legacy bootloader, needs SWD recovery - not flashing"
+            elif img is None and strict:
+                why = "the firmware index declares no layout for this image - not flashing"
+            elif inst is None and strict:
+                why = "stage-1 predates the layout byte, update the bootloader first - not flashing"
+            elif inst is not None and img is not None and inst != img:
+                why = ("bootloader runs flash layout %d, image is layout %d - needs SWD "
+                       "recovery or a bootloader update, not flashing" % (inst, img))
+        if why:
+            r["blocked"] = why
+            r["reason"] = "BLOCKED: " + why
+            r["needs_update"] = False
+
+    def firmware_report(self, manifest_fw, read_layout=False, strict_layout=False,
+                        layout_gate=True):
         """
         Compare every enumerated module's installed firmware against a manifest's
         module_firmware{} block, e.g.
-            {"knob": {"version": "2.1.0", "url": "..."}, "usb_leds": {...}}
+            {"knob": {"version": "2.1.0", "url": "...", "layout": 2}, "usb_leds": {...}}
         Returns one dict per module (both I2C and USB):
             {type, bus, uid, address, installed, protocol, required, url,
-             needs_update, reason}
+             needs_update, reason, layout_image, layout_installed, blocked}
         `bus` is "i2c" (carries `address`) or "usb" (identified by `uid`/serial).
         Single source of truth for PoC v1 (log) and PoC v2 (flash outdated ones).
+
+        Layout (DEV-65): `layout_image` is the manifest's `layout`,
+        `layout_installed` the module bootloader's own (None = not known yet).
+        A definite mismatch sets `blocked` to a plain reason and `needs_update`
+        to False. With read_layout=True an unknown installed layout is read from
+        the module first (slow: bootloader round trip per module); with
+        strict_layout=True anything not provably runnable is blocked too.
+        update_all() uses both. The defaults keep the report cheap and read-only.
+        layout_gate=False skips the layout check altogether (the fields stay).
         """
         manifest_fw = manifest_fw or {}
         report = []
         for list_attr, mf_key in self._FW_GROUPS:
             spec = manifest_fw.get(mf_key, {})
-            for m in getattr(self, list_attr):
+            for m in list(getattr(self, list_attr)):
                 report.append(self._fw_entry(m, mf_key, spec, "i2c", m.address))
         for list_attr, mf_key in self._USB_FW_GROUPS:
             spec = manifest_fw.get(mf_key, {})
-            for m in getattr(self, list_attr):
+            for m in list(getattr(self, list_attr)):
                 report.append(self._fw_entry(m, mf_key, spec, "usb", None))
+        if layout_gate:
+            for r in report:
+                self._check_layout(r, read_layout, strict_layout)
         return report
 
     def log_firmware_report(self, manifest_fw, logfn=print):
@@ -1260,7 +1328,8 @@ class Conductor:
         Returns the report list so the caller can also act on needs_update."""
         report = self.firmware_report(manifest_fw)
         for r in report:
-            flag  = "UPDATE AVAILABLE" if r["needs_update"] else "ok"
+            flag  = ("UPDATE AVAILABLE" if r["needs_update"]
+                     else "BLOCKED" if r.get("blocked") else "ok")
             where = ("0x%02X" % r["address"]) if r["address"] is not None \
                     else ("usb:%s" % (r["uid"] or "?"))
             logfn("  fw %-11s %-14s installed=%s required=%s  [%s] %s"
@@ -1474,7 +1543,7 @@ class Conductor:
                     "action": "failed", "detail": str(e)}
 
     def update_all(self, manifest_fw, get_image, progress=None, logfn=print,
-                   exclude_uids=None):
+                   exclude_uids=None, check_layout=True):
         """
         Flash every module that firmware_report() flags needs_update.
 
@@ -1488,17 +1557,32 @@ class Conductor:
         the new image (wrong flash layout): one such module must not stop the
         others of its type from updating.
 
+        Layout gate (DEV-65): an I2C module is flashed only if its bootloader's
+        flash layout EQUALS the image's `layout` (manifest_fw[type]["layout"]).
+        Fails closed - a manifest without `layout`, or a module whose layout
+        cannot be read, is not flashed. Such modules come back in the result with
+        updated=False and the plain reason in 'error'; nothing is written to them.
+        check_layout=False switches this off - bench experiments only.
+
         Re-enumerates at the end so the Conductor's module instances are fresh.
         Returns the list of attempted entries, each with added 'updated':bool and
         'error':str|None.
         """
         skip = set(exclude_uids or ())
-        todo = [r for r in self.firmware_report(manifest_fw)
-                if r["needs_update"] and r.get("uid") not in skip]
-        if not todo:
-            logfn("Firmware: all modules up to date.")
-            return []
+        report = self.firmware_report(manifest_fw, read_layout=check_layout,
+                                      strict_layout=check_layout,
+                                      layout_gate=check_layout)
+        todo = [r for r in report if r["needs_update"] and r.get("uid") not in skip]
         done = []
+        for r in report:
+            if r.get("blocked") and r.get("uid") not in skip:
+                logfn("Firmware: %s %s REFUSED - %s" % (r["type"], r.get("uid"), r["blocked"]))
+                r2 = dict(r)
+                r2["updated"], r2["error"] = False, r["blocked"]
+                done.append(r2)
+        if not todo:
+            logfn("Firmware: nothing to flash.")
+            return done
         for r in todo:
             r2 = dict(r)
             try:

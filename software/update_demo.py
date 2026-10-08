@@ -29,6 +29,10 @@ IMAGES = {
 
 # A minimal manifest module_firmware{} block. Versions are set high on purpose to
 # force an update of whatever is connected (edit to match your modules).
+# NOTE (DEV-65): update_all() now refuses an I2C module unless the entry carries
+# the image's flash `layout` ("layout": 1 or 2) and the module's bootloader
+# matches it. These entries have none, so the I2C ones are refused - that is the
+# gate working. Add the layout of the .bin you actually have before using this.
 MANIFEST_FW = {
     "usb_leds":   {"version": "1.9.0", "url": "(local)"},
     "buzzer":     {"version": "3.3.1", "url": "(local)"},
