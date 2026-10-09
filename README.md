@@ -107,8 +107,12 @@ shows up on a PC as a drive again (fail-open, below), so recovery is always poss
    An **I2C FRAM at 0x50** (byte-atomic, wear-free, two slots written alternately — genuinely
    power-safe) is still implemented in `noknok.py` and would remove that last loss, but no
    noknok board fits one: the PicoHub FRAM story (DEV-40) was **cancelled**. The backend is
-   probed only when `settings.toml` has `NOKNOK_FRAM = 1` *and* a chip answers at 0x50, so a
-   maker who wires one up gets it; `0x50–0x57` stays reserved ecosystem-wide for exactly that.
+   meant to be probed only when `settings.toml` has `NOKNOK_FRAM = 1` *and* a chip answers at
+   0x50, so a maker who wires one up gets it; `0x50–0x57` stays reserved ecosystem-wide for
+   exactly that. **Known bug (DEV-101):** today `noknok.store()` probes unless
+   `NOKNOK_FRAM = 0` (unset = probe), so any EEPROM/FRAM a maker connects at 0x50 would
+   silently become the Store. Until it is fixed, set `NOKNOK_FRAM = 0` if you put such a
+   chip on the bus for another purpose.
 3. **Stable module addresses.** Enumeration gives a known module its previous address, so
    the state record only changes when hardware changes — it used to be rewritten on most
    power-ons because modules were numbered in arrival order.
@@ -162,7 +166,7 @@ these. noknok hardware (PicoHub) follows the Ecosystem standard and ships the de
 | `NOKNOK_USB_DP` / `NOKNOK_USB_DM` | `"GP16"` / `"GP17"` (D+ = lower GPIO of a consecutive pair) | `noknok_usb` host port |
 | `NOKNOK_USB_DRIVE` | `0` = hidden (shipped) · `1` = visible (maker/bench) | `boot.py` |
 | `NOKNOK_MDNS` | `0` = off (default) · `1` = advertise `noknok-XXXX.local` | `code.py` app channel |
-| `NOKNOK_FRAM` | `1` = probe the I2C FRAM at 0x50, `0` = nvm only | `noknok.store()` |
+| `NOKNOK_FRAM` | `1` = probe the I2C FRAM at 0x50, `0` = nvm only (intended default `0`; today unset still probes, DEV-101) | `noknok.store()` |
 | `NOKNOK_WATCHDOG` | `0` = off (default) · `1` = **bench only**, 8 s hardware watchdog fed by the app-channel pump, plus the `bench.wifi_drop` op | `code.py` |
 
 ⚠ `NOKNOK_WATCHDOG` is a diagnostic for unattended bench runs, never for a shipped brain or

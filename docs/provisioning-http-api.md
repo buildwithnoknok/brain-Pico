@@ -4,9 +4,9 @@ The reference for the HTTP API the Pico brain exposes during provisioning. It is
 served by `software/code.py` and consumed by the noknok app (and by the captive-
 portal setup page). This is the app ↔ brain contract.
 
-> **Private for now.** This is the provisioning layer (Architecture Open Decision
-> #9 — provisioning/OTA Pico-side stays private for now). Keep this doc with the
-> `brain-Pico` provisioning code, not in a public repo, until that split is settled.
+> **Open.** Provisioning is open (Architecture Open Decision #9 resolved): this doc
+> lives with the provisioning code in the public `brain-Pico` repo (MIT). Only the
+> noknok app and the backend stay closed.
 
 ## Transport
 
@@ -18,8 +18,10 @@ portal setup page). This is the app ↔ brain contract.
 - **When:** the form endpoints below are called by the app **while the phone
   is on the `noknok-setup` AP**, before `/connect` hands the Pico onto home WiFi.
   Since code.py 0.17 the brain also serves **`POST /rpc`** (JSON, see below) on the
-  AP *and* on home WiFi for the product's whole lifetime — that is the channel new
-  app code uses; the form endpoints are adapters over the same handlers.
+  AP *and* on home WiFi for the product's whole lifetime; the form endpoints are
+  adapters over the same handlers. Today (app 1.5.2) the app still runs **all of setup**
+  over the form endpoints (`/roles/assign`, `/firmware/check`, `/connect`) and uses `/rpc`
+  only after setup (`hello`, `settings.*`).
 - **⚠ Client requirement — route over the hotspot.** `noknok-setup` has no internet, so
   Android (and iOS) keep mobile data as the default network while the phone is joined to
   it; a plain HTTP request to `192.168.4.1` then leaves over LTE and never arrives. A client
@@ -28,10 +30,11 @@ portal setup page). This is the app ↔ brain contract.
   INTERNET capability — app 1.5.1+, `MainActivity.kt`; iOS: `NEHotspotConfiguration` /
   per-request interface binding, not built yet), re-bind before each request (the phone
   reconnects when the brain restarts its hotspot) and unbind once `/connect` succeeded.
-- **`/connect` answers before the WiFi join.** HTTP 200 means "credentials received and
-  saved", not "joined": the brain then stops the hotspot and tries the home WiFi 3×. On
-  failure it reopens `noknok-setup`; the app does not learn why yet (DEV-47 adds a
-  `setup_result`). A wrong name shows on the serial console as `No network with that ssid`.
+- **`/connect` answers before the WiFi join.** HTTP 200 today means only "credentials
+  received" - **not saved, not joined** (DEV-100): the brain sends the page first, then
+  stops the hotspot and tries the home WiFi 3×, and saves the credentials only after a
+  successful join. On failure nothing is saved and it reopens `noknok-setup`; the app does
+  not learn why yet (DEV-47 adds a `setup_result`). A wrong name shows on the serial console as `No network with that ssid`.
 
 ## Endpoints
 
@@ -64,8 +67,9 @@ happens here (that runs headless once the Pico is on WiFi).
 > join in `check_and_flash_modules()`. See
 > [Module Firmware Index](https://github.com/buildwithnoknok/Ecosystem/blob/main/software/firmware-index.md).
 
-The `modules[]` list is still useful to the app as a "what did the brain actually
-see" confirmation. Degrades gracefully (`modules:[]`) if there is no Conductor/bus.
+Consequence: the app's "update available" banner, driven by `update_needed`, never
+shows today (DEV-99). The `modules[]` list is still useful to the app as a "what did
+the brain actually see" confirmation. Degrades gracefully (`modules:[]`) if there is no Conductor/bus.
 
 ### `POST /roles/assign`  (preferred)
 Detect which module the customer interacts with **and** save the role in one round
@@ -88,8 +92,12 @@ blocking detect.
 
 ### `POST /connect`
 Final step: hand the Pico its home-WiFi credentials (plus the chosen product's
-script + firmware manifest). The Pico saves them, then hard-resets into WiFi mode
-and continues headless (download `product.py`, OTA-update modules, run the product).
+script + firmware manifest). The Pico replies at once (see *Transport*: the reply
+comes before anything is saved, DEV-100), stops the hotspot and joins the home WiFi.
+Only if the join works does it save the credentials (Store copy + `/data/wifi.json`)
+and the `config_defaults`, then hard-reset into WiFi mode and continue headless
+(download `product.py`, OTA-update modules, run the product). If the join fails nothing
+is saved and the hotspot comes back.
 
 | Field | Value |
 |-------|-------|
@@ -157,10 +165,15 @@ the phone by this point, since it is long off the setup AP.
 ## `POST /rpc` — Device Protocol v1 (DEV-34, since code.py 0.17)
 
 One JSON message protocol, transport-agnostic (spec: Confluence 113868802 §2). The
-form endpoints above are now thin **adapters** over the same handlers; new app code
-uses `/rpc` only. Served **on the setup AP and on home WiFi for the product's whole
-lifetime**, advertised as **`noknok-XXXX.local`** (mDNS, `XXXX` = last two bytes of
-the MCU id; `hello` returns the name). Implementation: `software/noknok_rpc.py`
+form endpoints above are now thin **adapters** over the same handlers. App 1.5.2 still
+uses the form endpoints for setup and calls only `hello` and `settings.*` over `/rpc`
+(after setup); the other ops are served but not called by the app yet. Served **on the
+setup AP and on home WiFi for the product's whole lifetime**. **mDNS is off by default:**
+the name **`noknok-XXXX.local`** (`XXXX` = last two bytes of the MCU id; `hello` returns
+the name) is advertised only with `NOKNOK_MDNS = 1` in `settings.toml`; the app finds a
+brain by sending `hello` to every address of the phone's /24 (or a typed IP).
+**No authorisation:** every op is open to anyone who can reach port 80 (setup hotspot,
+home LAN); pairing / authorisation is DEV-35. Implementation: `software/noknok_rpc.py`
 (dispatcher + HTTP carrier + servicing), ops registered in `code.py`.
 
 - **Request:** `POST /rpc`, body `application/json`:
@@ -243,7 +256,8 @@ The `fram` branch stays in `noknok.store()` for a future board, but no shipping 
 
 Since DEV-18 (15 Sep 2026) the brain **never writes its filesystem while a product runs**
 — a power cut during any FAT write can destroy the filesystem on this platform. Runtime data
-lives in the **Store** (`noknok.store()`: I2C FRAM at 0x50 on the PicoHub, else `nvm`);
+lives in the **Store** (`noknok.store()`: `microcontroller.nvm` on every shipping brain; an
+optional maker-wired I2C FRAM at 0x50 is supported, see README *Store* and DEV-101);
 setup/OTA-time files live in `/data/`.
 
 | Where | Written by | Purpose |

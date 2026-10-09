@@ -234,16 +234,27 @@
 #   - NOTE: NTP needs adafruit_ntp.mpy in /lib. If absent, logging still works
 #     (uptime only) — wall-clock is simply skipped.
 #
-# Boot logic:
-#   1. If wifi.json exists -> connect to home WiFi directly
-#        - Success -> run product.py (if downloaded)
-#        - Failure -> delete wifi.json, fall through to AP mode
-#   2. AP provisioning:
+# Boot logic (summary; the full flow incl. OTA, crash recovery and factory
+# reset is drawn in the architecture repo, flows/provisioning.md):
+#   1. Credentials found (/data/wifi.json, legacy root wifi.json, else the
+#      Store copy) -> join home WiFi (3 tries)
+#        - Joined, no product.py yet -> download script_url, compile-check,
+#          write /data/product.py atomically, reload
+#        - Joined, product.py present -> module OTA pass if due, run product.py
+#        - Join failed -> credentials are NEVER deleted (since 0.13): with
+#          product.py present the product runs offline; without it the setup
+#          AP is offered, credentials kept
+#   2. No credentials -> AP provisioning:
 #        - Start hotspot "noknok-setup" (open network)
-#        - Serve setup form at 192.168.4.1 via adafruit_httpserver
+#        - Serve the setup form, the form routes (/connect, /roles/*,
+#          /firmware/check) and POST /rpc at 192.168.4.1 via adafruit_httpserver
 #        - Captive-portal probe paths serve the setup page so the OS shows "Sign in"
-#        - On form submit -> stop AP -> try home WiFi -> save creds -> download -> reboot
-#        - On WiFi failure -> restart AP so the user can retry
+#        - On /connect -> reply "Connected!" at once (before the join or any
+#          save, DEV-100) -> stop AP -> try home WiFi -> on success save creds +
+#          settings defaults and hard-reset (the download happens on the next
+#          boot, step 1)
+#        - On WiFi failure -> restart AP so the user can retry (the app is not
+#          told, DEV-47)
 #
 # IMPORTANT (development): the CYW43 radio is NOT reset by a soft reboot
 # (Ctrl+D / supervisor.reload). AP mode only works reliably after a full
@@ -413,10 +424,11 @@ def log_new_boot():
 AP_SSID     = "noknok-setup"
 AP_PASSWORD = ""   # Open network
 
-# Script to download on first provision (PoC: hardcoded to trio demo)
-# PoC test script — hosted in the PUBLIC buildwithnoknok.github.io repo so the
-# Pico can fetch it without auth. (The Ecosystem repo is private -> 404 over raw.)
-# In production this URL comes from the backend based on the purchased product.
+# FALLBACK script, used only when the saved credentials carry no script_url
+# (the app always sends the chosen product's script_url from its manifest in
+# the public poc repo). Points at the trio demo in the public
+# buildwithnoknok.github.io repo. There is no backend: the product comes from
+# the app's catalog, not from a purchase record.
 SCRIPT_URL = "https://raw.githubusercontent.com/buildwithnoknok/buildwithnoknok.github.io/main/poc/trio_demo.py"
 
 # Field-written files live in /data (DEV-18): their directory entries share a

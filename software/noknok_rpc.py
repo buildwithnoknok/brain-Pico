@@ -7,9 +7,11 @@
 #   ← {"id": 8, "ok": false, "error": "unknown op: foo"}
 #
 # The Dispatcher knows ops, not transports. A carrier turns bytes on some
-# medium into dispatch() calls: today the HttpCarrier (POST /rpc over the
-# setup AP and over home WiFi + mDNS); a BLE NUS carrier (DEV-35) will feed
-# the same dispatcher with newline-delimited JSON when the platform has BLE.
+# medium into dispatch() calls: the HttpCarrier (POST /rpc over the setup AP
+# and over home WiFi). mDNS (noknok-XXXX.local) is opt-in only
+# (settings.toml NOKNOK_MDNS = 1, code.py start_app_channel()); the app finds
+# brains by scanning its /24 with `hello`. BLE is not planned (skipped by
+# ADR-001); another carrier would feed the same dispatcher unchanged.
 #
 # Staying reachable while a product runs (spec §5): CircuitPython runs one
 # thing at a time, and after setup that is the maker's `while True:` loop.
@@ -26,7 +28,8 @@
 #
 # Security (v1): no authentication. The setup AP is open today and the home
 # LAN is trusted, same as the existing endpoints. The `token` field is
-# reserved; Dispatcher.authorize is the hook pairing (DEV-35) plugs into.
+# reserved; Dispatcher.authorize is the hook pairing / authorisation (DEV-35)
+# plugs into.
 
 import json
 import time

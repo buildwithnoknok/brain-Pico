@@ -33,8 +33,9 @@
 #               into /data, whose directory block is not the one naming
 #               code.py / noknok.py / lib;
 #             - everything that changes at runtime lives in the Store —
-#               I2C FRAM at 0x50 when present (power-safe, DEV-40), else
-#               microcontroller.nvm (self-healing): module state, roles,
+#               microcontroller.nvm on every shipping brain (self-healing;
+#               no noknok board fits FRAM, DEV-40 cancelled; an optional
+#               maker-wired I2C FRAM at 0x50 is supported): module state, roles,
 #               settings (DEV-34), event history, a credentials copy;
 #             - enumeration gives a known module its previous address, so
 #               the state stops changing from boot to boot.
@@ -349,11 +350,14 @@ DATA_DIR = "/data"
 # the event history, plus recovery copies of the WiFi credentials and roles —
 # lives here, as one small JSON record with a CRC:
 #
-#   FRAM backend (I2C FM24CL64B at 0x50 on the PicoHub, DEV-40): two 4 KB slots,
+#   FRAM backend (optional, maker-wired I2C FM24CL64B at 0x50; no noknok board
+#     fits one - the board story DEV-40 was cancelled). Intended to be probed
+#     only with settings.toml NOKNOK_FRAM = 1; today the code below probes
+#     unless NOKNOK_FRAM = 0 (DEV-101). Two 4 KB slots,
 #     written alternately with a rising sequence number; a power cut mid-write
 #     leaves one slot with a bad CRC and the other intact. FRAM writes are
 #     byte-atomic and wear-free, so this is genuinely power-safe.
-#   nvm backend (fallback, any Pico): the record at microcontroller.nvm[64:]
+#   nvm backend (the backend of every shipping brain): the record at microcontroller.nvm[64:]
 #     (nvm[0] and nvm[1:5] belong to code.py). nvm is one 4 KB flash sector
 #     rewritten in place, so a cut mid-write loses the whole record — which is
 #     ACCEPTABLE only because every key here is self-healing: state is
@@ -919,8 +923,9 @@ _settings_by_key = {}
 def settings(scope="product"):
     """The brain's Settings for a scope — one instance per scope, shared by
     every Conductor and the RPC handlers. "product" values are tagged with
-    product_tag(); "device" values (timezone, radios, pairing — DEV-35/36)
-    survive product switches."""
+    product_tag(); "device" values (meant for timezone, radios, pairing —
+    DEV-35/36) survive product switches. The "device" scope exists, is served
+    by settings.* and wiped by factory reset, but nothing writes it yet."""
     key = SETTINGS_KEY if scope == "product" else DEVICE_SETTINGS_KEY
     s = _settings_by_key.get(key)
     if s is None:
