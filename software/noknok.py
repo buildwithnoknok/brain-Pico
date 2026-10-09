@@ -1481,7 +1481,9 @@ class Conductor:
             (hardening C, last_error = 7).
         In both cases the fix is the same: push a good application. The module
         cannot say what TYPE it is, but it can say its chip UID (0xB3), and we
-        remember UID -> type from the last successful enumeration.
+        remember UID -> type from the last successful enumeration (the saved
+        state in the Store, read via _state_map(); `state_file` is a leftover
+        parameter from the JSON era and is ignored).
 
         `get_image(entry) -> bytes` is injected, as for update_all(). The entry
         passed has 'type' (manifest key), 'bus', 'uid', 'address': None and a

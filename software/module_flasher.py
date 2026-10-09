@@ -262,7 +262,8 @@ class ModuleFlasher:
 
         Same transfer as flash(), closed with VERIFY_STAGE1 instead of VERIFY;
         then BOOT hands off to stage-0, which installs the new stage-1 and reboots
-        into it. Returns (version_before, version_after) as 4-tuples.
+        into it. Returns (version_before, version_after) as get_version()
+        5-tuples [proto, major, minor, patch, layout].
 
         The module is left in the bootloader with NO valid app — the staging area
         is the app region. Re-push the application with flash(app, runtime_addr=None).

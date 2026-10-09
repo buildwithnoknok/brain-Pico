@@ -91,7 +91,9 @@
 #   - The OTA pass asks GitHub at most once per 24 h (last-check time in
 #     microcontroller.nvm, no filesystem write, survives power cycles). Other
 #     boots make no round-trips; the parked-module rescue still runs, from the
-#     on-device cache. The first connected boot after provisioning also warms
+#     on-device cache. (On a connected boot whose check IS due, the rescue is
+#     skipped if the manifest has no module_firmware, the HTTPS session fails
+#     or nothing resolves; see check_and_flash_modules.) The first connected boot after provisioning also warms
 #     that cache for every I2C type the product uses, so any module is
 #     rescuable offline from day one — not only the ones updated that day.
 #   - The layout gate refuses per MODULE, not per type: one older spare no
@@ -130,7 +132,8 @@
 #     before touching a module. The bootloader's own CRC cannot catch a short
 #     download — it is computed over whatever we send. Checked if present in
 #     the index; warned about if absent.
-#   - Fetched images are kept as an on-device cache (/fw_<type>.bin + .json
+#   - Fetched images are kept as an on-device cache (/fw_<type>.bin + .json,
+#     today /data/fw_<type>.bin since DEV-18 / ADR-003
 #     sidecar with version/layout/size/crc32) instead of deleted, so a module
 #     parked after a power cut is rescued with no internet, from the Pico
 #     itself. Same layout check; sidecar integrity re-checked on read.
@@ -1363,8 +1366,9 @@ def _stage1_pass(c, s1):
         it is refused here first rather than transferred and rejected;
       - a legacy monolithic bootloader (no 0xB1) cannot self-update — SWD only.
     Reading a module's stage-1 version costs a bootloader round-trip and a
-    re-enumeration, so it is done once per module and remembered in
-    noknok_state.json; after that a newer published stage-1 is a free compare."""
+    re-enumeration, so it is done once per module and remembered as "bl" in
+    the Conductor's saved state (the Store, not a file); after that a newer
+    published stage-1 is a free compare."""
     if not s1:
         return
     want = _semver3(s1["version"])
@@ -1757,11 +1761,15 @@ def check_and_flash_modules(module_firmware):
     nothing and an interrupted one cannot leave the bus half-updated. See the
     comments at each pass for why that order matters.
 
-    Best-effort + crash-safe: any failure is logged and swallowed. A failed I2C
-    flash leaves that module safe in its bootloader at 0x7E; a failed USB flash
-    leaves it enumerated as its bootloader PID (4E42) — neither can strand or
-    brick the module, and neither blocks the rest of the boot. A module left
-    parked at 0x7E is picked up by the rescue pass on the next boot (DEV-31)."""
+    Best-effort + crash-safe: any failure is logged and swallowed, and none
+    blocks the rest of the boot. A failed I2C flash leaves that module safe in
+    its bootloader at 0x7E; the rescue pass (DEV-31) picks it up on a later
+    boot that runs it: every offline boot and every "not due" boot, but NOT a
+    due boot that returns early below (no module_firmware, HTTPS setup failed,
+    nothing resolved). A failed USB flash leaves the module in its bootloader
+    (PID 4E42): not bricked (it can be flashed again), but discover() skips
+    bootloader-PID devices and there is no USB rescue, so it is not re-flashed
+    automatically."""
     if not module_firmware:
         return   # older app / no manifest fw block -> nothing to do
 
