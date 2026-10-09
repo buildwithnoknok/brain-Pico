@@ -132,9 +132,9 @@
 #     before touching a module. The bootloader's own CRC cannot catch a short
 #     download — it is computed over whatever we send. Checked if present in
 #     the index; warned about if absent.
-#   - Fetched images are kept as an on-device cache (/fw_<type>.bin + .json,
-#     today /data/fw_<type>.bin since DEV-18 / ADR-003
-#     sidecar with version/layout/size/crc32) instead of deleted, so a module
+#   - Fetched images are kept as an on-device cache (/fw_<type>.bin + .json
+#     sidecar with version/layout/size/crc32; moved to /data/fw_<type>.* by
+#     DEV-18 / ADR-003) instead of deleted, so a module
 #     parked after a power cut is rescued with no internet, from the Pico
 #     itself. Same layout check; sidecar integrity re-checked on read.
 #
