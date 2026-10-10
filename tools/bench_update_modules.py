@@ -43,6 +43,7 @@ IMAGES = {
 }
 
 BUSES = (
+    ("std",  board.GP8,  board.GP9),     # ecosystem standard I2C pins
     ("i2c0", board.GP20, board.GP21),
     ("i2c1", board.GP18, board.GP19),
 )

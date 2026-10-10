@@ -165,5 +165,45 @@ c.add(FakeModule("bb", 0x11, "3.3.1", L1B))
 res = c.update_all(IMG2, lambda e: b"img", logfn=lambda *a: None, exclude_uids={"bb"})
 check("exclude_uids (product path) still works, no duplicate result", c.flashed == ["aa"] and len(res) == 1)
 
+print("bootloader_version() must never leave a module parked")
+
+
+class FailingFlasher:
+    """module_flasher.ModuleFlasher whose read fails after the module was put
+    into its bootloader (what a stale module_flasher.py or an I2C glitch does)."""
+    log = []
+
+    def __init__(self, i2c):
+        pass
+
+    def enter_bootloader(self, addr):
+        FailingFlasher.log.append("enter")
+
+    def wait_for_bootloader(self):
+        FailingFlasher.log.append("wait")
+
+    def get_version(self):
+        raise AttributeError("get_version")
+
+    def boot(self):
+        FailingFlasher.log.append("boot")
+
+
+mf = types.ModuleType("module_flasher")
+mf.ModuleFlasher = FailingFlasher
+sys.modules["module_flasher"] = mf
+c = Rig({})
+c.i2c = None
+c.enumerate = lambda *a, **k: 0
+raised = False
+try:
+    # the REAL method (Rig overrides bootloader_version for the other tests)
+    noknok.Conductor.bootloader_version(c, {"bus": "i2c", "address": 0x10, "uid": "aa"})
+except AttributeError:
+    raised = True
+check("a failing read still sends BOOT (module returns to its app)",
+      FailingFlasher.log == ["enter", "wait", "boot"], str(FailingFlasher.log))
+check("  ...and the error is not swallowed", raised)
+
 print("\n%s" % ("ALL PASS" if not fails else "%d FAILED" % fails))
 sys.exit(1 if fails else 0)

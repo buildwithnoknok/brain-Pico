@@ -67,21 +67,31 @@ try:
         tested += len(mods)
 
         # 1. read-only report with the real layout read from each module
-        types = {}
+        # The fake "required" version must have the SAME MAJOR as what is installed:
+        # a major-version gap is "confirm before flashing" (no update offered), and the
+        # layout gate only looks at modules that have an update pending.
+        fake = {}
         for k, m in mods:
-            types[{"ledbutton": "led_button"}.get(k, k)] = 1
-        lie_ok = {t: {"version": "99.0.0", "url": "x", "layout": 2} for t in types}
-        rep = c.firmware_report(lie_ok, read_layout=True, strict_layout=True)
+            t = {"ledbutton": "led_button"}.get(k, k)
+            fake[t] = "%s.99.0" % (getattr(m, "firmware_version", None) or "0").split(".")[0]
+
+        def manifest(layout):
+            return {t: dict({"version": v, "url": "x"}, **({} if layout is None else {"layout": layout}))
+                    for t, v in fake.items()}
+
+        rep = c.firmware_report(manifest(2), read_layout=True, strict_layout=True)
         for r in rep:
             print("    %-11s uid=%s fw %-7s layout installed=%s image=%s  %s"
                   % (r["type"], r["uid"], r["installed"], r["layout_installed"],
                      r["layout_image"], r["blocked"] or "ok"))
-        check("every module answered with a layout", all(r["layout_installed"] is not None for r in rep))
-        layouts = {r["layout_installed"] for r in rep}
+        check("every module has an update pending (so the gate looked at it)",
+              len(rep) == len(mods) and all(r["blocked"] or r["needs_update"] for r in rep))
+        check("a module whose layout is unknown/legacy is blocked, not 'ok'",
+              all(r["blocked"] for r in rep if r["layout_installed"] in (None, 0)))
 
         # 2. wrong layout in the manifest -> every module with another layout is BLOCKED
         for wrong in (1, 2):
-            lie = {t: {"version": "99.0.0", "url": "x", "layout": wrong} for t in types}
+            lie = manifest(wrong)
             res = c.update_all(lie, get_image, logfn=lambda *a: None)
             mismatched = [r for r in rep if r["layout_installed"] != wrong]
             refused = {r["uid"] for r in res if not r["updated"] and r["error"]}
@@ -92,8 +102,7 @@ try:
         # raises there, update_all() records the failure - nothing is flashed)
 
         # 3. fail closed: no layout in the manifest
-        nolay = {t: {"version": "99.0.0", "url": "x"} for t in types}
-        res = c.update_all(nolay, get_image, logfn=lambda *a: None)
+        res = c.update_all(manifest(None), get_image, logfn=lambda *a: None)
         check("manifest without layout: all refused, none written",
               len(res) == len(mods) and not any(r["updated"] for r in res))
 

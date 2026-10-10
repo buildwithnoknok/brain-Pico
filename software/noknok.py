@@ -69,6 +69,12 @@
 #             update_all() refuses (fail closed) any I2C module whose bootloader
 #             layout is not EXACTLY the image's — a wrong-layout image hangs the
 #             module until SWD. update_all(check_layout=False) is bench-only.
+# v1.13 (Sue): DEV-65 follow-up from the first run on real modules —
+#             bootloader_version() now ALWAYS sends BOOT after entering the
+#             bootloader, even if the read fails (before, a failed read left the
+#             module parked at 0x7E, invisible to enumerate()); "layout read but
+#             unknown" (stage-1 older than 1.2.0) is remembered so it is not
+#             re-read, with a full re-enumeration, on every call.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -89,7 +95,7 @@ import json
 import os
 import struct
 
-__version__ = "1.12"
+__version__ = "1.13"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -1232,7 +1238,17 @@ class Conductor:
         # Layout of the INSTALLED bootloader, only if already known (remembered on
         # the module / in the saved state) - reading it costs a bootloader round
         # trip, see _check_layout(). Legacy bootloader = 0, unknown = None.
-        lay_inst = self.layout_of(m.bootloader) if (bus == "i2c" and hasattr(m, "bootloader")) else None
+        # "Read" matters: a stage-1 older than 1.2.0 answers WITHOUT a layout byte,
+        # so "read, layout unknown" must not look like "never read" (it would be
+        # re-read - bootloader round trip + re-enumeration - on every call).
+        uid_hex = getattr(m, "_uid_hex", None)
+        seen = getattr(self, "_bl_seen", None) or {}
+        if bus == "i2c" and hasattr(m, "bootloader"):
+            lay_read, lay_inst = True, self.layout_of(m.bootloader)
+        elif bus == "i2c" and uid_hex in seen:
+            lay_read, lay_inst = True, self.layout_of(seen[uid_hex])
+        else:
+            lay_read, lay_inst = False, None
         return {
             "type":         mf_key,
             "bus":          bus,            # "i2c" or "usb" — routes update_module()
@@ -1246,6 +1262,7 @@ class Conductor:
             "reason":       reason,
             "layout_image":     spec.get("layout"),   # flash layout the image is linked for
             "layout_installed": lay_inst,             # flash layout the module's bootloader runs
+            "layout_read":  lay_read,       # True once the bootloader was asked (even if it did not say)
             "blocked":      None,           # plain reason string if the image must not be flashed
         }
 
@@ -1271,10 +1288,11 @@ class Conductor:
         why = None
         img = r["layout_image"]
         inst = r["layout_installed"]
-        if inst is None and read and r["uid"]:
+        if inst is None and read and r["uid"] and not r["layout_read"]:
             try:
                 inst = self.bootloader_layout(r)
                 r["layout_installed"] = inst
+                r["layout_read"] = True
             except Exception as ex:
                 why = "could not read the bootloader layout (%r)" % (ex,)
         if why is None:
@@ -1394,9 +1412,19 @@ class Conductor:
         from module_flasher import ModuleFlasher
         f = ModuleFlasher(self.i2c)
         f.enter_bootloader(entry["address"])
-        f.wait_for_bootloader()
-        v = f.get_version()
-        f.boot()                        # app is still valid — jump straight back
+        try:
+            f.wait_for_bootloader()
+            v = f.get_version()
+        finally:
+            # Whatever happened while reading (timeout, I2C error, a stale
+            # module_flasher.py), the app is still valid: jump straight back. A
+            # failed read must never leave the module parked at 0x7E, where it
+            # is invisible to enumerate() and several of them would share one
+            # address (DEV-65, found on the bench with an old module_flasher).
+            try:
+                f.boot()
+            except Exception:
+                pass
         self.enumerate()
         # Remember it. Reading costs a bootloader round-trip and a re-enumeration,
         # so the answer is kept on the module object and in noknok_state.json
@@ -1404,6 +1432,11 @@ class Conductor:
         # a free comparison whenever a newer stage-1 is published.
         uid = entry.get("uid")
         m = self.by_uid(uid) if uid else None
+        if uid:
+            seen = getattr(self, "_bl_seen", None)
+            if seen is None:
+                seen = self._bl_seen = {}
+            seen[uid] = v               # survives the re-enumeration above
         if m is not None:
             m.bootloader = v
             self._save_state()
