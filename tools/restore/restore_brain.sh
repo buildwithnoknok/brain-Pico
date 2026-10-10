@@ -25,7 +25,9 @@
 #
 # Runs on the bench host (Linux, e.g. the Pi4) with exactly ONE brain Pico attached.
 # Needs python3 + pyserial (tools/pico.py). Mounting the fresh drive uses udisksctl or,
-# failing that, `sudo mount` (asks for the password; nothing is stored here).
+# failing that, `sudo mount`: passwordless sudo, or a prompt in a terminal, or the
+# password in the environment variable PICO_SUDO_PASS for an unattended run.
+# Nothing is stored anywhere.
 #
 # Why a mount: after the reformat the drive is visible (there is no boot.py yet) and the
 # Pi auto-mounts it. While the host holds the filesystem, the Pico cannot write to it
@@ -75,6 +77,17 @@ $PICO run "$HERE/erase_fs.py" >/dev/null 2>&1
 for i in $(seq 1 30); do [ -e /dev/disk/by-label/CIRCUITPY ] && break; sleep 1; done
 
 echo "--- 3/4 copy files"
+# Root is needed only to mount/unmount the fresh drive. Order: passwordless sudo, then
+# an interactive prompt (when run in a terminal), then the password in the environment
+# variable PICO_SUDO_PASS (for unattended runs: PICO_SUDO_PASS=... restore_brain.sh).
+# The password is never written to a file.
+as_root() {
+  if sudo -n true 2>/dev/null; then sudo "$@"
+  elif [ -t 0 ]; then sudo "$@"
+  elif [ -n "${PICO_SUDO_PASS:-}" ]; then printf '%s\n' "$PICO_SUDO_PASS" | sudo -S -p '' "$@"
+  else echo "root is needed to mount the drive: run in a terminal or set PICO_SUDO_PASS" >&2; return 1
+  fi
+}
 DEV=$(readlink -f /dev/disk/by-label/CIRCUITPY 2>/dev/null || true)
 [ -n "$DEV" ] || { echo "the fresh CIRCUITPY drive did not show up on the host - cannot copy. Unplug/replug the Pico and rerun with --no-backup."; exit 1; }
 MP=$(findmnt -rn -S "$DEV" -o TARGET | head -1); OWN=0
@@ -82,7 +95,7 @@ if [ -z "$MP" ]; then
   if command -v udisksctl >/dev/null 2>&1 && udisksctl mount -b "$DEV" >/dev/null 2>&1; then
     MP=$(findmnt -rn -S "$DEV" -o TARGET | head -1)
   else
-    MP=/mnt/circuitpy; sudo mkdir -p "$MP" && sudo mount -o "uid=$(id -u),gid=$(id -g)" "$DEV" "$MP" || { echo "could not mount $DEV"; exit 1; }
+    MP=/mnt/circuitpy; as_root mkdir -p "$MP" && as_root mount -o "uid=$(id -u),gid=$(id -g)" "$DEV" "$MP" || { echo "could not mount $DEV"; exit 1; }
     OWN=1
   fi
 fi
@@ -99,7 +112,7 @@ fi
 cp "$SW/boot.py" "$MP/boot.py" || exit 1                       # boot.py LAST
 sync; sleep 2
 echo "  on the drive: $(ls "$MP" | tr '\n' ' ')"
-if [ $OWN -eq 1 ]; then sudo umount "$MP"; else udisksctl unmount -b "$DEV" >/dev/null 2>&1 || sudo umount "$DEV"; fi
+if [ $OWN -eq 1 ]; then as_root umount "$MP"; else udisksctl unmount -b "$DEV" >/dev/null 2>&1 || as_root umount "$DEV"; fi
 sleep 1
 
 echo "--- 4/4 hard reset + verify"
