@@ -23,3 +23,11 @@ Convention: Confluence "Development Conventions" (SD space, page 120160257).
 ## Baseline - 2026-10-02
 
 - Changelog starts here. Current: noknok.py 1.11 (__version__), code.py 0.18 (CODE_VERSION). Track the two versions separately in each entry. Earlier history: git log and the README.
+
+## noknok.py 1.11 - 2026-10-02 (backfilled for DEV-46)
+
+- DEV-46 - read-only `info` settings: `c.settings.info(id, fn)` shows a live value (e.g. the LEDs 16x temperature) on the app's settings page. `settings.get` returns `info{id: value}`, computed on every call and never stored (no `seq` bump, no dirty flag, no flash write); `settings.set` rejects an info id as `read-only`; a provider that raises gives `null` (logged once). `docs/provisioning-http-api.md` updated. Tests: `software/bench_info_settings.py` (real 16x, PASS), `software/bench_lamp16.py` (unmodified product on the Pico, PASS). Breaking: no.
+
+## noknok.py 1.10 / noknok_usb.py 1.1 - 2026-09-29 (backfilled for DEV-46)
+
+- DEV-46 - USB modules are identified by the `0xF0` type byte, not the PID (all noknok USB apps share PID `0x4E4E`): `0x04` = LEDs (8x, `NoknokLEDs`), `0x06` = LEDs 16x (`NoknokLEDs16`); an unknown type is logged once and skipped, no answer is retried next pass. New `NoknokLEDs16`: 16 LEDs, RGBW (every colour call takes `w=`, plus `white(level)`), `status()` from GET_STATUS 0x30 (`temp_c`, `vbus_mv`, `cc1_mv`/`cc2_mv`, `budget_ma`, `led_ma`, thermal/VBUS flags, `limited`), `temperature()`. Conductor: `c.leds16`, manifest type `usb_leds_16x`, included in `firmware_report()` and role assignment. `c.leds` (8x) unchanged. Tests: `tools/usb_sim.py` 39/39, `tools/usb_hw_leds16.py` (real 16x on a fast host, PASS), `software/bench_dev46.py` (8x + 16x + Display behind the Pico, PASS). Breaking: no.
