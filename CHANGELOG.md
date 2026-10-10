@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## Tools: restore - 2026-10-10 (no component version bumped)
+
+- DEV-84 - `tools/restore/`: `restore_brain.sh` (backup, reformat, restore from this checkout, hard reset, verify; `--data` puts a backup's setup data back), `backup_brain.sh`, and the Pico-side `erase_fs.py`, `hard_reset.py`, `verify_brain.py`. Replaces the one-off scripts that lived only on the bench Pi4 (and had gone stale: no `noknok_rpc.py`); no password in any file (`PICO_SUDO_PASS` env var or a terminal prompt), no WiFi credentials in git. Bench-proven on a deliberately wiped Pico (70 s, `RESTORE OK`). Also `.gitattributes`: `*.sh` always LF. Breaking: no.
+
 ## noknok.py 1.13 - 2026-10-10
 
 - DEV-65 - follow-up found by the first run on 8 real modules. `bootloader_version()` always sends BOOT after entering the bootloader, even when the read fails (a failed read used to leave the module parked at 0x7E, invisible to `enumerate()`); a "layout read, stage-1 too old to say" answer is remembered per UID instead of being re-read (a bootloader round trip plus re-enumeration) on every `firmware_report()` / `update_all()`. New `software/bench_unpark.py` releases modules parked in their bootloader. `tools/bench_update_modules.py` also walks the standard GP8/GP9 bus. Breaking: no.
