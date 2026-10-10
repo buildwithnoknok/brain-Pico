@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## Tools: bench - 2026-10-10 (no component version bumped)
+
+- `tools/bench/`: test helpers from the Sprint 1 QA run - boot capture from replug, listen-only console reader, hands-free power-pull loop for `bench_yank.py` (incl. runtime-only mode), `/rpc` failure-mode script, offline `wifi.json` helper, read-only bench inventory, Display rotation check, deliberately crashing product. Bench only, nothing ships to a brain. Breaking: no.
+
 ## Docs: stale public statements - 2026-10-10 (no component version bumped)
 
 - DEV-87 - README, `tools/soak/README.md`, `soak_run.py` header, `code.py` and `noknok.py` comments/docstrings no longer say what is not true: per-port `uhubctl` does not cut VBUS (ganged does, verify per host); `noknok_events.txt` / `noknok_state.json` are gone (the Store holds the event history and module state); no FRAM on any noknok board; Display firmware 0.7.0 is current and `bench_dev41.py` has 8 steps; the display examples now fit the 80 px panel (size 16, 5 characters; size 32 = 2). Removed the dead `software/flip_v_once.py` (rev 1.0 rework-board probe). Comments and docs only; no code behaviour changed. Breaking: no.
