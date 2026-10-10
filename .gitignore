@@ -1,0 +1,21 @@
+# brain-Pico - files that must never be committed (DEV-61)
+
+# Python caches (host tools, simulators)
+__pycache__/
+*.pyc
+
+# Editor and OS leftovers
+*.bak
+*.orig
+*~
+*.swp
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local bench run output
+tools/soak/runs/
+soak_pico.log
+soak_client.log
+*.log
