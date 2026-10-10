@@ -29,7 +29,7 @@ over I2C.
 | `keyboard_test.py` | LED button module standalone test. |
 | `ledbutton_color_test.py` | Test one or many LED Buttons at once: a button press cycles that button's colour; number keys 1-9 set all to a colour (0 = off). Quick "is this module alive?" check + brightness comparison. |
 | `display_test.py` | Interactive Display bench tool: type text to draw it; `p` = print(), `icon`, `image`, `region`/`set`, `demo`/`demo2`. See *noknok Display* under *Current versions*. |
-| `bench_dev41.py` | Display hardware check (DEV-41): native sizes, print, icons, image, regions — 7 steps, prints timings + module error byte. Pins GP20/21 (Pi4RFID bench). |
+| `bench_dev41.py` | Display hardware check (DEV-41): native sizes, print, icons, image, regions — 8 steps, prints timings + module error byte. Pins GP20/21 (Pi4RFID bench). |
 | `../tools/display_sim.py` | Desktop simulator for the Display driver — a virtual module that decodes the I²C stream like the firmware and dumps the panel as ASCII art (71 checks). Needs `module-I2C-1.42-display` cloned next to this repo for the font. |
 | `bench_dev46.py` | LEDs 8× + 16× on one hub behind the Pico (DEV-46): driver dispatch, white channel, `status()`, 300-frame burst, firmware report + roles. |
 | `bench_info_settings.py` | Read-only `info` settings on the Pico (live temperature, read-only rejects, no Store writes). |
@@ -195,8 +195,8 @@ setup-time writes into `/data`, `settings.toml` for pins and drive visibility; s
   in one `stage1_update()` transaction from the cache. Same flash layout only (the module
   refuses a cross-layout stage-1 itself, error 8, so the brain refuses first); a legacy
   monolithic bootloader is logged once and left for SWD. Each module's stage-1 version is
-  read **once** (a bootloader round-trip) and remembered in `noknok_state.json` (`"bl"`), so
-  later checks and the layout gate are a free comparison.
+  read **once** (a bootloader round-trip) and remembered with the module state in the Store
+  (`"bl"`), so later checks and the layout gate are a free comparison.
 - **Cache-first, once a day.** On a connected boot the OTA pass first refreshes an on-device
   image cache (one download per type per published version) — **before any Conductor exists**,
   the one condition under which downloads on this board are reliable — then creates the
@@ -212,10 +212,12 @@ setup-time writes into `/data`, `settings.toml` for pins and drive visibility; s
   lives in `microcontroller.nvm` and clears on a real power-on. After three, a clean boot parks
   in a safe idle that still answers the knob-hold factory reset and, if online, fetches a fresh
   `product.py` once — acting on it only if it differs. (It used to end at "Code done running".)
-- **Flash writes only when they earn it.** `log.txt` is written only with the bench marker
-  `/debug_log` present, or once on a crash (a "RING FLUSH" of the last ~80 lines); otherwise
-  logging is serial + RAM. `noknok_state.json` is rewritten only on a real change. The events
-  file is unchanged. See DEV-18 for why this matters on an unjournaled FAT filesystem.
+- **No flash writes while a product runs.** `log.txt` is written only on a bench brain with the
+  marker `/debug_log` present (and then also gets a "RING FLUSH" of the last ~80 lines on a
+  crash); otherwise logging is serial + a RAM ring. Module state and the event history
+  (`[FW]/[CRASH]/…`) live in the Store, not in files — `noknok_state.json` and
+  `noknok_events.txt` are gone (an old `noknok_state.json` is imported once, read-only). See
+  *Filesystem policy* and DEV-18 for why this matters on an unjournaled FAT filesystem.
 - **Image integrity + offline rescue cache.** Downloads are checked against `index.json`
   `size`/`crc32` before touching a module, and every fetched image is kept on the Pico with a
   sidecar so a module parked after a power cut is rescued with no internet.
@@ -278,9 +280,9 @@ Earlier features:
 - `POST /firmware/check` (AP time) reports installed versions only and returns
   `resolved:false` — on the setup AP the Pico has no internet and cannot reach the registry.
 - Crash-safe throughout — a failed flash leaves the module safe in its bootloader (`0x7E`).
-  Outcomes go to the serial console and `noknok_events.txt` (durable `[FW]`/`[RESCUE]`/`[CRASH]`
-  audit trail). The post-flash re-enumerate deliberately does **not** wipe `noknok_state.json`,
-  so modules that weren't flashed keep their addresses.
+  Outcomes go to the serial console and the Store's event history (`[FW]`/`[RESCUE]`/`[CRASH]`
+  audit trail, last 40 lines). The post-flash re-enumerate deliberately does **not** wipe the
+  saved module state, so modules that weren't flashed keep their addresses.
 
 **`noknok.py` v1.11** — Conductor library.
 
@@ -305,7 +307,7 @@ codes to know: **7** = app unhealthy, module parked, rescue it; **8** = wrong fi
 
 Core:
 - Dynamic I2C addressing: modules boot at staging address `0x7F` and are assigned runtime
-  addresses; `noknok_state.json` caches the UID→address map so reboots re-find modules without
+  addresses; the Store caches the UID→address map so reboots re-find modules without
   re-enumerating (and self-heals if hardware changed).
 - **Factory reset by boot-hold (code.py 0.18)** — the one reset gesture every product shares:
   hold any LED Button or Knob button **while plugging in the power** and keep holding. After
@@ -318,7 +320,7 @@ Core:
   op). Product scripts no longer need to reserve a gesture for this.
 - **`Conductor.check_factory_reset(knob_status)`** — the optional *runtime* gesture: call once
   per product loop, passing the `KnobStatus` you already read. Hold the Knob button ~5 s for
-  the same wipe as above. `noknok_state.json` is deliberately **kept** (a soft reset doesn't power-cycle the
+  the same wipe as above. The saved module state is deliberately **kept** (a soft reset doesn't power-cycle the
   modules, so they keep their addresses).
 - **`Conductor.detect_interaction(module_type, timeout, exclude)`** — return the UID of the
   module the customer interacts with (knob turn/press, LED-button press). Guides them with
@@ -328,7 +330,7 @@ Core:
 
 **noknok Display — `c.display[0]` (v1.9, DEV-41).** The module is a small GPU with no frame
 buffer and a 12 KB flash; everything beyond its own 8×8 font is rendered on the Pico and streamed
-as a 1-bit-per-pixel blit, so nothing below needs firmware support (v0.2.0+; v0.5.0 current).
+as a 1-bit-per-pixel blit, so nothing below needs firmware support (v0.2.0+; v0.7.0 current).
 - **`d.print(...)`** — the display as a terminal, same arguments as Python's `print()` (`sep`,
   `end=""` to continue a line) plus `size`/`color`. Wraps, scrolls in place when full (no
   blank-out), `d.clear()` restarts at the top. Defaults `d.print_size`/`print_color`/`print_x`.
@@ -367,7 +369,7 @@ as a 1-bit-per-pixel blit, so nothing below needs firmware support (v0.2.0+; v0.
   driver's drawing rules, diffed against `tools/display_sim.py` on every change
   ([source](https://github.com/buildwithnoknok/Ecosystem/tree/main/software/display-planner)).
 - Bench: `display_test.py` (`p <text>`, `icon`, `icons`, `image`, `region`, `set`, `demo2`);
-  `bench_dev41.py` = the 7-step hardware check (all passed 19 Sep 2026 on Pi4RFID, fw 0.5.0:
+  `bench_dev41.py` = the 8-step hardware check (passed on Pi4RFID in Sep 2026, fw 0.5.0:
   15 ms per region update, ≈75 ms per scrolling print() line, 16 ms per 16×16 icon).
   Desktop: `tools/display_sim.py` runs the driver against a virtual module that decodes the
   I²C stream exactly like the firmware (its `font8x8.h` included) and prints the panel as
@@ -411,7 +413,8 @@ compiled — `noknok.py` 184 KB → `noknok.mpy` 45 KB — so it loads with a fr
 4. Watch the live serial console, or — to have `log.txt` written on the Pico — first create an
    empty file named `debug_log` in its root (that marker is the only thing that turns on flash
    logging; the field default is off). Read it over the REPL — the drive is hidden on a
-   shipped-configured brain. `noknok_events.txt` is always written.
+   shipped-configured brain. The event history (`[FW]/[CRASH]/…`) is kept in the Store (not a
+   file), whatever the marker says.
 
 ## Bench-flashing modules (bring-up)
 

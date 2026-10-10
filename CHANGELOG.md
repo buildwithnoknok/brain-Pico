@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## Docs: stale public statements - 2026-10-10 (no component version bumped)
+
+- DEV-87 - README, `tools/soak/README.md`, `soak_run.py` header, `code.py` and `noknok.py` comments/docstrings no longer say what is not true: per-port `uhubctl` does not cut VBUS (ganged does, verify per host); `noknok_events.txt` / `noknok_state.json` are gone (the Store holds the event history and module state); no FRAM on any noknok board; Display firmware 0.7.0 is current and `bench_dev41.py` has 8 steps; the display examples now fit the 80 px panel (size 16, 5 characters; size 32 = 2). Removed the dead `software/flip_v_once.py` (rev 1.0 rework-board probe). Comments and docs only; no code behaviour changed. Breaking: no.
+
 ## Tools: restore - 2026-10-10 (no component version bumped)
 
 - DEV-84 - `tools/restore/`: `restore_brain.sh` (backup, reformat, restore from this checkout, hard reset, verify; `--data` puts a backup's setup data back), `backup_brain.sh`, and the Pico-side `erase_fs.py`, `hard_reset.py`, `verify_brain.py`. Replaces the one-off scripts that lived only on the bench Pi4 (and had gone stale: no `noknok_rpc.py`); no password in any file (`PICO_SUDO_PASS` env var or a terminal prompt), no WiFi credentials in git. Bench-proven on a deliberately wiped Pico (70 s, `RESTORE OK`). Also `.gitattributes`: `*.sh` always LF. Breaking: no.

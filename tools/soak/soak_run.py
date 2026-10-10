@@ -10,9 +10,10 @@
 #                   -> run soak_probe.py on it -> compare what came back against
 #                   the golden baseline -> append one JSON line to the log.
 #
-# Power is cut with uhubctl on the Pi's own USB hub port. The Pico's VBUS
-# pass-through feeds the PicoHub, so cutting that port cold-boots the Pico,
-# the PicoHub and every module - a real power failure, not a soft reset.
+# Power is switched with uhubctl on the Pi's own USB hub, GANGED (all ports; a per-port
+# switch does not cut VBUS on a Pi 4B - see power() below). If the cut is real, the Pico's
+# VBUS pass-through also cold-boots the PicoHub and every module. Verify that on each new
+# host: time.monotonic() must restart near 0 across the cut.
 #
 # Design rules:
 #   * It must NEVER exit on an error. Every failure is logged and the loop

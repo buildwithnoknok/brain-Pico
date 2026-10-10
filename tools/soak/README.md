@@ -58,10 +58,16 @@ cleanly.
 
 ## Design notes
 
-- **Power** is cut with `uhubctl` on the Pi's own USB hub port (auto-detected by
-  looking for the Pico in `uhubctl` output). The Pico's VBUS pass-through feeds
-  the PicoHub, so cutting that one port cold-boots the Pico, the PicoHub and
-  every module — a real power failure, not a soft reset.
+- **Power** is switched with `uhubctl` on the Pi's own USB hub (found by looking for the
+  Pico in `uhubctl` output), **ganged**: `uhubctl -l <hub> -a off|on`, all ports at once.
+  **Per-port switching (`-p <port>`) does not cut power on a Raspberry Pi 4B.** It reports
+  "off", but VBUS stays up and the Pico only loses its data link, which looks like a power
+  cycle and is not (measured 28 Sep 2026: `time.monotonic()` kept counting). The ganged switch
+  did restart the Pico's uptime clock on that rig (925.4 s → 9.1 s), a real cut there.
+  **Verify on every new host before trusting a result**: `time.monotonic()` must restart
+  near 0 across the "cut" (`reset_reason` is stale and proves nothing). Runs made with the
+  per-port switch tested I2C traffic only. A purpose-built cut (relay or MOSFET in VBUS,
+  smart plug) is DEV-67; ask for a hand-pulled cable for any test where the cut itself matters.
 - **The probe never writes the Pico's filesystem** (DEV-18: no runtime FS writes).
 - **The probe never makes noise.** The buzzer is only ever read
   (`is_playing`/`stop`), LEDs are driven dim and briefly, and the display

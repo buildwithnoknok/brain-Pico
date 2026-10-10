@@ -1427,7 +1427,7 @@ class Conductor:
                 pass
         self.enumerate()
         # Remember it. Reading costs a bootloader round-trip and a re-enumeration,
-        # so the answer is kept on the module object and in noknok_state.json
+        # so the answer is kept on the module object and in the saved state (Store)
         # ("bl": [...] or null for legacy) — one read per module lifetime, then
         # a free comparison whenever a newer stage-1 is published.
         uid = entry.get("uid")
@@ -3617,7 +3617,7 @@ class NoknokDisplay:
     Everyday use:
         d.clear(BLACK)                        # wipe the screen
         d.text("Hello", size=16)              # text, any pixel size you like
-        d.text("22.5 C", size=32, x=4, y=40, color=YELLOW)
+        d.text("22.5", size=16, x=8, y=40, color=YELLOW)   # 4 chars x 16 px = 64 px of 80
         d.icon("wifi", x=60, y=2)             # built-in icon (see icon_names())
         d.image("/pics/logo.bmp", x=8, y=40)  # a 1-bit .bmp from your paint app
         d.fill_rect(0, 0, 80, 10, RED)        # a bar
@@ -3627,7 +3627,7 @@ class NoknokDisplay:
 
     Named regions — define a box once, update it by name (only that box is
     redrawn, so a live value never flickers):
-        d.region("temp", 0, 40, 80, 32, size=32, color=YELLOW, align="right")
+        d.region("temp", 0, 40, 80, 16, size=16, color=YELLOW, align="right")
         d.region("net", 60, 0, 20, 16)
         d.set("temp", text="22.5")            # later, as often as you like
         d.set("net", icon="wifi")
@@ -4055,7 +4055,7 @@ class NoknokDisplay:
         Draw text. `size` is the exact PIXEL HEIGHT — any size works.
 
             d.text("Hello World")                        # 16 px, white, from 0,0
-            d.text("22.5", size=32, x=4, y=40, color=YELLOW)
+            d.text("22.5", size=16, x=8, y=40, color=YELLOW)
             d.text("tiny", size=11)                      # non-native -> blitted
             d.text("mine", size=28, font="/fonts/a.bdf") # your own font
             d.text("ghost", bg=None)                     # transparent background
@@ -4331,7 +4331,7 @@ class NoknokDisplay:
         the new content into it, so a live value updates without flicker and
         without you tracking coordinates.
 
-            d.region("clock", 0, 0, 80, 32, size=32, align="center")
+            d.region("clock", 0, 0, 80, 16, size=16, align="center")
             d.region("net", 62, 140, 18, 18)
             d.set("clock", text="12:34")
             d.set("net", icon="wifi")
@@ -4339,6 +4339,10 @@ class NoknokDisplay:
         size / color / align are the defaults d.set() uses for this box; bg is
         the colour the box is wiped to ("auto" = the last clear() colour).
         align is "left", "center" or "right".
+
+        The panel is 80 px wide: with the module's own font a character is
+        `size` px wide, so 5 characters fit at size 16 (like "12:34" above) and
+        only 2 at size 32.
         """
         x, y, w, h = self._clip(x, y, w, h)
         if w <= 0 or h <= 0:

@@ -47,11 +47,12 @@
 #   losses, one total). Unplugging is how a product is switched off, and loose
 #   cables do the same. So the brain no longer writes the filesystem while a
 #   product runs — at all:
-#   - Runtime data lives in the Store (noknok.store(): I2C FRAM at 0x50 when
-#     the PicoHub has one — power-safe — else microcontroller.nvm, self-
-#     healing): module state, roles, event history, a credentials copy, and
-#     product settings once DEV-34 lands. noknok_events.txt is gone; event()
-#     appends to the Store ring, events() reads it.
+#   - Runtime data lives in the Store (noknok.store(): microcontroller.nvm,
+#     self-healing; an I2C FRAM at 0x50 is an optional backend that no
+#     noknok board fits - DEV-40 was cancelled): module state, roles, event
+#     history, a credentials copy, and product settings (DEV-34).
+#     noknok_events.txt is gone; event() appends to the Store ring,
+#     events() reads it.
 #   - Filesystem writes happen only at setup and OTA — wifi.json, product.py,
 #     the firmware cache — into /data, whose directory block is not the one
 #     naming code.py / noknok.py / lib. Legacy root files are still read.
@@ -324,8 +325,9 @@ def _timestamp():
 # append to flash on EVERY line — including "waiting for setup" every 5 s — which
 # made it the single largest write load on the device. Now: every line goes to
 # the serial console and a RAM ring; it reaches log.txt only if the bench has
-# created the marker file below, or once, on a crash, so the last lines before
-# a failure survive a power cycle. The events file (rare, audit) still writes.
+# created the marker file below (and then also gets a ring flush on a crash, so
+# the last lines before a failure survive a power cycle). The event history
+# (rare, audit) lives in the Store, not in a file.
 DEBUG_LOG_MARKER = "/debug_log"        # bench: `pico.py put` an empty file of this name
 LOG_RING_LINES   = 80
 _log_ring        = []
