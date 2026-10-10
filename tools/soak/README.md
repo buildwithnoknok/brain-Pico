@@ -63,7 +63,8 @@ cleanly.
   **Per-port switching (`-p <port>`) does not cut power on a Raspberry Pi 4B.** It reports
   "off", but VBUS stays up and the Pico only loses its data link, which looks like a power
   cycle and is not (measured 28 Sep 2026: `time.monotonic()` kept counting). The ganged switch
-  did restart the Pico's uptime clock on that rig (925.4 s → 9.1 s), a real cut there.
+  did restart the Pico's uptime clock on that rig (925.4 s → 9.1 s): a real cut, confirmed
+  on the bench (it can only cut all four ports together, never one by one).
   **Verify on every new host before trusting a result**: `time.monotonic()` must restart
   near 0 across the "cut" (`reset_reason` is stale and proves nothing). Runs made with the
   per-port switch tested I2C traffic only. A purpose-built cut (relay or MOSFET in VBUS,
