@@ -8,6 +8,10 @@ Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
 - `tools/bench/`: test helpers from the Sprint 1 QA run - boot capture from replug, listen-only console reader, hands-free power-pull loop for `bench_yank.py` (incl. runtime-only mode), `/rpc` failure-mode script, offline `wifi.json` helper, read-only bench inventory, Display rotation check, deliberately crashing product. Bench only, nothing ships to a brain. Breaking: no.
 
+## Tools: restore fix - 2026-10-17 (no component version bumped)
+
+- DEV-84 / DEV-111 - `restore_brain.sh` no longer leaves a non-working brain (found by Bob on a real restore: `RESTORE OK` but no I2C modules and `MemoryError`). With `--data` it restores the backup's `settings.toml` (the maker's pins) instead of the repo default (`--settings FILE` overrides); the libraries are installed as `.mpy` (`--mpy DIR`, `mpy-cross` on the host, or the backup's own), never as `.py` sources, and the script stops BEFORE the erase when no `.mpy` exists (`--allow-source` to override); the crash-strike counter in nvm is cleared (`clear_strikes.py`); `verify_brain.py` now also compiles the installed product, enumerates the I2C modules on the configured pins against the modules the brain remembers, and checks the strike counter. New `--dry-run`. Breaking: no (a restore without a source of `.mpy` now refuses instead of installing sources).
+
 ## Docs: stale public statements - 2026-10-10 (no component version bumped)
 
 - DEV-87 - README, `tools/soak/README.md`, `soak_run.py` header, `code.py` and `noknok.py` comments/docstrings no longer say what is not true: per-port `uhubctl` does not cut VBUS (ganged does, verify per host); `noknok_events.txt` / `noknok_state.json` are gone (the Store holds the event history and module state); no FRAM on any noknok board; Display firmware 0.7.0 is current and `bench_dev41.py` has 8 steps; the display examples now fit the 80 px panel (size 16, 5 characters; size 32 = 2). Removed the dead `software/flip_v_once.py` (rev 1.0 rework-board probe). Comments and docs only; no code behaviour changed. Breaking: no.

@@ -18,13 +18,28 @@ On a Linux host (the bench Pi4, or any PC with Python 3 + pyserial) with **one**
 
 ```bash
 git clone https://github.com/buildwithnoknok/brain-Pico && cd brain-Pico
-tools/restore/restore_brain.sh                     # backs up, asks "ERASE", reformats, restores, verifies
-tools/restore/restore_brain.sh --data ~/pico-backup-20261010-093000   # also put back wifi/product
+# 1. libraries must be .mpy: build them on the PC (tools/build_mpy.ps1 -> pico-deploy\mpy), copy the folder to the host
+tools/restore/restore_brain.sh --mpy ~/mpy                                   # factory-fresh brain
+tools/restore/restore_brain.sh --mpy ~/mpy --data ~/pico-backup-20261010-093000   # a brain that was set up
+tools/restore/restore_brain.sh --dry-run ...    # print the plan, change nothing
 ```
 
-It ends with `RESTORE OK` (and exit code 0) or `RESTORE FAILED`. Without `--data` the brain comes back
-factory-fresh and opens the `noknok-setup` WiFi; the app then provisions it again — that is the designed
-recovery and needs nothing but the repo.
+It ends with `RESTORE OK` (and exit code 0) or `RESTORE FAILED`.
+
+**What ends up on the brain** (printed before anything is erased; the script stops if it cannot do it properly):
+
+* **`settings.toml`**: with `--data`, the *backup's* (the maker's own pins, e.g. I2C on GP20/GP21); `--settings FILE`
+  overrides; with neither, the repo default (I2C on GP8/GP9, the PicoHub standard). A restore never silently
+  replaces a maker's pins with the default.
+* **Libraries as `.mpy`, never `.py`**: `noknok.py` is ~190 KB of source and does not fit in the Pico's RAM next to a
+  product (`MemoryError`, brain parks itself in safe idle). Sources of the `.mpy`, in order: `--mpy DIR`; `mpy-cross` on the
+  host (`$MPY_CROSS` or on the `PATH`; its version must match the Pico's CircuitPython); the four `.mpy` inside the
+  `--data` backup. If none exists the script stops *before the erase*. `--allow-source` installs `.py` anyway (small
+  products only). `.mpy` and `.py` of the same library are never both installed (the `.py` would win).
+* **Without `--data`** the brain comes back factory-fresh and opens the `noknok-setup` WiFi; the app then provisions it
+  again — that is the designed recovery.
+* **Crash strikes are cleared** (they live in nvm and survive a reformat; otherwise a brain that had parked itself after
+  3 crashes stays parked).
 
 ## The pieces
 
@@ -34,7 +49,8 @@ recovery and needs nothing but the repo.
 | `backup_brain.sh [DEST]` | host | Read-only copy of everything on the Pico to `DEST` (default `~/pico-backup-<date>`). Safe on a damaged filesystem. **Keep `DEST` out of git** — it can hold `wifi.json` (the customer's WiFi password). |
 | `erase_fs.py` | Pico | `storage.erase_filesystem()`. Destroys all files; the board resets itself. |
 | `hard_reset.py` | Pico | A real reset, so `boot.py` runs again (a soft reload does not). |
-| `verify_brain.py` | Pico | Lists `/lib` with size and CRC, imports the modules `code.py` needs, prints `VERIFY OK` / `VERIFY FAILED`. |
+| `clear_strikes.py` | Pico | Sets the three-strikes crash counter (nvm byte 0) back to 0. |
+| `verify_brain.py` | Pico | "Does this brain work?": lists `/lib` (size, CRC), imports the modules `code.py` needs, compiles the installed product (catches `MemoryError`), enumerates the I2C modules on the *configured* pins and compares them with the modules the brain remembers (none answering = wrong pins or dead bus = FAILED), checks the strike counter is 0. Prints `VERIFY OK` / `VERIFY FAILED`. |
 
 The Pico-side scripts run through `tools/pico.py run <file>`.
 
