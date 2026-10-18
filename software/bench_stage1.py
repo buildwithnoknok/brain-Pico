@@ -30,6 +30,7 @@ import time
 import board
 import busio
 from module_flasher import ModuleFlasher, PAGE, crc32
+import noknok
 
 
 STAGE1_IMAGE = "noknok_stage1_v101.bin"
@@ -53,8 +54,11 @@ def fmt(v):
 
 
 def main():
-    # Same pins + speed as the Conductor (noknok.py): SCL=GP9, SDA=GP8, 100 kHz.
-    i2c = busio.I2C(board.GP9, board.GP8, frequency=100_000)
+    # Same pins + speed as the Conductor: bus A from settings.toml (DEV-74), 100 kHz.
+    a = noknok.pins("i2c_a")
+    if a is None:
+        raise SystemExit(noknok.NO_PINS_MSG)
+    i2c = busio.I2C(a[1], a[0], frequency=100_000)
     f = ModuleFlasher(i2c)          # get_version / verify_stage1 / wait_for_bootloader_gone live here now
 
     # ── 1-2. is stage-1 up, and is it the version we flashed? ─────────────────

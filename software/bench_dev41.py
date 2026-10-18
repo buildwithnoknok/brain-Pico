@@ -16,10 +16,10 @@ import board
 from noknok import (Conductor, Bitmap, icon_names, __version__,
                     BLACK, WHITE, YELLOW, RED, GREEN, CYAN, NOKNOK)
 
-SDA, SCL = board.GP20, board.GP21      # Pi4RFID bench: PicoHub far port
-
+# Pins come from settings.toml (DEV-74: no pins in code); the display may sit on
+# bus A or bus B.
 print("noknok.py", __version__)
-c = Conductor(sda=SDA, scl=SCL)
+c = Conductor()
 for attempt in (1, 2):
     n = c.enumerate()
     if c.display:
@@ -27,7 +27,7 @@ for attempt in (1, 2):
     time.sleep(0.4)
 print("enumerated %d, display=%s" % (n, c.display))
 if not c.display:
-    raise SystemExit("no display on GP20/21")
+    raise SystemExit("no display on the I2C buses in settings.toml")
 
 d = c.display[0]
 print("info:", d.info(refresh=True), " fw:", d.firmware_version)
@@ -160,4 +160,4 @@ d.print("bench done")
 d.print(("FAIL: " + ", ".join(fails)) if fails else "all ok", color=RED if fails else GREEN)
 print()
 print("FAILED:", fails) if fails else print("ALL STEPS OK")
-c.i2c.deinit()
+c.deinit()

@@ -27,6 +27,7 @@ import board
 import microcontroller
 import supervisor
 
+import noknok
 from noknok import Conductor
 
 # ── Prelude-supplied knobs (defaults when run standalone) ────────────────────
@@ -43,11 +44,10 @@ try:
 except NameError:
     REPS = 10             # I2C transactions per module per pass
 
-# The dual-bus PicoHub layout. I2C0 = CN2/CN5/CN7, I2C1 = CN1/CN4/CN6.
-BUSES = (
-    ("i2c0", "GP20/21", board.GP20, board.GP21),
-    ("i2c1", "GP18/19", board.GP18, board.GP19),
-)
+# The I2C buses settings.toml configures (DEV-74: no pins in code).
+BUSES = tuple((name, label, sda, scl) for name, sda, scl, label in noknok.i2c_bus_pins())
+if not BUSES:
+    raise SystemExit(noknok.NO_PINS_MSG)
 
 TYPE_NAME = {
     "NoknokBuzzer": "buzzer",
@@ -181,10 +181,8 @@ def main():
         u = {"n": 0, "modules": [], "error": None}
         c = None
         try:
-            # Pins of a REAL bus, not the GP8/9 default - a Conductor built on
-            # empty pins prints "I2C bus unavailable", which is noise that could
-            # mask a genuine bus fault in the log.
-            c = Conductor(sda=board.GP18, scl=board.GP19)
+            # Pins from settings.toml (DEV-74), the USB host pins included.
+            c = Conductor()
             n = c.enumerate_usb()
             u["n"] = n
             for m in getattr(c, "leds", []):

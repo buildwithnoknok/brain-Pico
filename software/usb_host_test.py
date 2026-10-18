@@ -26,8 +26,11 @@ import board
 import usb_host
 import usb.core
 
-DP = board.GP16   # USB D+   <- change to match your wiring (must be lower pin)
-DM = board.GP17   # USB D-
+import noknok                       # USB host pins from settings.toml (DEV-74)
+_usb = noknok.pins("usb")
+if _usb is None:
+    raise SystemExit("no USB host pins in settings.toml (NOKNOK_USB_DP / NOKNOK_USB_DM)")
+DP, DM = _usb
 
 LEDS_VID = 0x1209
 LEDS_PID = 0x4E4E
@@ -46,7 +49,7 @@ def _ensure_port():
 
 
 def run():
-    print("Bringing up USB host port on GP16 (D+) / GP17 (D-)...")
+    print("Bringing up USB host port on the settings.toml pins (D+ %s / D- %s)..." % (DP, DM))
     try:
         _ensure_port()
     except Exception as e:
@@ -72,7 +75,7 @@ def run():
     if leds is None:
         print("\nNO noknok LEDs module found.")
         print("If NO device was listed at all, D+/D- are most likely swapped -")
-        print("swap the data wires on GP16/GP17 (D+ must be GP16) and re-run.")
+        print("swap the D+/D- data wires (D+ must be the lower GPIO) and re-run.")
         print("Also check common GND and 5V on VBUS.")
         return
 

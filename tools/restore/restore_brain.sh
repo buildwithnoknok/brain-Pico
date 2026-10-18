@@ -26,7 +26,7 @@
 #                 firmware cache), noknok_state.json, noknok_roles.json AND the backup's
 #                 settings.toml (the maker's pins, e.g. I2C on GP20/21) - see --settings.
 #                 Without --data the brain comes back factory-fresh with the repo's
-#                 default settings.toml (I2C on GP8/GP9) and opens the noknok-setup WiFi.
+#                 settings.toml (PicoHub pins: I2C GP10/11 + GP20/21, USB GP0/1) and opens the noknok-setup WiFi.
 #   --settings F  use this settings.toml instead (wins over the backup's and the repo's).
 #   --mpy DIR     directory with noknok.mpy, noknok_rpc.mpy, noknok_usb.mpy and
 #                 module_flasher.mpy built by tools/build_mpy.ps1 for the CircuitPython

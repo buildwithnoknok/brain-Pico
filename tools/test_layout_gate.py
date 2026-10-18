@@ -193,7 +193,7 @@ mf = types.ModuleType("module_flasher")
 mf.ModuleFlasher = FailingFlasher
 sys.modules["module_flasher"] = mf
 c = Rig({})
-c.i2c = None
+c.i2c, c.i2c_b = object(), None     # a bus A object; the fake flasher never touches it
 c.enumerate = lambda *a, **k: 0
 raised = False
 try:

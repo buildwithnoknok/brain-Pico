@@ -157,14 +157,27 @@ churn) must never lose a file, *setup-time* rounds reproduce the finding. **Acce
 ## settings.toml — maker configuration
 
 CircuitPython reads `/settings.toml` natively; the noknok code reads it with `os.getenv()`.
-It is *the* place to adapt a brain you wired yourself — never edit `noknok.py` or `code.py` for
-these. noknok hardware (PicoHub) follows the Ecosystem standard and ships the defaults.
+It is *the* place the brain learns its wiring — never edit `noknok.py` or `code.py` for these.
+The repo's [`software/settings.toml`](software/settings.toml) carries the values of the
+reference carrier, the noknok PicoHub (MOD-0011).
+
+**Pins have no default in code** (since `noknok.py` 1.15 / `code.py` 0.21, DEV-74). A pin group
+that is missing is **off**, and the brain says so: a console line, a `[CFG]` entry in the event
+history (written only when the problem changes), the Pico's own LED blinking at boot, and the
+`config` block of the `hello` op (pins in use, where they came from, problems). A group needs both
+of its keys and real pin names; a typo turns that group off and is reported. A complete,
+problem-free set is kept in the Store as a **last-known-good copy**: if `settings.toml` has no pin
+key at all (lost or damaged), the brain uses that copy and asks you to restore the file. If the file
+has some pin keys, it is authoritative (leave out bus B or USB to turn them off).
+`noknok.pin_config()` returns all of this; bench scripts use `noknok.i2c_bus_pins()`.
+Test: `tools/test_two_bus.py` (host, tier S).
 
 | Key | Default | Used by |
 |-----|---------|---------|
-| `NOKNOK_I2C_SDA` / `NOKNOK_I2C_SCL` | `"GP8"` / `"GP9"` (Ecosystem standard) | `noknok.Conductor()` |
-| `NOKNOK_I2C_FREQ` | `100000` | `noknok.Conductor()` |
-| `NOKNOK_USB_DP` / `NOKNOK_USB_DM` | `"GP16"` / `"GP17"` (D+ = lower GPIO of a consecutive pair) | `noknok_usb` host port |
+| `NOKNOK_I2C_SDA` / `NOKNOK_I2C_SCL` | none — I2C bus A (PicoHub: `"GP10"` / `"GP11"`, ports J3/J4) | `noknok.Conductor()` |
+| `NOKNOK_I2C_B_SDA` / `NOKNOK_I2C_B_SCL` | none — optional I2C bus B (PicoHub: `"GP20"` / `"GP21"`, ports J5/J6). Must use the other I2C peripheral than bus A. | `noknok.Conductor()` |
+| `NOKNOK_I2C_FREQ` | `100000` (both buses) | `noknok.Conductor()` |
+| `NOKNOK_USB_DP` / `NOKNOK_USB_DM` | none — optional USB host port (PicoHub: `"GP0"` / `"GP1"`; D+ = lower GPIO of a consecutive pair) | `noknok_usb` host port |
 | `NOKNOK_USB_DRIVE` | `0` = hidden (shipped) · `1` = visible (maker/bench) | `boot.py` |
 | `NOKNOK_MDNS` | `0` = off (default) · `1` = advertise `noknok-XXXX.local` | `code.py` app channel |
 | `NOKNOK_FRAM` | `1` = probe the I2C FRAM at 0x50 and use it as the Store if a chip answers. Unset or anything else = nvm only, the bus is not touched (default since 1.14) | `noknok.store()` |

@@ -1,13 +1,14 @@
 # noknok_usb.py - USB transport + USB module drivers for the noknok Conductor.
 #
 # Counterpart to the I2C side of noknok.py. USB modules (e.g. the noknok LEDs
-# ring) attach to the Pico as USB devices on a PIO-USB host port (GP16/GP17).
+# ring) attach to the Pico as USB devices on a PIO-USB host port (pins from
+# settings.toml: NOKNOK_USB_DP / NOKNOK_USB_DM; noknok PicoHub = GP0/GP1).
 # This module is LAZILY imported by noknok.py's Conductor (enumerate_usb) only
 # when a product actually uses USB modules, so I2C-only products never load the
 # USB stack and pay no RAM/flash cost.
 #
 # Setup (Pico 2 W, RP2350, CircuitPython with USB host support):
-#   - D+ -> GP16, D- -> GP17 (consecutive pair, D+ the lower pin); modules behind
+#   - D+ / D- on the settings.toml pins (consecutive pair, D+ the lower pin); modules behind
 #     a POWERED hub (the DataHub). discover() brings the host port up itself.
 #
 # Identity: each module reports a unique iSerialNumber built from its chip UID
@@ -34,17 +35,17 @@ except ImportError:
 
 NOKNOK_VID = 0x1209
 
-# Default PIO-USB host pins (noknok standard GP16/GP17; D+ must be the lower
-# GPIO number). Makers wiring their own Pico override them in settings.toml
-# (NOKNOK_USB_DP / NOKNOK_USB_DM) — never here. See noknok.env_pin().
+# PIO-USB host pins come ONLY from settings.toml (NOKNOK_USB_DP / NOKNOK_USB_DM;
+# D+ must be the lower GPIO number of a consecutive pair). No default in code
+# (DEV-74): without them the USB host port stays off. See noknok.pin_config().
 def _pins():
     if not _USB_OK:
         return None, None
     try:
-        from noknok import env_pin
-        return env_pin("NOKNOK_USB_DP", board.GP16), env_pin("NOKNOK_USB_DM", board.GP17)
+        from noknok import pins
+        return pins("usb") or (None, None)
     except ImportError:
-        return board.GP16, board.GP17
+        return None, None
 
 DEFAULT_DP, DEFAULT_DM = _pins()
 
@@ -435,7 +436,11 @@ def ensure_host_port(dp=None, dm=None):
             "usb.core / usb_host not available - need a CircuitPython build with "
             "USB host support.")
     if _host_port is None:
-        _host_port = usb_host.Port(dp or DEFAULT_DP, dm or DEFAULT_DM)
+        dp, dm = dp or DEFAULT_DP, dm or DEFAULT_DM
+        if dp is None or dm is None:
+            raise RuntimeError(
+                "USB host pins not set: add NOKNOK_USB_DP / NOKNOK_USB_DM to settings.toml")
+        _host_port = usb_host.Port(dp, dm)
     return _host_port
 
 

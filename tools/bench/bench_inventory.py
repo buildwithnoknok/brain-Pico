@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 #
 # bench_inventory.py - read-only "what is this brain and what is on it". Run: pico.py run.
-# Library versions, WiFi setup (SSID only), then every I2C bus the benches use (GP8/9, GP20/21,
+# Library versions, WiFi setup (SSID only), then every I2C bus settings.toml configures (DEV-74; was GP8/9, GP20/21,
 # GP18/19) and the USB host. Writes nothing. To learn bootloader versions/layouts use
 # bench_dev65.py (it reads them with the flasher replaced by tripwires).
 import board, os, wifi
@@ -22,9 +22,13 @@ try:
 except Exception as e:
     print("wifi.json unreadable:", e)
 print("radio connected:", wifi.radio.connected, wifi.radio.ipv4_address)
-for label, sda, scl in (("GP8/9", board.GP8, board.GP9), ("GP20/21", board.GP20, board.GP21),
-                        ("GP18/19", board.GP18, board.GP19)):
-    print("== I2C", label)
+# The I2C buses settings.toml configures (DEV-74: no pins in code).
+cfg = noknok.pin_config()
+print("pins:", {g: cfg.get(g) for g in ("i2c_a", "i2c_b", "usb")}, "source:", cfg.get("source"))
+for p in cfg.get("problems", ()):
+    print("  PROBLEM:", p)
+for name, sda, scl, label in noknok.i2c_bus_pins():
+    print("== I2C bus", name, label)
     try:
         c = Conductor(sda=sda, scl=scl)
         c.enumerate(total_timeout_sec=8)
@@ -32,14 +36,13 @@ for label, sda, scl in (("GP8/9", board.GP8, board.GP9), ("GP20/21", board.GP20,
             for m in getattr(c, kind, []):
                 print("   %-10s 0x%02X fw %s uid %s" % (kind, m.address, getattr(m, "firmware_version", None),
                                                        getattr(m, "_uid_hex", None)))
-        if label == "GP8/9":
+        if name == "A":
             try:
                 c.enumerate_usb()
                 for m in getattr(c, "leds", []) + getattr(c, "leds16", []):
                     print("   usb        %s fw %s" % (type(m).__name__, getattr(m, "firmware_version", None)))
             except Exception as e:
                 print("   usb enumeration failed:", e)
-        if c.i2c:                      # None when the bus has no pull-ups (no modules)
-            c.i2c.deinit()
+        c.deinit()
     except Exception as e:
         print("  ", type(e).__name__, e)

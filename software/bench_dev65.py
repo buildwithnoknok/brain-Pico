@@ -21,8 +21,10 @@ import board
 import noknok
 from noknok import Conductor
 
-BUSES = (("GP20/21", board.GP20, board.GP21), ("GP8/9", board.GP8, board.GP9),
-         ("GP18/19", board.GP18, board.GP19))
+# The I2C buses settings.toml configures (DEV-74: no pins in code).
+BUSES = tuple((label, sda, scl) for _, sda, scl, label in noknok.i2c_bus_pins())
+if not BUSES:
+    raise SystemExit(noknok.NO_PINS_MSG)
 fails = 0
 tested = 0          # modules actually exercised - zero means the test proved nothing
 
@@ -61,7 +63,7 @@ try:
         mods = [(k, m) for k in ("buzzer", "knob", "ledbutton", "display") for m in getattr(c, k)]
         if not mods:
             print("\n== %s: no I2C modules" % label)
-            c.i2c.deinit() if getattr(c, "i2c", None) else None
+            c.deinit()
             continue
         print("\n== %s: %d module(s)" % (label, len(mods)))
         tested += len(mods)
@@ -112,7 +114,7 @@ try:
         after = {r["uid"]: r["installed"] for r in c.firmware_report({})}
         check("installed versions unchanged after the run", before == after)
         try:
-            c.i2c.deinit()
+            c.deinit()
         except Exception:
             pass
 finally:

@@ -1,5 +1,13 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.20 (no WiFi boot skips the parked-module rescue — DEV-97)
+# Version: 0.21 (pins only from settings.toml, two I2C buses — DEV-74)
+#
+# v0.21 changes (Sue): DEV-74 — no hard-coded GPIOs. noknok.py 1.15 takes the
+#   I2C bus A / bus B / USB host pins only from settings.toml (with a last-known-
+#   good copy in the Store). At boot the brain logs the pins in use and reports
+#   every problem: console, a [CFG] event (only when the problem changes), the
+#   Pico's own LED, and a new `config` block in the hello op. A configured bus
+#   that does not come up is reported the same way. _release_conductor() and the
+#   boot-hold reset now release BOTH buses (Conductor.deinit()).
 #
 # v0.20 changes (Sue): DEV-97 — a WiFi boot whose daily OTA check is due used
 #   to return early with NO parked-module rescue when the manifest has no
@@ -306,7 +314,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.20"
+CODE_VERSION = "0.21"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -471,6 +479,90 @@ pending = {"ssid": None, "password": None, "script_url": None,
            "ready": False}
 
 # ── Role assignment: lazily-created, cached Conductor ───────────────────────────
+# ── Pin configuration report (DEV-74) ──────────────────────────────────────────
+# No GPIO is hard-coded: settings.toml is the only source of the I2C bus A/B and
+# USB host pins (noknok.pin_config(), with a last-known-good copy in the Store).
+# When it cannot give them, the brain says so everywhere it can: the console, a
+# [CFG] event in the history the app reads (written only when the problem is
+# new or changed, so no Store write per boot), the Pico's own LED (no module can
+# signal it - they sit on the missing bus) and the `config` block of hello.
+PIN_PROBLEMS_KEY = "pins_problems"
+BUS_PROBLEMS_KEY = "bus_problems"
+_bus_problems = []          # buses that are configured but did not come up, this boot
+
+def _note_problems(key, problems):
+    """[CFG] events for a problem list that differs from the last one recorded
+    under `key` in the Store; one Store write per change, none per boot."""
+    try:
+        st = nk.store()
+        before = st.get(key) or []
+        if problems == before:
+            return
+        for p in problems:
+            if p not in before:
+                event("[CFG] " + p)
+        if before and not problems:
+            event("[CFG] resolved: " + "; ".join(before))
+        if problems:
+            st.set(key, problems)
+        else:
+            st.delete(key)
+    except Exception as e:
+        log(f"[cfg] could not record the problem ({e!r})")
+
+def _blink_onboard_led(times=6, period=0.25):
+    """Error pattern on the Pico's own LED. On a Pico 2 W board.LED is driven
+    through the WiFi chip, so this is not a GPIO choice; it works when no module
+    can be reached. Best-effort, ~1.5 s."""
+    try:
+        import board
+        import digitalio
+        led = digitalio.DigitalInOut(board.LED)
+        led.direction = digitalio.Direction.OUTPUT
+        for _ in range(times):
+            led.value = True
+            time.sleep(period / 2)
+            led.value = False
+            time.sleep(period / 2)
+        led.deinit()
+    except Exception as e:
+        log(f"[cfg] onboard LED unavailable ({e!r})")
+
+def _report_pin_config():
+    """Log the pins in use and report every problem pin_config() found."""
+    try:
+        cfg = nk.pin_config()
+    except Exception as e:
+        log(f"[cfg] pin check failed: {e!r}")
+        return
+    log("[cfg] pins (%s): %s" % (cfg.get("source"), nk._pins_text(cfg)))
+    problems = list(cfg.get("problems") or [])
+    for p in problems:
+        log("[cfg] PROBLEM: " + p)
+    _note_problems(PIN_PROBLEMS_KEY, problems)
+    if problems:
+        _blink_onboard_led()
+
+def _report_bus_problems(c):
+    """A configured bus that did not come up (no pull-ups, both buses on one
+    I2C peripheral): same treatment as a pin problem."""
+    global _bus_problems
+    _bus_problems = list(getattr(c, "bus_problems", None) or [])
+    for p in _bus_problems:
+        log("[cfg] PROBLEM: " + p)
+    _note_problems(BUS_PROBLEMS_KEY, _bus_problems)
+
+def _config_status():
+    """The `config` block of hello: pins in use, where they came from, problems."""
+    try:
+        cfg = nk.pin_config()
+    except Exception as e:
+        return {"error": repr(e)}
+    return {"pins": {g: (list(cfg[g]) if cfg.get(g) else None)
+                     for g in ("i2c_a", "i2c_b", "usb")},
+            "source": cfg.get("source"),
+            "problems": list(cfg.get("problems") or []) + list(_bus_problems)}
+
 # The role endpoints need a Conductor to talk to the I2C modules. Enumeration
 # takes a few seconds, so we create + enumerate it once on first use and reuse it.
 _conductor = None
@@ -496,7 +588,8 @@ def get_conductor(rescue_get_image=None):
         try:
             from noknok import Conductor
             log("[roles] Creating Conductor + enumerating modules (first use)...")
-            c = Conductor()                 # self-configures I2C (GP8/GP9, 100 kHz)
+            c = Conductor()                 # pins from settings.toml (DEV-74), 100 kHz
+            _report_bus_problems(c)
             if rescue_get_image is not None:
                 _rescue_parked(c, rescue_get_image)
             found = c.enumerate_all()       # ~3 s — discovers I2C + USB modules
@@ -795,6 +888,7 @@ def _h_hello(args, msg):
                      "circuitpython": sys.version.split(" on ")[0]},
         "online": bool(wifi.radio.connected),
         "ap": bool(wifi.radio.ap_active),
+        "config": _config_status(),     # DEV-74: pins in use + problems (app: "setup incomplete")
         "carrier": "wifi",
         "uptime": round(time.monotonic(), 1),
         "ops": rpc.dispatcher().ops(),
@@ -813,7 +907,8 @@ def _h_status(args, msg):
         for m in c._registry.values():
             modules.append({"type": type(m).__name__.replace("Noknok", "").lower(),
                             "uid": getattr(m, "_uid_hex", None) or getattr(m, "serial", None),
-                            "fw": getattr(m, "firmware_version", None)})
+                            "fw": getattr(m, "firmware_version", None),
+                            "bus": getattr(m, "i2c_bus", None) or "usb"})   # "A"/"B"/"usb" (DEV-74)
     return {
         "state": _device_state(),
         "strikes": _crash_count(),
@@ -1217,13 +1312,13 @@ def run_ap_provisioning():
 # ── Module firmware OTA (v0.10) ─────────────────────────────────────────────────
 
 def _release_conductor():
-    """Free the cached Conductor's I2C bus so product.py can create its own.
-    busio.I2C can only own the pins once per process — without this, the product
-    script's Conductor() would collide with the one code.py created here."""
+    """Free the cached Conductor's I2C buses (A and B) so product.py can create
+    its own. busio.I2C can only own the pins once per process — without this, the
+    product script's Conductor() would collide with the one code.py created here."""
     global _conductor
     if _conductor is not None:
         try:
-            _conductor.i2c.deinit()
+            _conductor.deinit()
         except Exception:
             pass
         _conductor = None
@@ -2004,7 +2099,7 @@ def _boot_hold_reset_check():
         # Free the pins; the reload that follows starts a fresh VM anyway.
         try:
             if c is not None:
-                c.i2c.deinit()
+                c.deinit()
         except Exception:
             pass
 
@@ -2175,6 +2270,7 @@ def main():
         else "owned by the PC",
         nk.store().backend))
     nk.clean_tmp()
+    _report_pin_config()                 # DEV-74: pins come only from settings.toml
 
     creds = load_wifi_credentials()
     if not creds:

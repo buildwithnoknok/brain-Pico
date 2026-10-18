@@ -39,7 +39,7 @@
 #               settings (DEV-34), event history, a credentials copy;
 #             - enumeration gives a known module its previous address, so
 #               the state stops changing from boot to boot.
-#             Pins come from settings.toml (NOKNOK_I2C_SDA/SCL/FREQ).
+#             Pins come from settings.toml (since v1.15 ONLY from there, DEV-74).
 # v1.8 (Sue): DEV-34 — reachable by the app while the product runs. Every
 #             driver read/write and Conductor.sleep() call _service(), the
 #             hook code.py points at noknok_rpc.service (non-blocking,
@@ -75,6 +75,14 @@
 #             module parked at 0x7E, invisible to enumerate()); "layout read but
 #             unknown" (stage-1 older than 1.2.0) is remembered so it is not
 #             re-read, with a full re-enumeration, on every call.
+# v1.14 (Sue): DEV-101 — the Store probes an I2C FRAM only with NOKNOK_FRAM = 1.
+# v1.15 (Sue): DEV-74 — no hard-coded GPIOs: pin_config() takes I2C bus A, the
+#             optional bus B (NOKNOK_I2C_B_SDA / _SCL) and the USB host pins only
+#             from settings.toml, keeps a last-known-good copy in the Store and
+#             lists problems. Two I2C buses: one enumeration over both (polled in
+#             turn, still ~3 s), one shared address space, c.i2c_b, module.i2c_bus,
+#             "i2c_bus" in the saved state and firmware_report(); rescue probes
+#             both buses; Conductor.deinit() releases both.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -95,7 +103,7 @@ import json
 import os
 import struct
 
-__version__ = "1.14"
+__version__ = "1.15"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -140,13 +148,17 @@ def conductor():
 
 # ── settings.toml — the one maker-facing config file ──────────────────────────
 # CircuitPython reads /settings.toml natively; os.getenv("KEY") returns the
-# value (str, or int for a bare number) or None when the key is absent. Every
-# key has a default here that equals the noknok ecosystem standard, so a brain
-# without the file behaves exactly like a factory unit. Makers wiring their own
-# Pico change the file, never this library. Keys read here:
-#   NOKNOK_I2C_SDA  = "GP8"      NOKNOK_I2C_SCL = "GP9"     NOKNOK_I2C_FREQ = 100000
-#   NOKNOK_USB_DP   = "GP16"     NOKNOK_USB_DM  = "GP17"    (read by noknok_usb.py)
-#   NOKNOK_USB_DRIVE = 0         (read by boot.py, see set_usb_drive() below)
+# value (str, or int for a bare number) or None when the key is absent. Makers
+# wiring their own Pico change the file, never this library.
+#
+# PINS HAVE NO DEFAULT IN CODE (DEV-74, decided 18 Oct 2026): settings.toml is
+# the only source; see pin_config() below. The repo's settings.toml carries the
+# reference carrier's values (noknok PicoHub MOD-0011):
+#   NOKNOK_I2C_SDA   = "GP10"    NOKNOK_I2C_SCL   = "GP11"   I2C bus A
+#   NOKNOK_I2C_B_SDA = "GP20"    NOKNOK_I2C_B_SCL = "GP21"   I2C bus B (optional)
+#   NOKNOK_USB_DP    = "GP0"     NOKNOK_USB_DM    = "GP1"    USB host port (optional)
+# Other keys keep a default: NOKNOK_I2C_FREQ = 100000 (both buses),
+# NOKNOK_USB_DRIVE = 0 (read by boot.py, see set_usb_drive() below).
 
 SETTINGS_FILE = "/settings.toml"
 
@@ -160,8 +172,9 @@ def env(key, default=None):
 
 def env_pin(key, default):
     """A board pin named in settings.toml (e.g. "GP8"), or `default`. An unknown
-    pin name is reported once and the default used, so a typo never kills the
-    bus at boot."""
+    pin name is reported once and the default used. The library's own buses no
+    longer use this (pin_config() has no defaults, DEV-74); kept for makers'
+    scripts."""
     name = env(key)
     if not name:
         return default
@@ -170,6 +183,132 @@ def env_pin(key, default):
     except AttributeError:
         print(f"[settings] {key}={name!r} is not a pin on this board — using default")
         return default
+
+
+# ── Pin configuration: settings.toml is the ONLY source (DEV-74) ─────────────
+# No GPIO is hard-coded in this library. Three pin groups, each a pair of keys:
+PIN_GROUPS = (
+    ("i2c_a", "NOKNOK_I2C_SDA",   "NOKNOK_I2C_SCL",   "I2C bus A"),
+    ("i2c_b", "NOKNOK_I2C_B_SDA", "NOKNOK_I2C_B_SCL", "I2C bus B"),
+    ("usb",   "NOKNOK_USB_DP",    "NOKNOK_USB_DM",    "USB host port"),
+)
+PINS_STORE_KEY = "pins"     # last-known-good copy in the Store
+_pin_config = None
+
+def pin_config(refresh=False):
+    """The brain's pins, from settings.toml, checked. Cached; refresh=True rereads.
+
+    Returns {"i2c_a": ("GP10", "GP11") or None, "i2c_b": ..., "usb": ("GP0", "GP1")
+    or None, "source": "settings" | "last-known-good" | "none", "problems": [str]}.
+    A group that is None is OFF: the Conductor brings up no bus there.
+
+    Rules (decided with Christopher, 18 Oct 2026):
+    - A group needs BOTH keys and real pin names, otherwise it is off and the
+      reason is in "problems" (a typo is reported, never papered over).
+    - The file is authoritative whenever it has ANY pin key: a group it leaves
+      out is simply off (that is how a maker turns bus B or USB off). Having no
+      I2C bus at all is reported, because then no I2C module can be reached.
+    - Last-known-good: whenever the file gives a complete, problem-free set, it
+      is copied to the Store (only when it changed, so no write per boot). If the
+      file has NO pin key at all - lost or damaged, e.g. by a power cut during a
+      PC edit - that copy is used and the problem says so.
+    Callers report "problems" (code.py: console, [CFG] event, onboard LED, the
+    `config` block of the hello op)."""
+    global _pin_config
+    if _pin_config is not None and not refresh:
+        return _pin_config
+    cfg = {"source": "settings", "problems": []}
+    any_key = False
+    for group, k1, k2, label in PIN_GROUPS:
+        cfg[group] = None
+        a, b = env(k1), env(k2)
+        if a is None and b is None:
+            continue
+        any_key = True
+        if a is None or b is None or not str(a).strip() or not str(b).strip():
+            cfg["problems"].append("%s is off: %s and %s must both be set in settings.toml"
+                                   % (label, k1, k2))
+            continue
+        a, b = str(a).strip(), str(b).strip()
+        bad = [n for n in (a, b) if not hasattr(board, n)]
+        if bad:
+            cfg["problems"].append("%s is off: %s is not a pin on this board (settings.toml)"
+                                   % (label, " / ".join(repr(n) for n in bad)))
+            continue
+        cfg[group] = (a, b)
+
+    if not any_key:
+        saved = None
+        try:
+            saved = store().get(PINS_STORE_KEY)
+        except Exception:
+            pass
+        if isinstance(saved, dict) and any(saved.get(g) for g, _, _, _ in PIN_GROUPS):
+            for group, _, _, _ in PIN_GROUPS:
+                v = saved.get(group)
+                cfg[group] = (v[0], v[1]) if v and all(hasattr(board, n) for n in v) else None
+            cfg["source"] = "last-known-good"
+            cfg["problems"].append(
+                "settings.toml has no pin settings (file lost or damaged?) - using the "
+                "last known good pins: " + _pins_text(cfg) + ". Restore settings.toml.")
+        else:
+            cfg["source"] = "none"
+            cfg["problems"].append(
+                "settings.toml has no pin settings (NOKNOK_I2C_SDA / NOKNOK_I2C_SCL, ...) "
+                "and no earlier copy exists - no module can be reached. Install settings.toml.")
+    else:
+        if cfg["i2c_a"] is None and cfg["i2c_b"] is None and not cfg["problems"]:
+            cfg["problems"].append("no I2C pins in settings.toml (NOKNOK_I2C_SDA / "
+                                   "NOKNOK_I2C_SCL) - I2C modules are off")
+        if not cfg["problems"]:
+            _remember_pins(cfg)
+    _pin_config = cfg
+    return cfg
+
+def _pins_text(cfg):
+    parts = []
+    for group, _, _, label in PIN_GROUPS:
+        if cfg.get(group):
+            parts.append("%s %s/%s" % (label, cfg[group][0], cfg[group][1]))
+    return ", ".join(parts) or "none"
+
+def _remember_pins(cfg):
+    """Keep a problem-free pin set as the last-known-good copy (Store, only on change)."""
+    rec = {g: (list(cfg[g]) if cfg[g] else None) for g, _, _, _ in PIN_GROUPS}
+    try:
+        st = store()
+        if st.get(PINS_STORE_KEY) != rec:
+            st.set(PINS_STORE_KEY, rec)
+    except Exception as e:
+        print("[settings] could not keep the last-known-good pins (%r)" % (e,))
+
+def _pin_name(pin):
+    """'GP10' for board.GP10 (best effort, for messages)."""
+    for n in dir(board):
+        if n.startswith("GP") and getattr(board, n, None) is pin:
+            return n
+    return str(pin)
+
+def i2c_bus_pins():
+    """[(name, sda, scl, label)] for each I2C bus settings.toml configures, e.g.
+    ("A", board.GP10, board.GP11, "GP10/GP11"). For bench and test scripts that
+    open their own busio.I2C. Empty when no I2C pins are set (no defaults)."""
+    out = []
+    for name, group in (("A", "i2c_a"), ("B", "i2c_b")):
+        p = pins(group)
+        if p:
+            out.append((name, p[0], p[1], "%s/%s" % pin_config()[group]))
+    return out
+
+NO_PINS_MSG = ("no I2C pins in settings.toml (NOKNOK_I2C_SDA / NOKNOK_I2C_SCL, "
+               "optional NOKNOK_I2C_B_SDA / NOKNOK_I2C_B_SCL) - nothing to test")
+
+def pins(group):
+    """(pin, pin) board objects for a PIN_GROUPS group, or None when it is off."""
+    names = pin_config().get(group)
+    if not names:
+        return None
+    return getattr(board, names[0]), getattr(board, names[1])
 
 
 # ── Filesystem policy (DEV-18) ────────────────────────────────────────────────
@@ -415,7 +554,13 @@ class Store:
                 return fn(self._bus)
             except (ValueError, RuntimeError):
                 self._bus = None    # bus was deinit'ed under us — use a temporary one
-        bus = busio.I2C(env_pin("NOKNOK_I2C_SCL", board.GP9), env_pin("NOKNOK_I2C_SDA", board.GP8),
+        # Bus A pins straight from settings.toml - NOT via pin_config(), which
+        # reads the Store itself (loop). No pins, no FRAM: _load() falls back
+        # to nvm. No default pins in code (DEV-74).
+        sda, scl = env("NOKNOK_I2C_SDA"), env("NOKNOK_I2C_SCL")
+        if not sda or not scl:
+            raise OSError("no I2C bus A pins in settings.toml")
+        bus = busio.I2C(getattr(board, str(scl).strip()), getattr(board, str(sda).strip()),
                         frequency=int(env("NOKNOK_I2C_FREQ", 100_000)))
         try:
             return fn(bus)
@@ -1073,17 +1218,25 @@ class Conductor:
     CMD_GET_VERSION  = 0xB1   # write 0xB1, read 4 bytes [PROTO, FW_MAJOR, MINOR, PATCH]
     PROTOCOL_VERSION = 0x01   # the standard-command protocol version this lib understands
 
-    def __init__(self, sda=None, scl=None, frequency=None):
-        # Pins: explicit argument > settings.toml > ecosystem standard (GP8/GP9,
-        # 100 kHz). noknok hardware follows the standard; the file is for makers
-        # wiring their own Pico.
-        self._sda  = sda if sda is not None else env_pin("NOKNOK_I2C_SDA", board.GP8)
-        self._scl  = scl if scl is not None else env_pin("NOKNOK_I2C_SCL", board.GP9)
+    def __init__(self, sda=None, scl=None, frequency=None, sda_b=None, scl_b=None):
+        # Pins: explicit arguments (board pin objects) > settings.toml. There is
+        # NO default in code (DEV-74): a bus without pins stays off and
+        # pin_config() says why. Two buses (noknok PicoHub MOD-0011: A = J3/J4,
+        # B = J5/J6), each on its own hardware I2C peripheral; bus B is optional.
+        cfg = pin_config()
+        a = (sda, scl) if sda is not None and scl is not None else pins("i2c_a")
+        b = (sda_b, scl_b) if sda_b is not None and scl_b is not None else pins("i2c_b")
+        self._bus_pins = {"A": a, "B": b}         # (sda, scl) per bus, or None = off
+        self._sda, self._scl = a if a else (None, None)   # kept for older callers
         self._freq = int(frequency if frequency is not None
                          else env("NOKNOK_I2C_FREQ", 100_000))
-        self.i2c = None
-        self._init_i2c()   # tolerant: warns + leaves i2c=None if no pull-ups / no bus
-        store().attach(self.i2c)   # the Store (FRAM at 0x50 / nvm) shares this bus
+        self.i2c   = None      # bus A (busio.I2C); product scripts and the Store use it
+        self.i2c_b = None      # bus B, None when not configured / not up
+        self.bus_problems = []  # why a configured bus did not come up (this boot)
+        for p in cfg.get("problems", ()):
+            print("[settings] " + p)
+        self._init_i2c()   # tolerant: warns + leaves a bus None if no pull-ups / no pins
+        store().attach(self.i2c)   # the Store (opt-in FRAM at 0x50 / nvm) shares bus A
         global _last_conductor
         _last_conductor = self     # see conductor()
         self.settings = settings() # c.settings — product values (DEV-34), shared instance
@@ -1115,52 +1268,80 @@ class Conductor:
     # ── Low-level I2C ─────────────────────────────────────────────────────────
 
     def _init_i2c(self):
-        """Bring up the I2C bus, tolerantly. If it can't initialise - e.g. no
-        pull-ups because no I2C modules are connected (USB-only product, or a
-        breakout without host pull-ups) - warn and leave self.i2c = None so the
-        USB side still works. Returns True if the bus is up."""
-        if self.i2c is not None:
-            return True
-        try:
-            self.i2c = busio.I2C(self._scl, self._sda, frequency=self._freq)
-            return True
-        except Exception as e:
-            print("I2C bus unavailable (%s) - I2C modules will be skipped." % e)
-            self.i2c = None
-            return False
+        """Bring up the configured I2C buses, tolerantly. A bus that cannot
+        initialise - no pull-ups because nothing is plugged in, or bus B on the
+        same hardware peripheral as bus A - is reported and left None; the other
+        bus and the USB side still work. Returns True if at least one bus is up."""
+        for name, attr in (("A", "i2c"), ("B", "i2c_b")):
+            if getattr(self, attr) is not None or not self._bus_pins.get(name):
+                continue
+            sda, scl = self._bus_pins[name]
+            try:
+                setattr(self, attr, busio.I2C(scl, sda, frequency=self._freq))
+            except Exception as e:
+                msg = ("I2C bus %s (%s/%s) unavailable: %s - its modules are skipped. "
+                       "(No pull-ups? Both buses on the same I2C peripheral?)"
+                       % (name, _pin_name(sda), _pin_name(scl), e))
+                print(msg)
+                if msg not in self.bus_problems:
+                    self.bus_problems.append(msg)
+        return self.i2c is not None or self.i2c_b is not None
 
-    def _read(self, addr, n):
-        if self.i2c is None:
+    def deinit(self):
+        """Release BOTH I2C buses so another Conductor (product.py) can claim the
+        pins - busio.I2C owns its pins once per process. Safe to call twice."""
+        for attr in ("i2c", "i2c_b"):
+            bus = getattr(self, attr, None)
+            if bus is not None:
+                try:
+                    bus.deinit()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        store().attach(None)
+
+    def _buses(self):
+        """[(name, busio.I2C)] for every bus that is up: A first, then B."""
+        return [(n, b) for n, b in (("A", self.i2c), ("B", self.i2c_b)) if b is not None]
+
+    def _bus(self, name):
+        """The busio.I2C for bus "A"/"B" (None or missing = "A"), or None if off."""
+        return self.i2c_b if name == "B" else self.i2c
+
+    def _read(self, addr, n, i2c=None):
+        bus = i2c if i2c is not None else self.i2c
+        if bus is None:
             return None
         _service()
         buf = bytearray(n)
-        while not self.i2c.try_lock():
+        while not bus.try_lock():
             pass
         try:
-            self.i2c.readfrom_into(addr, buf)
+            bus.readfrom_into(addr, buf)
             return buf
         except OSError:
             return None
         finally:
-            self.i2c.unlock()
+            bus.unlock()
 
-    def _write(self, addr, data):
-        if self.i2c is None:
+    def _write(self, addr, data, i2c=None):
+        bus = i2c if i2c is not None else self.i2c
+        if bus is None:
             return False
         _service()
-        while not self.i2c.try_lock():
+        while not bus.try_lock():
             pass
         try:
-            self.i2c.writeto(addr, bytes(data))
+            bus.writeto(addr, bytes(data))
             return True
         except OSError:
             return False
         finally:
-            self.i2c.unlock()
+            bus.unlock()
 
     # ── Standard system commands (GET_VERSION) ─────────────────────────────────
 
-    def read_version(self, address):
+    def read_version(self, address, i2c=None):
         """
         Read a module's installed firmware version via the standard GET_VERSION
         command (0xB1) at its RUNTIME address. The module replies with 4 bytes:
@@ -1173,10 +1354,10 @@ class Conductor:
         OR garbage, so we only trust a reply whose first byte equals
         PROTOCOL_VERSION (0x01). Anything else => "unknown firmware".
         """
-        if not self._write(address, [self.CMD_GET_VERSION]):
+        if not self._write(address, [self.CMD_GET_VERSION], i2c):
             return (None, None)
         time.sleep(0.003)                       # let the module latch the command
-        buf = self._read(address, 4)
+        buf = self._read(address, 4, i2c)
         if buf is None or buf[0] != self.PROTOCOL_VERSION:
             return (None, None)
         return (buf[0], "%d.%d.%d" % (buf[1], buf[2], buf[3]))
@@ -1186,7 +1367,8 @@ class Conductor:
         the module doesn't speak GET_VERSION). Called for every enumerated module."""
         if module is None:
             return
-        module.protocol_version, module.firmware_version = self.read_version(address)
+        module.protocol_version, module.firmware_version = self.read_version(
+            address, getattr(module, "i2c", None))
 
     # ── Firmware version checking (against a product manifest) ─────────────────
 
@@ -1254,6 +1436,7 @@ class Conductor:
         return {
             "type":         mf_key,
             "bus":          bus,            # "i2c" or "usb" — routes update_module()
+            "i2c_bus":      getattr(m, "i2c_bus", "A") if bus == "i2c" else None,  # "A"/"B" (DEV-74)
             "uid":          getattr(m, "_uid_hex", None),
             "address":      address,        # I2C runtime addr, or None for USB
             "installed":    installed,
@@ -1367,6 +1550,13 @@ class Conductor:
     # ModuleFlasher (module_flasher.py) or the USB UsbModuleFlasher (noknok_usb.py).
     # Both are lazily imported so a single-bus product never loads the other stack.
 
+    def _entry_bus(self, entry):
+        """The busio.I2C an I2C firmware_report() entry lives on (DEV-74)."""
+        bus = self._bus(entry.get("i2c_bus") or "A")
+        if bus is None:
+            raise OSError("I2C bus %s is not up" % (entry.get("i2c_bus") or "A"))
+        return bus
+
     def update_module(self, entry, image, progress=None):
         """
         Flash one module's firmware. `entry` is a firmware_report() dict (needs
@@ -1380,8 +1570,8 @@ class Conductor:
         bus = entry.get("bus")
         if bus == "i2c":
             from module_flasher import ModuleFlasher
-            ModuleFlasher(self.i2c).flash(image, runtime_addr=entry.get("address"),
-                                          progress=progress)
+            ModuleFlasher(self._entry_bus(entry)).flash(image, runtime_addr=entry.get("address"),
+                                                        progress=progress)
             return True
         if bus == "usb":
             import noknok_usb
@@ -1412,7 +1602,7 @@ class Conductor:
         if entry.get("bus") != "i2c":
             raise NotImplementedError("bootloader_version: USB modules not yet (V203 port pending)")
         from module_flasher import ModuleFlasher
-        f = ModuleFlasher(self.i2c)
+        f = ModuleFlasher(self._entry_bus(entry))
         f.enter_bootloader(entry["address"])
         try:
             f.wait_for_bootloader()
@@ -1490,7 +1680,7 @@ class Conductor:
         if entry.get("bus") != "i2c":
             raise NotImplementedError("stage1_update: USB modules not yet (V203 port pending)")
         from module_flasher import ModuleFlasher
-        f = ModuleFlasher(self.i2c)
+        f = ModuleFlasher(self._entry_bus(entry))
         before, after = f.flash_stage1(stage1_image, runtime_addr=entry.get("address"),
                                        progress=progress)
         restored = False
@@ -1531,18 +1721,26 @@ class Conductor:
         Also the reason to do this FIRST: with a module already at 0x7E, starting
         another update would put two modules there and neither could be reached.
         """
-        if self.i2c is None:
-            return None
-        from module_flasher import ModuleFlasher, ST_ERROR, _ERRMSG
-        f = ModuleFlasher(self.i2c)
-        st = f._read_status()
-        if st is None:
-            return None                                   # nothing at 0x7E — normal
+        # Every bus that is up (DEV-74): a module can park on bus B too. One
+        # rescue per boot, as before - the first parked module found.
+        from module_flasher import ModuleFlasher
+        for bus_name, bus in self._buses():
+            f = ModuleFlasher(bus)
+            st = f._read_status()
+            if st is not None:
+                res = self._rescue_on(f, st, bus_name, get_image, logfn)
+                res["i2c_bus"] = bus_name
+                return res
+        return None                                       # nothing at 0x7E — normal
+
+    def _rescue_on(self, f, st, bus_name, get_image, logfn):
+        """rescue_parked_module() for the module parked at 0x7E on one bus."""
+        from module_flasher import ST_ERROR
         state, err = st
         reason = ("app unhealthy (stage-1 refused to boot it)"
                   if (state == ST_ERROR and err == 7) else
                   "interrupted update (no valid app)")
-        logfn("Module parked in bootloader at 0x7E: %s" % reason)
+        logfn("Module parked in bootloader at 0x7E on I2C bus %s: %s" % (bus_name, reason))
 
         ver = f.get_version()
         if ver is None:
@@ -1566,7 +1764,7 @@ class Conductor:
         # The parked module is already in its bootloader, so its layout is known
         # for free — pass it on so get_image() can refuse a wrong-layout image
         # instead of pushing one that will hang the module all over again.
-        entry = {"type": mf_key, "bus": "i2c", "uid": uid, "address": None,
+        entry = {"type": mf_key, "bus": "i2c", "i2c_bus": bus_name, "uid": uid, "address": None,
                  "reason": reason, "bootloader": ver,
                  "bootloader_layout": self.layout_of(ver)}
         logfn("  UID %s was a %s (bootloader v%d.%d.%d, layout %s) - fetching its app..."
@@ -1646,10 +1844,33 @@ class Conductor:
 
     # ── Enumeration ───────────────────────────────────────────────────────────
 
+    def _make_module(self, module_type, bus_name, address, uid_hex):
+        """Driver object for a module of `module_type` on bus "A"/"B", appended to
+        its type list (c.buzzer, ...). Returns (module or None, type_name)."""
+        i2c = self._bus(bus_name)
+        if module_type == self.TYPE_BUZZER:
+            module, type_name, lst = NoknokBuzzer(i2c, address=address), "noknokbuzzer", self.buzzer
+        elif module_type == self.TYPE_KNOB:
+            module, type_name, lst = NoknokKnob(i2c, address=address), "noknokknob", self.knob
+        elif module_type == self.TYPE_LEDBUTTON:
+            module, type_name, lst = NoknokLedButton(i2c, address=address), "noknokledbutton", self.ledbutton
+        elif module_type == self.TYPE_DISPLAY:
+            module, type_name, lst = NoknokDisplay(i2c, address=address), "noknokdisplay", self.display
+        else:
+            return None, "unknown(0x%02X)" % module_type
+        module._uid_hex = uid_hex
+        module.i2c_bus = bus_name           # "A" / "B" - state record, OTA, diagnostics
+        lst.append(module)
+        return module, type_name
+
     def enumerate(self, total_timeout_sec=10):
         """
-        Discover all modules on the bus.
-        Polls 0x7F every 20 ms. Stops after 3000 ms of no response.
+        Discover all modules on every I2C bus that is up (A, and B when
+        configured - DEV-74). Each bus has its own 0x7F hand-out address; both
+        are polled in turn every 20 ms, and the sweep stops once EVERY bus has
+        been quiet for 3000 ms, so two buses cost no extra boot time. Addresses
+        are unique across both buses (one shared address space), so a module
+        moved from one bus to the other keeps its address.
         Returns total number of modules found.
         """
         print("Enumerating noknok modules...")
@@ -1661,7 +1882,8 @@ class Conductor:
         self.role      = {}
 
         if not self._init_i2c():
-            print("  No I2C bus (no pull-ups / no I2C modules) - skipping I2C enumeration.")
+            print("  No I2C bus (no pins in settings.toml, no pull-ups, or no I2C "
+                  "modules) - skipping I2C enumeration.")
             return 0
 
         # ── Step 1: Restore already-assigned modules ──────────────────────────
@@ -1693,63 +1915,47 @@ class Conductor:
         # Always wait the full 3000 ms so a new module with a long backoff
         # (up to 2799 ms) is never missed, even when a saved state was restored.
         no_resp_limit = 3000
-        no_resp_ms    = 0
+        buses         = self._buses()
+        quiet_ms      = {name: 0 for name, _ in buses}
         deadline      = time.monotonic() + total_timeout_sec
         new_found     = 0
 
-        while no_resp_ms < no_resp_limit and time.monotonic() < deadline:
+        while (any(q < no_resp_limit for q in quiet_ms.values())
+               and time.monotonic() < deadline):
 
-            buf = self._read(self.ENUM_ADDR, 10)
+            for bus_name, bus in buses:
+                if quiet_ms[bus_name] >= no_resp_limit:
+                    continue                    # this bus is done; keep polling the other
 
-            if buf is None:
-                no_resp_ms += 20
-                time.sleep(0.02)
-                continue
+                buf = self._read(self.ENUM_ADDR, 10, bus)
 
-            no_resp_ms = 0
+                if buf is None:
+                    quiet_ms[bus_name] += 20
+                    continue
 
-            # Verify CRC
-            if _crc8(buf[:9]) != buf[9]:
-                print("  CRC mismatch — possible collision, retrying...")
+                quiet_ms[bus_name] = 0
+
+                # Verify CRC
+                if _crc8(buf[:9]) != buf[9]:
+                    print("  CRC mismatch on bus %s — possible collision, retrying..." % bus_name)
+                    time.sleep(0.05)
+                    continue
+
+                uid_hex     = bytes(buf[:8]).hex()
+                module_type = buf[8]
+                addr        = pick_address(uid_hex)
+
+                # Assign address - on the bus the module answered on
+                self._write(self.ENUM_ADDR, [self.ASSIGN_REG, addr], bus)
                 time.sleep(0.05)
-                continue
 
-            uid_hex     = bytes(buf[:8]).hex()
-            module_type = buf[8]
-            addr        = pick_address(uid_hex)
+                module, type_name = self._make_module(module_type, bus_name, addr, uid_hex)
+                if module is not None:
+                    self._apply_version(module, addr)
 
-            # Assign address
-            self._write(self.ENUM_ADDR, [self.ASSIGN_REG, addr])
-            time.sleep(0.05)
-
-            # Instantiate correct class
-            if module_type == self.TYPE_BUZZER:
-                module    = NoknokBuzzer(self.i2c, address=addr)
-                type_name = "noknokbuzzer"
-                self.buzzer.append(module)
-            elif module_type == self.TYPE_KNOB:
-                module    = NoknokKnob(self.i2c, address=addr)
-                type_name = "noknokknob"
-                self.knob.append(module)
-            elif module_type == self.TYPE_LEDBUTTON:
-                module    = NoknokLedButton(self.i2c, address=addr)
-                type_name = "noknokledbutton"
-                self.ledbutton.append(module)
-            elif module_type == self.TYPE_DISPLAY:
-                module    = NoknokDisplay(self.i2c, address=addr)
-                type_name = "noknokdisplay"
-                self.display.append(module)
-            else:
-                module    = None
-                type_name = f"unknown(0x{module_type:02X})"
-
-            if module is not None:
-                module._uid_hex = uid_hex
-                self._apply_version(module, addr)
-
-            self._registry[uid_hex] = module
-            new_found += 1
-            print(f"  {type_name} → 0x{addr:02X}  UID: {uid_hex}  [new]")
+                self._registry[uid_hex] = module
+                new_found += 1
+                print(f"  {type_name} → 0x{addr:02X} (bus {bus_name})  UID: {uid_hex}  [new]")
 
             time.sleep(0.02)
 
@@ -1762,7 +1968,7 @@ class Conductor:
         if new_found == 0 and restored > 0:
             print(f"No new modules. {restored} module(s) already assigned:")
             for uid, m in self._registry.items():
-                if m: print(f"  {type(m).__name__} at 0x{m.address:02X}  UID: {uid}")
+                if m: print(f"  {type(m).__name__} at 0x{m.address:02X} (bus {getattr(m, 'i2c_bus', 'A')})  UID: {uid}")
         else:
             print(f"Done — {total} module(s) ({restored} restored, {new_found} new).")
         return total
@@ -1777,8 +1983,9 @@ class Conductor:
         by_uid() and the role system work the same across both buses.
 
         `noknok_usb` is imported HERE (not at module top) so I2C-only products
-        never load the USB stack. Pins default to the noknok standard
-        GP16 (D+) / GP17 (D-). Returns the number of USB modules found.
+        never load the USB stack. Pins come from settings.toml
+        (NOKNOK_USB_DP / NOKNOK_USB_DM; no default, DEV-74). Returns the number
+        of USB modules found.
         """
         try:
             import noknok_usb
@@ -1787,6 +1994,10 @@ class Conductor:
             return 0
         if not noknok_usb.available():
             print("No USB host support on this build - skipping USB enumeration.")
+            return 0
+        if (dp is None or dm is None) and pins("usb") is None:
+            print("No USB host pins in settings.toml (NOKNOK_USB_DP / NOKNOK_USB_DM) "
+                  "- skipping USB enumeration.")
             return 0
 
         print("Enumerating noknok USB modules...")
@@ -1868,7 +2079,8 @@ class Conductor:
                     t = self.TYPE_DISPLAY
                 else:
                     t = 0
-                entry = {"address": module.address, "type": t}
+                entry = {"address": module.address, "type": t,
+                         "i2c_bus": getattr(module, "i2c_bus", "A")}   # DEV-74
                 if hasattr(module, "bootloader"):
                     bl = module.bootloader
                     entry["bl"] = list(bl) if bl else None
@@ -1916,28 +2128,15 @@ class Conductor:
                 # runtime GET_UID and restore becomes identity-checked.
                 print("  state: %s also claims 0x%02X — skipped (stale)" % (uid_hex, addr))
                 continue
-            if self._read(addr, 1) is None:
-                continue   # module not responding
+            bus_name = info.get("i2c_bus") or "A"   # state written before DEV-74 = bus A
+            bus = self._bus(bus_name)
+            if bus is None:
+                continue   # that bus is off this boot - keep the entry, try next time
+            if self._read(addr, 1, bus) is None:
+                continue   # module not responding (or moved to the other bus: the 0x7F sweep finds it)
             claimed.add(addr)
 
-            if type_code == self.TYPE_BUZZER:
-                module = NoknokBuzzer(self.i2c, address=addr)
-                module._uid_hex = uid_hex
-                self.buzzer.append(module)
-            elif type_code == self.TYPE_KNOB:
-                module = NoknokKnob(self.i2c, address=addr)
-                module._uid_hex = uid_hex
-                self.knob.append(module)
-            elif type_code == self.TYPE_LEDBUTTON:
-                module = NoknokLedButton(self.i2c, address=addr)
-                module._uid_hex = uid_hex
-                self.ledbutton.append(module)
-            elif type_code == self.TYPE_DISPLAY:
-                module = NoknokDisplay(self.i2c, address=addr)
-                module._uid_hex = uid_hex
-                self.display.append(module)
-            else:
-                module = None
+            module, _ = self._make_module(type_code, bus_name, addr, uid_hex)
 
             if module is not None:
                 self._apply_version(module, addr)

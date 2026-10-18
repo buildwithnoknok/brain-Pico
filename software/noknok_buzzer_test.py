@@ -14,7 +14,11 @@ import time
 
 # ── I2C setup ────────────────────────────────────────────────────────────────
 BUZZER_ADDR = 0x45
-i2c = busio.I2C(scl=board.GP9, sda=board.GP8, frequency=100_000)
+import noknok                                   # pins from settings.toml (DEV-74)
+_a = noknok.pins("i2c_a")
+if _a is None:
+    raise SystemExit(noknok.NO_PINS_MSG)
+i2c = busio.I2C(scl=_a[1], sda=_a[0], frequency=100_000)
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 

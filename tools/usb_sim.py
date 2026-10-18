@@ -77,6 +77,8 @@ sys.modules.update({"usb": usb, "usb.core": usb_core, "usb_host": usb_host,
 
 import noknok_usb as nu                      # noqa: E402
 nu.time.sleep = lambda s: None               # run the discovery loop at full speed
+# USB host pins as settings.toml would give them (no default in code, DEV-74)
+nu.DEFAULT_DP, nu.DEFAULT_DM = board.GP16, board.GP17
 
 # -- checks --------------------------------------------------------------------
 

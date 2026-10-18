@@ -11,8 +11,12 @@ import time
 import board
 import busio
 from module_flasher import ModuleFlasher
+import noknok
 
-for label, sda, scl in (("GP8/9", board.GP8, board.GP9),):
+# Every I2C bus settings.toml configures (DEV-74: no pins in code).
+if not noknok.i2c_bus_pins():
+    print(noknok.NO_PINS_MSG)
+for _, sda, scl, label in noknok.i2c_bus_pins():
     i2c = busio.I2C(scl, sda, frequency=100000)
     f = ModuleFlasher(i2c)
     print(label, "bootloader answers at 0x7E:", f.present())

@@ -29,7 +29,7 @@ It ends with `RESTORE OK` (and exit code 0) or `RESTORE FAILED`.
 **What ends up on the brain** (printed before anything is erased; the script stops if it cannot do it properly):
 
 * **`settings.toml`**: with `--data`, the *backup's* (the maker's own pins, e.g. I2C on GP20/GP21); `--settings FILE`
-  overrides; with neither, the repo default (I2C on GP8/GP9, the PicoHub standard). A restore never silently
+  overrides; with neither, the repo's `software/settings.toml` (the noknok PicoHub pins: I2C bus A GP10/GP11, bus B GP20/GP21, USB GP0/GP1). A restore never silently
   replaces a maker's pins with the default.
 * **Libraries as `.mpy`, never `.py`**: `noknok.py` is ~190 KB of source and does not fit in the Pico's RAM next to a
   product (`MemoryError`, brain parks itself in safe idle). Sources of the `.mpy`, in order: `--mpy DIR`; `mpy-cross` on the

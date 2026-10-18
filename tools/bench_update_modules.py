@@ -17,6 +17,7 @@
 import time
 
 import board
+import noknok
 from noknok import Conductor
 
 # Versions + layouts + local images, taken from each module repo's
@@ -42,11 +43,10 @@ IMAGES = {
     "usb_leds":   "noknok_leds.bin",
 }
 
-BUSES = (
-    ("std",  board.GP8,  board.GP9),     # ecosystem standard I2C pins
-    ("i2c0", board.GP20, board.GP21),
-    ("i2c1", board.GP18, board.GP19),
-)
+# The I2C buses settings.toml configures (DEV-74: no pins in code).
+BUSES = tuple((label, sda, scl) for _, sda, scl, label in noknok.i2c_bus_pins())
+if not BUSES:
+    raise SystemExit(noknok.NO_PINS_MSG)
 
 
 def get_image(entry):

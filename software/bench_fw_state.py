@@ -4,13 +4,18 @@
 # (noknok_state.json: fw + stage-1 "bl") and the firmware/event logs.
 # Run: ./pico.py run bench_fw_state.py ; then ./pico.py reset
 import os, busio, board, json
+import noknok
 
-i2c = busio.I2C(board.GP21, board.GP20)
-while not i2c.try_lock():
-    pass
-print("I2C scan GP20/21:", [hex(a) for a in i2c.scan()])
-i2c.unlock()
-i2c.deinit()
+# Every I2C bus settings.toml configures (DEV-74: no pins in code).
+if not noknok.i2c_bus_pins():
+    print(noknok.NO_PINS_MSG)
+for name, sda, scl, label in noknok.i2c_bus_pins():
+    i2c = busio.I2C(scl, sda)
+    while not i2c.try_lock():
+        pass
+    print("I2C scan bus %s (%s):" % (name, label), [hex(a) for a in i2c.scan()])
+    i2c.unlock()
+    i2c.deinit()
 
 def find(name):
     for d in ("/", "/data/"):

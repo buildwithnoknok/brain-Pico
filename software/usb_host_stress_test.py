@@ -20,8 +20,11 @@ import time
 import usb_host
 import usb.core
 
-DP = board.GP16
-DM = board.GP17
+import noknok                       # USB host pins from settings.toml (DEV-74)
+_usb = noknok.pins("usb")
+if _usb is None:
+    raise SystemExit("no USB host pins in settings.toml (NOKNOK_USB_DP / NOKNOK_USB_DM)")
+DP, DM = _usb
 
 LEDS_VID = 0x1209
 LEDS_PID = 0x4E4E
@@ -42,7 +45,7 @@ def _ensure_port():
     global _port
     if _port is None:
         _port = usb_host.Port(DP, DM)
-        print("  usb_host.Port OK on GP16 (D+) / GP17 (D-)")
+        print("  usb_host.Port OK on D+ %s / D- %s" % (DP, DM))
     return _port
 
 

@@ -11,7 +11,7 @@ scripts. Nothing here ships to a customer brain. MIT, like the rest of this repo
 | `yank_loop.sh [RUNS] [--runtime-only]` | host | Hands-free power-pull rounds with `software/bench_yank.py`: a person pulls during each tone, the loop records each boot and runs the next round. `--runtime-only` for brains with real setup data. |
 | `rpc_failure_modes.sh <ip>` | host on the LAN | `/rpc` failure modes: bad values, reboot keeps settings, dead product URL keeps the old product. Resets settings at the end. |
 | `wifi_offline.py IN OUT` | host | Offline copy of a brain's `wifi.json` (fake SSID, password emptied) for tests that need a brain without network. Prints key names only. |
-| `bench_inventory.py` | Pico (`pico.py run`) | Read-only: library versions, `settings.toml` pins, WiFi SSID, modules on GP8/9, GP20/21, GP18/19 and the USB host. |
+| `bench_inventory.py` | Pico (`pico.py run`) | Read-only: library versions, `settings.toml` pins, WiFi SSID, pin problems, modules on every I2C bus `settings.toml` configures (bus A, bus B) and the USB host. |
 | `bench_display_rotation.py` | Pico | Visual check of all four Display orientations (frame, corner markers, asymmetric text). |
 | `crash_product.py` | Pico, as `/data/product.py` | Crashes on purpose: exercises 3-strike recovery and safe idle. |
 

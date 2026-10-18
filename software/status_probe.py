@@ -6,8 +6,8 @@
 # to reset it. Pi4RFID bench pins GP20/21.
 import board
 from noknok import Conductor
-c = Conductor(sda=board.GP20, scl=board.GP21)
+c = Conductor()      # pins from settings.toml (DEV-74)
 c.enumerate()
 d = c.display[0]
 print("status (busy, last_err):", d.status(), " info:", d.info(refresh=True))
-c.i2c.deinit()
+c.deinit()
