@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## Tools: registry check - 2026-10-18 (no component version bumped)
+
+- DEV-98 - `tools/test_registry_complete.py` (host, tier S): fails when a module type the brain knows (I2C and USB type tables in `noknok.py` / `noknok_usb.py`) has no entry in the Ecosystem module registry `modules.json`, or the other way round; `--online` also fetches every index and image anonymously and checks size + crc32. Nothing ships to a brain. Breaking: no.
+
 ## code.py 0.20 - 2026-10-18
 
 - DEV-97 - no boot that starts a product skips the parked-module rescue any more. A connected boot whose daily update check was due used to skip it completely when the product has no `module_firmware`, the HTTPS session failed or nothing resolved (GitHub unreachable); those boots now rescue from the on-device firmware cache like offline boots do. A module that stays parked is reported loudly: a `MODULE STILL PARKED` log line, the `[RESCUE]` event in the history the app reads, and the buzzer/LED alert; every later boot retries. New host test `tools/test_rescue_paths.py`. Breaking: no.
