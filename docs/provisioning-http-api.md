@@ -257,7 +257,7 @@ The `fram` branch stays in `noknok.store()` for a future board, but no shipping 
 Since DEV-18 (15 Sep 2026) the brain **never writes its filesystem while a product runs**
 — a power cut during any FAT write can destroy the filesystem on this platform. Runtime data
 lives in the **Store** (`noknok.store()`: `microcontroller.nvm` on every shipping brain; an
-optional maker-wired I2C FRAM at 0x50 is supported, see README *Store* and DEV-101);
+optional maker-wired I2C FRAM at 0x50 is supported, opt-in with `NOKNOK_FRAM = 1`, see README *Store*);
 setup/OTA-time files live in `/data/`.
 
 | Where | Written by | Purpose |

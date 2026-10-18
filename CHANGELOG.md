@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## noknok.py 1.14 - 2026-10-18
+
+- DEV-101 - the runtime Store looks for an I2C FRAM at 0x50 only when `settings.toml` says `NOKNOK_FRAM = 1`. Before, it probed unless the setting was `0`, so an unrelated EEPROM/FRAM a maker wired to 0x50 could silently become the Store; without the setting the Store now never touches the I2C bus. New host test `tools/test_store_fram_optin.py`. Breaking: only for a brain that relied on an FRAM without setting `NOKNOK_FRAM = 1` (no noknok board fits one); add the setting to keep using it.
+
 ## Tools: bench - 2026-10-10 (no component version bumped)
 
 - `tools/bench/`: test helpers from the Sprint 1 QA run - boot capture from replug, listen-only console reader, hands-free power-pull loop for `bench_yank.py` (incl. runtime-only mode), `/rpc` failure-mode script, offline `wifi.json` helper, read-only bench inventory, Display rotation check, deliberately crashing product. Bench only, nothing ships to a brain. Breaking: no.

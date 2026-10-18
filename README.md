@@ -108,13 +108,12 @@ shows up on a PC as a drive again (fail-open, below), so recovery is always poss
    also live in `/data/wifi.json`. Bench-measured write: ~79 ms.
    An **I2C FRAM at 0x50** (byte-atomic, wear-free, two slots written alternately — genuinely
    power-safe) is still implemented in `noknok.py` and would remove that last loss, but no
-   noknok board fits one: the PicoHub FRAM story (DEV-40) was **cancelled**. The backend is
-   meant to be probed only when `settings.toml` has `NOKNOK_FRAM = 1` *and* a chip answers at
-   0x50, so a maker who wires one up gets it; `0x50–0x57` stays reserved ecosystem-wide for
-   exactly that. **Known bug (DEV-101):** today `noknok.store()` probes unless
-   `NOKNOK_FRAM = 0` (unset = probe), so any EEPROM/FRAM a maker connects at 0x50 would
-   silently become the Store. Until it is fixed, set `NOKNOK_FRAM = 0` if you put such a
-   chip on the bus for another purpose.
+   noknok board fits one: the PicoHub FRAM story (DEV-40) was **cancelled**. The FRAM is
+   **opt-in**: it is probed only when `settings.toml` has `NOKNOK_FRAM = 1` *and* a chip
+   answers at 0x50, so a maker who wires one up gets it. Without that setting the Store never
+   touches the I2C bus, and an EEPROM/FRAM you connect at 0x50 for another purpose is left
+   alone (since `noknok.py` 1.14; before, unset meant "probe"). `0x50–0x57` stays reserved
+   ecosystem-wide for the FRAM. Test: `tools/test_store_fram_optin.py` (host, tier S).
 3. **Stable module addresses.** Enumeration gives a known module its previous address, so
    the state record only changes when hardware changes — it used to be rewritten on most
    power-ons because modules were numbered in arrival order.
@@ -168,7 +167,7 @@ these. noknok hardware (PicoHub) follows the Ecosystem standard and ships the de
 | `NOKNOK_USB_DP` / `NOKNOK_USB_DM` | `"GP16"` / `"GP17"` (D+ = lower GPIO of a consecutive pair) | `noknok_usb` host port |
 | `NOKNOK_USB_DRIVE` | `0` = hidden (shipped) · `1` = visible (maker/bench) | `boot.py` |
 | `NOKNOK_MDNS` | `0` = off (default) · `1` = advertise `noknok-XXXX.local` | `code.py` app channel |
-| `NOKNOK_FRAM` | `1` = probe the I2C FRAM at 0x50, `0` = nvm only (intended default `0`; today unset still probes, DEV-101) | `noknok.store()` |
+| `NOKNOK_FRAM` | `1` = probe the I2C FRAM at 0x50 and use it as the Store if a chip answers. Unset or anything else = nvm only, the bus is not touched (default since 1.14) | `noknok.store()` |
 | `NOKNOK_WATCHDOG` | `0` = off (default) · `1` = **bench only**, 8 s hardware watchdog fed by the app-channel pump, plus the `bench.wifi_drop` op | `code.py` |
 
 ⚠ `NOKNOK_WATCHDOG` is a diagnostic for unattended bench runs, never for a shipped brain or

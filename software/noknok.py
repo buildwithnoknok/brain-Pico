@@ -95,7 +95,7 @@ import json
 import os
 import struct
 
-__version__ = "1.13"
+__version__ = "1.14"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -357,9 +357,9 @@ DATA_DIR = "/data"
 # lives here, as one small JSON record with a CRC:
 #
 #   FRAM backend (optional, maker-wired I2C FM24CL64B at 0x50; no noknok board
-#     fits one - the board story DEV-40 was cancelled). Intended to be probed
-#     only with settings.toml NOKNOK_FRAM = 1; today the code below probes
-#     unless NOKNOK_FRAM = 0 (DEV-101). Two 4 KB slots,
+#     fits one - the board story DEV-40 was cancelled). OPT-IN: probed only
+#     with settings.toml NOKNOK_FRAM = 1 (DEV-101); unset or anything else
+#     means nvm, and the bus is not touched. Two 4 KB slots,
 #     written alternately with a rising sequence number; a power cut mid-write
 #     leaves one slot with a bad CRC and the other intact. FRAM writes are
 #     byte-atomic and wear-free, so this is genuinely power-safe.
@@ -486,8 +486,10 @@ class Store:
         if self._data is not None:
             return
         self._data, self._seq = {}, 0
-        # FRAM first (unless disabled in settings.toml: NOKNOK_FRAM = 0)
-        if str(env("NOKNOK_FRAM", "1")) != "0":
+        # FRAM only when the maker opts in (settings.toml NOKNOK_FRAM = 1, DEV-101).
+        # Default is nvm: an unrelated EEPROM/FRAM a maker wires to 0x50 must
+        # never silently become the Store.
+        if str(env("NOKNOK_FRAM", "0")).strip() == "1":
             try:
                 def probe(i2c):
                     if not self._fram_present(i2c):
