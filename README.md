@@ -235,7 +235,8 @@ setup-time writes into `/data`, `settings.toml` for pins and drive visibility; s
   sidecar so a module parked after a power cut is rescued with no internet.
 
 Earlier features:
-- The app POSTs `ssid`, `password` and **`script_url`** to `192.168.4.1/connect`. The Pico
+- The app sends `ssid`, `password` and **`script_url`** (the `provision` op since app 1.5.4;
+  the browser form posts the same to `192.168.4.1/connect`). The Pico
   downloads whatever product `script_url` points to, so the brain is **product-agnostic** —
   a new product is just a new manifest + script, no firmware change. (`SCRIPT_URL` remains a
   fallback default.)

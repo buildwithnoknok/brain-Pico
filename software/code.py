@@ -1,5 +1,16 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.21 (pins only from settings.toml, two I2C buses — DEV-74)
+# Version: 0.22 (setup tells the app when the WiFi join fails — DEV-100)
+#
+# v0.22 changes (Sue): DEV-100 — /connect and the provision op used to answer
+#   "accepted" at once and the app showed Done even when the join then failed.
+#   Now: (1) new wifi.scan op lists the networks the device can see; (2) provision
+#   refuses a network that is not visible (reason network_not_found, hotspot
+#   kept; force=true for a hidden network); (3) it answers with a join_id, and a
+#   failed join is remembered in RAM as setup.last_join {join_id, ok, reason:
+#   auth / not_found / timeout / other / not_saved} in hello once the hotspot is
+#   back; (4) a wrong password stops retrying at once; (5) a failed join plays
+#   the module alert and blinks the Pico's LED. The browser page says
+#   "Connecting...", not "Connected!".
 #
 # v0.21 changes (Sue): DEV-74 — no hard-coded GPIOs. noknok.py 1.15 takes the
 #   I2C bus A / bus B / USB host pins only from settings.toml (with a last-known-
@@ -314,7 +325,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.21"
+CODE_VERSION = "0.22"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -672,9 +683,11 @@ HTML_SUCCESS = """\
 <title>noknok setup</title>
 <style>body{font-family:sans-serif;max-width:360px;margin:48px auto;padding:24px;color:#222}
 h1{color:#00aa44}</style></head><body>
-<h1>Connected!</h1>
-<p>Your noknok device is joining your network and downloading its software.</p>
-<p>You can close this page. The device will continue on its own.</p>
+<h1>Connecting...</h1>
+<p>Your noknok device is now trying your network. If it works, it downloads its
+software and starts on its own.</p>
+<p>If the network "noknok-setup" appears again within a minute, the connection did
+not work (usually a wrong password): join it again and retry.</p>
 </body></html>"""
 
 # ── Filesystem helpers ─────────────────────────────────────────────────────────
@@ -773,13 +786,30 @@ def connect_wifi(ssid, password):
     import gc
     gc.collect()
     log(f"[wifi] Connecting to '{ssid}'...")
+    global _wifi_error
+    _wifi_error = None
     try:
         wifi.radio.connect(ssid, password, timeout=WIFI_TIMEOUT_S)
         log(f"[wifi] Connected — IP: {wifi.radio.ipv4_address}")
         return True
     except Exception as e:
+        _wifi_error = "%s: %s" % (type(e).__name__, e)
         log(f"[wifi] Failed: {e}")
         return False
+
+_wifi_error = None          # text of the last failed join (connect_wifi)
+
+def _join_reason(err):
+    """Classify a CircuitPython join error for the app (DEV-100): 'auth' (wrong
+    password), 'not_found' (no such network in range), 'timeout' or 'other'."""
+    e = (err or "").lower()
+    if "auth" in e or "password" in e:
+        return "auth"
+    if "no network" in e or "not found" in e:
+        return "not_found"
+    if "timeout" in e or "timed out" in e:
+        return "timeout"
+    return "other"
 
 # ── Script download ────────────────────────────────────────────────────────────
 
@@ -889,6 +919,7 @@ def _h_hello(args, msg):
         "online": bool(wifi.radio.connected),
         "ap": bool(wifi.radio.ap_active),
         "config": _config_status(),     # DEV-74: pins in use + problems (app: "setup incomplete")
+        "setup": {"last_join": _last_join},   # DEV-100: why the last setup join failed (RAM)
         "carrier": "wifi",
         "uptime": round(time.monotonic(), 1),
         "ops": rpc.dispatcher().ops(),
@@ -1002,17 +1033,77 @@ def _h_settings_reset(args, msg):
     log("[rpc] settings.reset %s" % scope)
     return {"scope": scope, "values": values, "seq": s.seq}
 
+# ── Setup join feedback (DEV-100) ──────────────────────────────────────────────
+# The phone loses the hotspot while the brain tries the home WiFi, so the brain
+# cannot answer "it worked". What it can do: say up front when the network is
+# not even visible (scan pre-check), and remember why a join failed, so that
+# when the hotspot comes back, hello -> setup.last_join tells the app. RAM only
+# (ADR-003): a power cut mid-join forgets it, and the app then says "restarted".
+# join_id ties a report to the request that caused it, so the app never takes
+# the seconds before the join (hotspot still up) for a failure.
+_JOIN_BOOT = "%04x" % (int.from_bytes(os.urandom(2), "little"),)
+_join_seq  = 0
+_last_join = None           # {"join_id", "ssid", "ok", "reason", "attempts", "detail"}
+
+def _scan_networks():
+    """Networks the radio can see: [{"ssid", "rssi", "open"}], strongest first,
+    without our own hotspot, at most 25. None if scanning is not possible right
+    now (e.g. not supported while the hotspot runs) - callers then skip the
+    check instead of refusing anything."""
+    nets = {}
+    try:
+        for n in wifi.radio.start_scanning_networks():
+            name = n.ssid
+            if not name or name == AP_SSID:
+                continue
+            if name not in nets or n.rssi > nets[name]["rssi"]:
+                try:
+                    is_open = wifi.AuthMode.OPEN in n.authmode
+                except Exception:
+                    is_open = False
+                nets[name] = {"ssid": name, "rssi": n.rssi, "open": bool(is_open)}
+    except Exception as e:
+        log(f"[ap] WiFi scan not possible now ({e!r}) - skipping the check")
+        nets = None
+    finally:
+        try:
+            wifi.radio.stop_scanning_networks()
+        except Exception:
+            pass
+    if nets is None:
+        return None
+    return sorted(nets.values(), key=lambda x: -x["rssi"])[:25]
+
+def _h_wifi_scan(args, msg):
+    """wifi.scan op (DEV-100): the networks the device itself can see, so the
+    app offers a list instead of a typed name. AP time only in practice."""
+    nets = _scan_networks()
+    if nets is None:
+        return {"available": False, "networks": []}
+    return {"available": True, "networks": nets}
+
 def _do_provision(ssid, password, script_url, module_firmware, product_id,
-                  config_defaults=None):
+                  config_defaults=None, force=False):
     """Two situations, one op:
     - On the setup AP: hand the credentials to run_ap_provisioning()'s loop,
       which stops the AP, verifies the join, saves and hard-resets (as today).
     - On home WiFi (product running): a product switch. ssid/password may be
       omitted to keep the current network. Save, drop product.py, hard-reset;
       the boot path downloads the new script before any Conductor exists."""
+    global _join_seq
     if wifi.radio.ap_active:
         if not ssid:
             return {"ok": False, "error": "ssid required"}
+        # DEV-100: refuse at once, hotspot kept, when the network is not even
+        # visible (typo, out of range). force=True skips it (hidden network).
+        if not force:
+            nets = _scan_networks()
+            if nets is not None and ssid not in [n["ssid"] for n in nets]:
+                log(f"[ap] '{ssid}' is not visible from here - not trying it")
+                return {"accepted": False, "reason": "network_not_found", "networks": nets}
+        _join_seq += 1
+        join_id = "%s-%d" % (_JOIN_BOOT, _join_seq)
+        pending["join_id"]         = join_id
         pending["ssid"]            = ssid
         pending["password"]        = password or ""
         pending["script_url"]      = script_url or ""
@@ -1023,7 +1114,8 @@ def _do_provision(ssid, password, script_url, module_firmware, product_id,
         log(f"[ap] Credentials received for '{ssid}' "
             f"(module_firmware: {'yes' if module_firmware else 'none'}, "
             f"product_id: {product_id or 'none'})")
-        return {"accepted": True, "mode": "setup"}
+        return {"accepted": True, "mode": "setup", "join_id": join_id,
+                "uptime": round(time.monotonic(), 1)}
     creds = load_wifi_credentials() or {}
     if ssid and ssid != creds.get("ssid"):
         return {"ok": False, "error": "network change needs setup mode",
@@ -1074,7 +1166,9 @@ def register_ops():
         a.get("role_id"), a.get("module_type") or "", list(a.get("exclude") or [])))
     d.register("provision", lambda a, m: _do_provision(
         a.get("ssid"), a.get("password"), a.get("script_url"),
-        a.get("module_firmware"), a.get("product_id"), a.get("config_defaults")))
+        a.get("module_firmware"), a.get("product_id"), a.get("config_defaults"),
+        bool(a.get("force"))))
+    d.register("wifi.scan", _h_wifi_scan)          # DEV-100
 
 def _json(request, obj):
     return Response(request, json.dumps(obj), content_type="application/json")
@@ -1123,8 +1217,17 @@ def register_routes(server):
                 log(f"[ap] config_defaults parse failed ({e}) — ignoring")
 
         # Hand over to the provisioning loop (adapter over the `provision` op);
-        # it acts after the success page has been delivered to the browser.
-        _do_provision(ssid, pw, url, module_firmware, pid or None, config_defaults)
+        # it acts after the page has been delivered to the browser. A network
+        # the device cannot see is refused at once, hotspot kept (DEV-100);
+        # "force" (any value) skips that check for a hidden network.
+        res = _do_provision(ssid, pw, url, module_firmware, pid or None, config_defaults,
+                            bool(form.get("force")) if form else False)
+        if res.get("accepted") is False:
+            msg = ('<p style="color:#c00">Your device cannot see the network "%s". '
+                   'Check the name, or move the device closer to the router.</p>'
+                   % ssid.replace("<", "&lt;"))
+            return Response(request, HTML_SETUP.replace("<form", msg + "<form", 1),
+                            content_type="text/html")
         return Response(request, HTML_SUCCESS, content_type="text/html")
 
     # ── Role assignment endpoints (v0.8) ─────────────────────────────────────
@@ -1225,6 +1328,17 @@ def register_routes(server):
 
 # ── AP provisioning ────────────────────────────────────────────────────────────
 
+def _join_failed(ssid, reason, attempts, detail):
+    """Remember a failed setup join for hello (RAM only) and tell the customer
+    on the device itself: buzzer/LED Buttons if present, and the Pico's own LED
+    (DEV-100). The hotspot comes back right after."""
+    global _last_join
+    _last_join = {"join_id": pending.get("join_id"), "ssid": ssid, "ok": False,
+                  "reason": reason, "attempts": attempts, "detail": detail}
+    _field_alerts.append("wifi join failed: %s" % reason)
+    alert_customer()
+    _blink_onboard_led()
+
 def run_ap_provisioning():
     """
     Start a WiFi hotspot + HTTP server and wait for credentials.
@@ -1272,11 +1386,17 @@ def run_ap_provisioning():
         # before giving up — otherwise a transient blip kicks the user back to
         # re-entering credentials in the app.
         joined = False
+        reason = None
+        attempts = 0
         for attempt in range(1, 4):
+            attempts = attempt
             log(f"[ap] WiFi join attempt {attempt}/3")
             if connect_wifi(ssid, pw):
                 joined = True
                 break
+            reason = _join_reason(_wifi_error)
+            if reason == "auth":
+                break               # a wrong password does not get better (DEV-100)
             if attempt < 3:
                 time.sleep(3)
 
@@ -1297,6 +1417,7 @@ def run_ap_provisioning():
             # rather than reboot into a brain that has nothing saved.
             event("[CFG] provisioning NOT saved — filesystem read-only "
                   "(settings.toml NOKNOK_USB_DRIVE = 1?)")
+            _join_failed(ssid, "not_saved", attempts, "filesystem read-only")
             pending["ready"] = False
             time.sleep(1)
             # loop back to top -> start_ap again
@@ -1304,7 +1425,9 @@ def run_ap_provisioning():
             # WiFi join failed after all retries — restart the AP so the user
             # can retry. We do NOT supervisor.reload() here: a soft reload leaves
             # the CYW43 radio in a state where AP mode no longer works.
-            log("[ap] WiFi join failed after 3 attempts — restarting hotspot for retry")
+            log(f"[ap] WiFi join failed ({reason}, {attempts} attempt(s)) — "
+                "restarting hotspot for retry")
+            _join_failed(ssid, reason, attempts, _wifi_error)
             pending["ready"] = False
             time.sleep(1)
             # loop back to top -> start_ap again

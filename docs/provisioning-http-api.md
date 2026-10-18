@@ -19,9 +19,10 @@ portal setup page). This is the app ↔ brain contract.
   is on the `noknok-setup` AP**, before `/connect` hands the Pico onto home WiFi.
   Since code.py 0.17 the brain also serves **`POST /rpc`** (JSON, see below) on the
   AP *and* on home WiFi for the product's whole lifetime; the form endpoints are
-  adapters over the same handlers. Today (app 1.5.3) the app still runs **all of setup**
-  over the form endpoints (`/roles/assign`, `/connect`) and uses `/rpc`
-  only after setup (`hello`, `settings.*`).
+  adapters over the same handlers. Since app 1.5.4 the WiFi step uses `/rpc`
+  (`wifi.scan`, `provision`, then `hello` while connecting, DEV-100); role assignment
+  still uses the form endpoint `/roles/assign`; after setup the app uses `hello` and
+  `settings.*`.
 - **⚠ Client requirement — route over the hotspot.** `noknok-setup` has no internet, so
   Android (and iOS) keep mobile data as the default network while the phone is joined to
   it; a plain HTTP request to `192.168.4.1` then leaves over LTE and never arrives. A client
@@ -29,12 +30,20 @@ portal setup page). This is the app ↔ brain contract.
   `ConnectivityManager.bindProcessToNetwork` on a WiFi `NetworkRequest` *without* the
   INTERNET capability — app 1.5.1+, `MainActivity.kt`; iOS: `NEHotspotConfiguration` /
   per-request interface binding, not built yet), re-bind before each request (the phone
-  reconnects when the brain restarts its hotspot) and unbind once `/connect` succeeded.
-- **`/connect` answers before the WiFi join.** HTTP 200 today means only "credentials
-  received" - **not saved, not joined** (DEV-100): the brain sends the page first, then
-  stops the hotspot and tries the home WiFi 3×, and saves the credentials only after a
-  successful join. On failure nothing is saved and it reopens `noknok-setup`; the app does
-  not learn why yet (DEV-47 adds a `setup_result`). A wrong name shows on the serial console as `No network with that ssid`.
+  reconnects when the brain restarts its hotspot) and unbind once the join is settled.
+- **Setup answers before the WiFi join; failures are reported afterwards (DEV-100,
+  code.py 0.22).** `provision` / `/connect` first check that the network is visible
+  (a scan; skipped with `force` or when scanning is impossible) and refuse at once with
+  `accepted:false, reason:"network_not_found"` (hotspot kept). Otherwise they answer
+  `accepted:true` with a `join_id` - **not saved, not joined yet**. The brain then stops
+  the hotspot and tries the home WiFi (3 attempts; a wrong password stops at the first)
+  and saves the credentials only after a successful join. On failure nothing is saved,
+  the device plays its alert, and `noknok-setup` comes back with `hello` →
+  `setup.last_join {join_id, ok:false, reason}`: `auth` (wrong password), `not_found`,
+  `timeout`, `other`, or `not_saved` (drive open to a PC). RAM only: a power cut
+  forgets it (the app sees the uptime go backwards and says "restarted"). The brain cannot
+  report success (it is gone from the hotspot), so the app treats "no failure within
+  ~90 s" as success until DEV-70 can confirm on the home network.
 
 ## Endpoints
 
@@ -90,8 +99,12 @@ is saved and the hotspot comes back.
 | `script_url` | raw URL of the product's `product.py` (from the manifest's `files[]`) |
 | `module_firmware` | optional JSON string: the manifest's `module_firmware{}` block (floors, e.g. `{"buzzer":{"min":"3.3.1"}}`), persisted with the credentials (Store + `/data/wifi.json`) for the headless OTA check |
 
-**Response:** the "Connected!" HTML page. (The Pico acts on the credentials after
-the page is delivered.)
+| `force` | optional, any value: skip the "is this network visible?" check (hidden network) |
+
+**Response:** the "Connecting..." HTML page (the Pico acts on the credentials after the
+page is delivered), or the setup form again with "Your device cannot see the network ..."
+when the network is not visible (DEV-100). The app uses the `provision` op instead (JSON,
+with `join_id`).
 
 **What happens after the reset**, in order — this is where firmware is actually
 handled, because it is the first point at which the Pico has internet:
@@ -183,10 +196,11 @@ home LAN); pairing / authorisation is DEV-35. Implementation: `software/noknok_r
 
 | op | args | reply fields | notes |
 |----|------|--------------|-------|
-| `hello` | — | `device`, `name`, `state` (`unprovisioned` / `provisioned` / `parked`), `product{id,script,script_url}`, `versions{code,noknok,noknok_usb,rpc,circuitpython}`, `online`, `ap`, `config{pins{i2c_a,i2c_b,usb},source,problems[]}`, `carrier`, `uptime`, `ops[]` | open, cheap — call first. `config` (code.py 0.21+): the pins in use (`["GP10","GP11"]` or `null` = off), `source` (`settings` / `last-known-good` / `none`) and plain-text `problems[]`; non-empty problems = show "device setup incomplete" |
+| `hello` | — | `device`, `name`, `state` (`unprovisioned` / `provisioned` / `parked`), `product{id,script,script_url}`, `versions{code,noknok,noknok_usb,rpc,circuitpython}`, `online`, `ap`, `config{pins{i2c_a,i2c_b,usb},source,problems[]}`, `setup{last_join}`, `carrier`, `uptime`, `ops[]` | open, cheap — call first. `setup.last_join` (code.py 0.22+): `null`, or `{join_id, ssid, ok:false, reason, attempts, detail}` for the last failed setup join (see *Transport*). `config` (code.py 0.21+): the pins in use (`["GP10","GP11"]` or `null` = off), `source` (`settings` / `last-known-good` / `none`) and plain-text `problems[]`; non-empty problems = show "device setup incomplete" |
 | `status` | `since` (int, optional) | `state`, `strikes`, `store` (`fram`/`nvm`), `drive_visible`, `mem_free`, `ip`, `modules[{type,uid,fw,bus}]` (`bus` = `A` / `B` / `usb`, code.py 0.21+), `events[]`, `events_total` | phase-1 subset; DEV-36 adds firmware state |
 | `roles.assign` | `role_id`, `module_type`, `exclude[]` | `uid`, `type`, `saved` / `timeout` | = `/roles/assign`; blocks ≤ 20 s |
-| `provision` | `ssid`, `password`, `script_url`, `module_firmware`, `product_id`, `config_defaults` | `accepted`, `mode` (`setup` / `switch`), `rebooting` | on the AP = `/connect`; on home WiFi = **product switch**: the network stays (a different `ssid` is refused — use setup mode), the request is parked, the brain reboots, downloads + compiles the new script **before** touching anything, and only on success replaces `product.py`, saves the new product and installs its `config_defaults`. A bad URL / dead uplink keeps product, settings and firmware as they were (`[CFG] product switch FAILED` event). |
+| `wifi.scan` | — | `available`, `networks[{ssid,rssi,open}]` (strongest first, deduplicated, own hotspot left out, max 25) | code.py 0.22+, DEV-100. `available:false` = the radio cannot scan right now: let the user type the name |
+| `provision` | `ssid`, `password`, `script_url`, `module_firmware`, `product_id`, `config_defaults`, `force` | setup: `accepted`, `mode`, `join_id`, `uptime`; or `accepted:false`, `reason:"network_not_found"`, `networks[]`. Switch: `accepted`, `mode`, `rebooting` | on the AP = `/connect` (see *Transport* for the join feedback, DEV-100); on home WiFi = **product switch**: the network stays (a different `ssid` is refused — use setup mode), the request is parked, the brain reboots, downloads + compiles the new script **before** touching anything, and only on success replaces `product.py`, saves the new product and installs its `config_defaults`. A bad URL / dead uplink keeps product, settings and firmware as they were (`[CFG] product switch FAILED` event). |
 | `reboot` | — | `rebooting: true` | flushes settings, replies, resets 0.5 s later |
 | `factory_reset` | — | `resetting: true` | same wipe as the boot-hold gesture (both settings scopes too); the only reset path for a product with nothing pressable |
 | `settings.get` | `scope` (`product` default / `device`) | `product`, `values`, `defaults`, `seq`, `dirty`, `info?`, `error?` | poll `seq` to pick up knob-driven changes — it bumps **in RAM on every change**, not when the record is written, so a knob turn or button press is visible within one poll (the app's 3 s). Tying it to the write made device-side changes show up only after 5–30 s. `info{id: value}` (noknok.py 1.11+, only when the product registered any) = read-only live values (config_schema type `info`, e.g. a module temperature), computed on every call; they never change `seq`, so compare `info` itself to refresh |
