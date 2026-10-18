@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## code.py 0.20 - 2026-10-18
+
+- DEV-97 - no boot that starts a product skips the parked-module rescue any more. A connected boot whose daily update check was due used to skip it completely when the product has no `module_firmware`, the HTTPS session failed or nothing resolved (GitHub unreachable); those boots now rescue from the on-device firmware cache like offline boots do. A module that stays parked is reported loudly: a `MODULE STILL PARKED` log line, the `[RESCUE]` event in the history the app reads, and the buzzer/LED alert; every later boot retries. New host test `tools/test_rescue_paths.py`. Breaking: no.
+
 ## code.py 0.19 - 2026-10-18
 
 - DEV-99 - removed the setup-time `POST /firmware/check` route and the `firmware.check` op. On the setup hotspot the brain has no internet and manifests carry only minimum versions, so it could only ever answer "no update"; the app banner it fed never appeared. Module updates happen silently in the post-WiFi OTA pass (unchanged). Breaking: no (an older app calling the route gets 404 and shows nothing, as before).

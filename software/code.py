@@ -1,5 +1,14 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.19 (dead /firmware/check route removed — DEV-99)
+# Version: 0.20 (no WiFi boot skips the parked-module rescue — DEV-97)
+#
+# v0.20 changes (Sue): DEV-97 — a WiFi boot whose daily OTA check is due used
+#   to return early with NO parked-module rescue when the manifest has no
+#   module_firmware, the HTTPS session failed or nothing resolved (GitHub
+#   unreachable). Those paths now run the same cache rescue as offline and
+#   "not due" boots (_rescue_from_cache). A module that stays parked is
+#   reported loudly: a "MODULE STILL PARKED" log line, the [RESCUE] event in
+#   the Store history (status op), and the buzzer/LED alert; every later boot
+#   retries. No new cache: the OTA-time cache from 0.14 is the image source.
 #
 # v0.19 changes (Sue): DEV-99 — removed POST /firmware/check and the
 #   firmware.check op. At AP time the brain has no internet and manifests carry
@@ -297,7 +306,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.19"
+CODE_VERSION = "0.20"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -520,7 +529,24 @@ def _rescue_parked(c, get_image):
           f"reason={res.get('reason')} action={res.get('action')} "
           f"detail={res.get('detail')}")
     if res.get("action") != "reflashed":
+        # Report it loudly (DEV-97): the product starts a module short, so say
+        # so plainly in the log, in the event history the app reads (above),
+        # and with the buzzer/LED alert. Retried on every later boot.
+        log(f"[rescue] MODULE STILL PARKED: type={res.get('type')} uid={res.get('uid')} "
+            f"({res.get('detail')}) - the product starts without it; "
+            f"retried on the next boot")
         _field_alerts.append("rescue %s %s" % (res.get("action"), res.get("uid")))
+
+
+def _rescue_from_cache(why):
+    """Parked-module rescue with the on-device cache as the only image source.
+    Every connected boot that does NOT reach the online OTA pass calls this, so
+    no WiFi boot ever skips the rescue (DEV-97). Before 0.20 the due-boot early
+    returns below (no module_firmware, HTTPS setup failed, nothing resolved)
+    ran no rescue at all: a parked module stayed parked, silently. No network,
+    no filesystem write: one I2C read when nothing is parked."""
+    log(f"[fw] {why} — rescue from cache only")
+    get_conductor(rescue_get_image=_cached_image)
 
 # ── HTML pages ─────────────────────────────────────────────────────────────────
 
@@ -1736,15 +1762,20 @@ def check_and_flash_modules(module_firmware):
 
     Best-effort + crash-safe: any failure is logged and swallowed, and none
     blocks the rest of the boot. A failed I2C flash leaves that module safe in
-    its bootloader at 0x7E; the rescue pass (DEV-31) picks it up on a later
-    boot that runs it: every offline boot and every "not due" boot, but NOT a
-    due boot that returns early below (no module_firmware, HTTPS setup failed,
-    nothing resolved). A failed USB flash leaves the module in its bootloader
+    its bootloader at 0x7E; the rescue pass (DEV-31) picks it up on the next
+    boot, whatever that boot does: offline boots, "not due" boots and the
+    due-boot early returns below (no module_firmware, HTTPS setup failed,
+    nothing resolved) all run it from the on-device cache (DEV-97); the full
+    online pass runs it with a freshly refreshed cache. If it cannot help (no
+    cached image, wrong layout, unknown module), _rescue_parked() reports it
+    loudly and the next boot tries again. A failed USB flash leaves the module in its bootloader
     (PID 4E42): not bricked (it can be flashed again), but discover() skips
     bootloader-PID devices and there is no USB rescue, so it is not re-flashed
     automatically."""
     if not module_firmware:
-        return   # older app / no manifest fw block -> nothing to do
+        # Nothing to update, but a parked module must still be rescued.
+        _rescue_from_cache("product declares no module_firmware")
+        return
 
     # HTTPS session (correct DNS/SSL for the radio), used for both the rescue
     # image and the pre-flash fetch below.
@@ -1754,21 +1785,23 @@ def check_and_flash_modules(module_firmware):
         session = adafruit_requests.Session(pool, context)
     except Exception as e:
         log(f"[fw] OTA setup failed: {e}")
+        _rescue_from_cache("no HTTPS session")
         return
 
     # Not due yet? Then no GitHub round-trips at all this boot. The parked-
     # module rescue still runs — it is one I2C read — with the on-device cache
     # as its image source, exactly as on an offline boot.
     if not _ota_check_due():
-        log("[fw] update check not due (last < 24 h ago) — rescue from cache only")
-        get_conductor(rescue_get_image=_cached_image)
+        _rescue_from_cache("update check not due (last < 24 h ago)")
         return
     # Resolve the manifest's floors into concrete versions + URLs via the module
     # registry. Two small JSON fetches; everything downstream then works on the
     # {version, url} shape firmware_report() has always taken.
     resolved, stage1 = _resolve_module_firmware(session, module_firmware)
     if not resolved:
-        log("[fw] nothing resolved — skipping firmware check")
+        # GitHub unreachable or the registry/index unusable: no update this
+        # boot, but the cache can still rescue a parked module.
+        _rescue_from_cache("nothing resolved (registry unreachable?)")
         return
 
     # ── Refresh the on-device cache, BEFORE any Conductor exists ──────────────

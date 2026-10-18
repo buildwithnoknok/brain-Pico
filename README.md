@@ -275,7 +275,12 @@ Earlier features:
   module short. `get_conductor()` runs `rescue_parked_module()` **between** `Conductor()` and
   `enumerate_all()`, applies the same layout check, and pushes a good app back onto it. Logged
   as `[RESCUE]`. Proven 12 Sep 2026: an app that never armed its watchdog was parked by stage-1
-  1.2.0 and rescued over the bus by the ordinary boot path in 2 s — no SWD.
+  1.2.0 and rescued over the bus by the ordinary boot path in 2 s — no SWD. **Every boot that
+  starts a product runs it** (since code.py 0.20, DEV-97): the boots that skip the online update
+  (offline, not due, no `module_firmware`, no HTTPS, registry unreachable) use the on-device
+  cache. When it cannot help (no cached image, wrong layout, unknown module) the brain logs
+  `MODULE STILL PARKED`, writes the `[RESCUE]` event and plays the buzzer/LED alert; the next
+  boot retries. Test: `tools/test_rescue_paths.py` (host, tier S).
 - **No firmware check at setup.** The app shows no "update available" notice: module updates
   happen silently in this post-WiFi pass. The setup-time `POST /firmware/check` route was removed
   in code.py 0.19 (DEV-99) because, offline on the hotspot, it could only ever say "no update".
