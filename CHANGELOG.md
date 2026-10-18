@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## code.py 0.19 - 2026-10-18
+
+- DEV-99 - removed the setup-time `POST /firmware/check` route and the `firmware.check` op. On the setup hotspot the brain has no internet and manifests carry only minimum versions, so it could only ever answer "no update"; the app banner it fed never appeared. Module updates happen silently in the post-WiFi OTA pass (unchanged). Breaking: no (an older app calling the route gets 404 and shows nothing, as before).
+
 ## noknok.py 1.14 - 2026-10-18
 
 - DEV-101 - the runtime Store looks for an I2C FRAM at 0x50 only when `settings.toml` says `NOKNOK_FRAM = 1`. Before, it probed unless the setting was `0`, so an unrelated EEPROM/FRAM a maker wired to 0x50 could silently become the Store; without the setting the Store now never touches the I2C bus. New host test `tools/test_store_fram_optin.py`. Breaking: only for a brain that relied on an FRAM without setting `NOKNOK_FRAM = 1` (no noknok board fits one); add the setting to keep using it.

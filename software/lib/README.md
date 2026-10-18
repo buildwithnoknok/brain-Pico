@@ -7,7 +7,7 @@ built without fetching a bundle. Copy the whole folder to `/lib` on the Pico.
 
 | File | For |
 |------|-----|
-| `adafruit_httpserver/` | the setup-AP HTTP server (`/connect`, `/roles/*`, `/firmware/check`) |
+| `adafruit_httpserver/` | the setup-AP HTTP server (`/connect`, `/roles/*`, `/rpc`) |
 | `adafruit_requests.mpy` + `adafruit_connection_manager.mpy` | HTTPS downloads (product script, firmware index + images) |
 | `adafruit_ntp.mpy` | optional wall-clock sync for log timestamps |
 

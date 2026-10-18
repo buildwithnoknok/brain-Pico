@@ -62,8 +62,8 @@ it. Subsequent boots reconnect to WiFi and re-run the product directly.
 provisioning uses WiFi AP instead. Full process, test steps, and gotchas are documented in
 Confluence: *Software Development -> Pico W Provisioning — Process & Implementation*.
 
-**HTTP API reference:** the app ↔ brain endpoints (`/connect`, `/firmware/check`,
-`/roles/assign`, and the planned `/settings`) are documented in
+**HTTP API reference:** the app ↔ brain endpoints (`/connect`, `/roles/assign`, `POST /rpc`)
+are documented in
 [docs/provisioning-http-api.md](docs/provisioning-http-api.md).
 
 ## Filesystem policy (DEV-18)
@@ -276,8 +276,9 @@ Earlier features:
   `enumerate_all()`, applies the same layout check, and pushes a good app back onto it. Logged
   as `[RESCUE]`. Proven 12 Sep 2026: an app that never armed its watchdog was parked by stage-1
   1.2.0 and rescued over the bus by the ordinary boot path in 2 s — no SWD.
-- `POST /firmware/check` (AP time) reports installed versions only and returns
-  `resolved:false` — on the setup AP the Pico has no internet and cannot reach the registry.
+- **No firmware check at setup.** The app shows no "update available" notice: module updates
+  happen silently in this post-WiFi pass. The setup-time `POST /firmware/check` route was removed
+  in code.py 0.19 (DEV-99) because, offline on the hotspot, it could only ever say "no update".
 - Crash-safe throughout — a failed flash leaves the module safe in its bootloader (`0x7E`).
   Outcomes go to the serial console and the Store's event history (`[FW]`/`[RESCUE]`/`[CRASH]`
   audit trail, last 40 lines). The post-flash re-enumerate deliberately does **not** wipe the

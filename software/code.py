@@ -1,5 +1,13 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.18 (factory reset by boot-hold — one gesture for every product)
+# Version: 0.19 (dead /firmware/check route removed — DEV-99)
+#
+# v0.19 changes (Sue): DEV-99 — removed POST /firmware/check and the
+#   firmware.check op. At AP time the brain has no internet and manifests carry
+#   only floors ({"min"}), so it could never answer anything but
+#   update_needed:false and the app's "update available" banner never showed
+#   (the app 1.5.3 no longer calls it; an older app gets 404 and shows nothing,
+#   as before). Module updates happen silently in the post-WiFi OTA pass
+#   (check_and_flash_modules), which is unchanged.
 #
 # v0.18 changes (Sue): factory reset by BOOT-HOLD.
 #   - Hold any LED Button or Knob button while plugging in the power and keep
@@ -250,8 +258,8 @@
 #          AP is offered, credentials kept
 #   2. No credentials -> AP provisioning:
 #        - Start hotspot "noknok-setup" (open network)
-#        - Serve the setup form, the form routes (/connect, /roles/*,
-#          /firmware/check) and POST /rpc at 192.168.4.1 via adafruit_httpserver
+#        - Serve the setup form, the form routes (/connect, /roles/*)
+#          and POST /rpc at 192.168.4.1 via adafruit_httpserver
 #        - Captive-portal probe paths serve the setup page so the OS shows "Sign in"
 #        - On /connect -> reply "Connected!" at once (before the join or any
 #          save, DEV-100) -> stop AP -> try home WiFi -> on success save creds +
@@ -289,7 +297,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.18"
+CODE_VERSION = "0.19"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -837,26 +845,6 @@ def _do_roles_assign(role_id, module_type, exclude):
     log(f"[roles] assigned role_id='{role_id}' uid={uid} saved={saved}")
     return {"uid": uid, "type": module_type, "saved": saved}
 
-def _do_firmware_check(module_firmware):
-    """Installed firmware per module. At AP time there is no internet, so this
-    cannot reach the registry and only reports what is installed; the real
-    check is the headless post-WiFi pass (resolved:false says so)."""
-    c = get_conductor()
-    if c is None:
-        return {"update_needed": False, "resolved": False, "modules": []}
-    try:
-        report = c.firmware_report(module_firmware or {})
-    except Exception as e:
-        log(f"[fw] firmware check error: {e}")
-        report = []
-    slim = [{"type": r["type"], "installed": r["installed"],
-             "required": r["required"], "needs_update": r["needs_update"]}
-            for r in report]
-    log(f"[fw] firmware check — {len(slim)} module(s) present; version "
-        f"resolution needs internet, deferred to the post-WiFi pass")
-    return {"update_needed": any(r["needs_update"] for r in report),
-            "resolved": False, "modules": slim}
-
 def _settings_for(args):
     scope = args.get("scope") or "product"
     if scope not in ("product", "device"):
@@ -963,7 +951,6 @@ def register_ops():
     d.register("settings.reset", _h_settings_reset)
     d.register("roles.assign", lambda a, m: _do_roles_assign(
         a.get("role_id"), a.get("module_type") or "", list(a.get("exclude") or [])))
-    d.register("firmware.check", lambda a, m: _do_firmware_check(a.get("module_firmware")))
     d.register("provision", lambda a, m: _do_provision(
         a.get("ssid"), a.get("password"), a.get("script_url"),
         a.get("module_firmware"), a.get("product_id"), a.get("config_defaults")))
@@ -1018,22 +1005,6 @@ def register_routes(server):
         # it acts after the success page has been delivered to the browser.
         _do_provision(ssid, pw, url, module_firmware, pid or None, config_defaults)
         return Response(request, HTML_SUCCESS, content_type="text/html")
-
-    # ── Firmware version check (v0.10) ───────────────────────────────────────
-    # Called by the app BEFORE /connect (still on the noknok-setup AP) so it can
-    # tell the user "firmware update available" up front. Reads installed versions
-    # over I2C (GET_VERSION) and compares against the manifest's module_firmware{}.
-    # No flashing here — the actual OTA happens headless once the Pico has WiFi.
-    @server.route("/firmware/check", POST)
-    def _firmware_check(request: Request):
-        form = request.form_data
-        mf_raw = (_url_decode(form.get("module_firmware") or "").strip()
-                  if form else "")
-        try:
-            module_firmware = json.loads(mf_raw) if mf_raw else {}
-        except Exception:
-            module_firmware = {}
-        return _json(request, _do_firmware_check(module_firmware))
 
     # ── Role assignment endpoints (v0.8) ─────────────────────────────────────
     # Called by the noknok app BEFORE /connect, while the phone is on the

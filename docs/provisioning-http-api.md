@@ -19,8 +19,8 @@ portal setup page). This is the app ↔ brain contract.
   is on the `noknok-setup` AP**, before `/connect` hands the Pico onto home WiFi.
   Since code.py 0.17 the brain also serves **`POST /rpc`** (JSON, see below) on the
   AP *and* on home WiFi for the product's whole lifetime; the form endpoints are
-  adapters over the same handlers. Today (app 1.5.2) the app still runs **all of setup**
-  over the form endpoints (`/roles/assign`, `/firmware/check`, `/connect`) and uses `/rpc`
+  adapters over the same handlers. Today (app 1.5.3) the app still runs **all of setup**
+  over the form endpoints (`/roles/assign`, `/connect`) and uses `/rpc`
   only after setup (`hello`, `settings.*`).
 - **⚠ Client requirement — route over the hotspot.** `noknok-setup` has no internet, so
   Android (and iOS) keep mobile data as the default network while the phone is joined to
@@ -43,33 +43,17 @@ Serves the HTML WiFi-setup page. Captive-portal probe paths
 (`/hotspot-detect.html`, `/generate_204`, `/ncsi.txt`, `/connecttest.txt`, …) also
 return this page so the OS shows a "Sign in to network" prompt.
 
-### `POST /firmware/check`
-Report each connected module's **installed** firmware. Read-only — **no flashing**
-happens here (that runs headless once the Pico is on WiFi).
-
-| Field | Value |
-|-------|-------|
-| `module_firmware` | JSON string: the manifest's `module_firmware{}` block, e.g. `{"buzzer":{"min":"3.3.1"}}` |
-
-**Response** `application/json`:
-```json
-{ "update_needed": false,
-  "resolved": false,
-  "modules": [ {"type":"buzzer","installed":"3.3.0","required":null,"needs_update":false} ] }
-```
-
-> **`resolved` is always `false` here, and `update_needed` with it.** This endpoint
-> runs while the phone is on the `noknok-setup` AP, so the Pico has **no internet**
-> and cannot reach the module registry to find out what the current firmware
-> version is. It can only report what is installed. Manifests carry a floor
-> (`min`), not a version to install, so there is nothing to compare against
-> offline. The real check — resolve, gate, download, flash — runs after the WiFi
-> join in `check_and_flash_modules()`. See
-> [Module Firmware Index](https://github.com/buildwithnoknok/Ecosystem/blob/main/software/firmware-index.md).
-
-Consequence: the app's "update available" banner, driven by `update_needed`, never
-shows today (DEV-99). The `modules[]` list is still useful to the app as a "what did
-the brain actually see" confirmation. Degrades gracefully (`modules:[]`) if there is no Conductor/bus.
+### Module firmware during setup: nothing to call
+There is **no firmware endpoint at setup time.** Module updates happen **silently** in the
+brain's OTA pass after it joins home WiFi (`check_and_flash_modules()` in `code.py`):
+resolve each module's current version from the
+[Module Firmware Index](https://github.com/buildwithnoknok/Ecosystem/blob/main/software/firmware-index.md),
+gate, download, flash. Outcomes land in the event history (`status` op, `[FW]` / `[RESCUE]`).
+The app sends the manifest's `module_firmware{}` only inside `/connect` / `provision`.
+`POST /firmware/check` and the `firmware.check` op existed until code.py 0.18; they were
+removed in 0.19 (DEV-99) because, offline on the hotspot and with floor-only manifests, they
+could only ever answer "no update". An older app that still calls the route gets HTTP 404
+and shows nothing, exactly as before.
 
 ### `POST /roles/assign`  (preferred)
 Detect which module the customer interacts with **and** save the role in one round
@@ -202,7 +186,6 @@ home LAN); pairing / authorisation is DEV-35. Implementation: `software/noknok_r
 | `hello` | — | `device`, `name`, `state` (`unprovisioned` / `provisioned` / `parked`), `product{id,script,script_url}`, `versions{code,noknok,noknok_usb,rpc,circuitpython}`, `online`, `ap`, `carrier`, `uptime`, `ops[]` | open, cheap — call first |
 | `status` | `since` (int, optional) | `state`, `strikes`, `store` (`fram`/`nvm`), `drive_visible`, `mem_free`, `ip`, `modules[{type,uid,fw}]`, `events[]`, `events_total` | phase-1 subset; DEV-36 adds firmware state |
 | `roles.assign` | `role_id`, `module_type`, `exclude[]` | `uid`, `type`, `saved` / `timeout` | = `/roles/assign`; blocks ≤ 20 s |
-| `firmware.check` | `module_firmware{}` | as `/firmware/check` | AP time only: `resolved:false` |
 | `provision` | `ssid`, `password`, `script_url`, `module_firmware`, `product_id`, `config_defaults` | `accepted`, `mode` (`setup` / `switch`), `rebooting` | on the AP = `/connect`; on home WiFi = **product switch**: the network stays (a different `ssid` is refused — use setup mode), the request is parked, the brain reboots, downloads + compiles the new script **before** touching anything, and only on success replaces `product.py`, saves the new product and installs its `config_defaults`. A bad URL / dead uplink keeps product, settings and firmware as they were (`[CFG] product switch FAILED` event). |
 | `reboot` | — | `rebooting: true` | flushes settings, replies, resets 0.5 s later |
 | `factory_reset` | — | `resetting: true` | same wipe as the boot-hold gesture (both settings scopes too); the only reset path for a product with nothing pressable |
