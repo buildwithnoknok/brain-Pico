@@ -21,3 +21,14 @@ Rules that cost time to learn:
 - After a power-on a brain needs ~25 s before the product runs; leave the console alone until then.
 - Keep logs and backups in `~/` on the Pi, not `/tmp` (wiped on reboot).
 - `wifi.json` holds a real WiFi password: never print it, delete host copies after a test.
+
+DEV-97 / DEV-74 bench scripts (Bob, 19 Oct 2026; all run with `pico.py run`):
+
+| File | What it does |
+|---|---|
+| `bench_dev97_state.py` | Read-only: parked module at 0x7E on each bus, modules + UIDs, `/data` and `/` listing. |
+| `bench_dev97_fixture.py` | Writes a fake `/data/wifi.json` (SSID that does not exist, no secret) + minimal `/data/product.py` so the brain takes the offline-with-product boot path. `REMOVE = True` undoes it. |
+| `bench_dev97_park.py` | Parks the Buzzer in its bootloader (ERASE, nothing written) after enumerating, so the rescue knows its UID. |
+| `bench_dev97_recover.py` | Reflashes a parked Buzzer from `/data/fw_buzzer.bin` or `/buzzer_firmware.bin` on the Pico. |
+| `bench_dev74_settings.py` | Rewrites `/settings.toml` for one failure scenario (`MODE` = noB, nopins, typo, restore); reboot afterwards. |
+| `bench_dev74_drive.py` | Drives the Buzzer (bus A) and LED Button (bus B) and checks `i2c_bus` + `by_uid()` across buses. |
