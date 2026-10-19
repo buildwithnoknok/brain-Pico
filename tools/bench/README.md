@@ -32,3 +32,7 @@ DEV-97 / DEV-74 bench scripts (Bob, 19 Oct 2026; all run with `pico.py run`):
 | `bench_dev97_recover.py` | Reflashes a parked Buzzer from `/data/fw_buzzer.bin` or `/buzzer_firmware.bin` on the Pico. |
 | `bench_dev74_settings.py` | Rewrites `/settings.toml` for one failure scenario (`MODE` = noB, nopins, typo, restore); reboot afterwards. |
 | `bench_dev74_drive.py` | Drives the Buzzer (bus A) and LED Button (bus B) and checks `i2c_bus` + `by_uid()` across buses. |
+| `bench_dev74_cutenum.py` | DEV-74 step 7: arms the Pico watchdog (hard reset) while `enumerate()` runs, to cut it mid-sweep. |
+| `bench_dev97_cut.py` | DEV-97 step 4: parks the Display, flashes it and hard-resets the brain after `CUT_AT` bytes. |
+| `bench_dev98_downgrade.py` | DEV-98: flashes an older Display app (`/display_050.bin`) and makes the daily OTA check due. |
+| `bench_factory_reset.py` | Clears wifi.json, product.py and the Store copy of the credentials (brain not reachable on the LAN). |
