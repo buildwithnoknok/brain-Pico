@@ -36,3 +36,4 @@ DEV-97 / DEV-74 bench scripts (Bob, 19 Oct 2026; all run with `pico.py run`):
 | `bench_dev97_cut.py` | DEV-97 step 4: parks the Display, flashes it and hard-resets the brain after `CUT_AT` bytes. |
 | `bench_dev98_downgrade.py` | DEV-98: flashes an older Display app (`/display_050.bin`) and makes the daily OTA check due. |
 | `bench_factory_reset.py` | Clears wifi.json, product.py and the Store copy of the credentials (brain not reachable on the LAN). |
+| `bench_dev98_downgrade16.py` | DEV-98: flashes an older LEDs 16x app (`/leds16_202.bin`) through the Pico USB host, makes the OTA check due, hard-resets. Needs two runs (the bootloader is not seen on the first, DEV-45/DEV-133); then `tools/usb_bench/leds_ota_bl.py` finishes the flash. Images: module repo `firmware/bin` at commit `2d1856a` is v2.2.0 (the oldest that reports type 0x06). |
