@@ -38,4 +38,12 @@ done
 sleep 4
 AFTER=$(timeout 60 python3 pico.py run uptime_pico.py 40 2>&1 | grep -o 'monotonic=[0-9.]*' | head -1)
 echo "after  : $AFTER  (serial back after ${i}s)"
-echo "VERDICT: 'after' SMALLER than 'before' = the Pico really reset."
+# Compute the verdict (it used to print a fixed "really reset" line, whatever the clocks said).
+B=${BEFORE#monotonic=}; A=${AFTER#monotonic=}
+if [ -z "$B" ] || [ -z "$A" ]; then
+    echo "VERDICT: UNKNOWN - could not read the Pico clock before/after (before='$B' after='$A')."
+elif [ "$(echo "$A $B" | awk '{ print ($1 < $2) ? "yes" : "no" }')" = "yes" ]; then
+    echo "VERDICT: RESET - 'after' ($A) is SMALLER than 'before' ($B): the Pico really lost power."
+else
+    echo "VERDICT: NOT RESET - 'after' ($A) is not smaller than 'before' ($B): this method did NOT cut the Pico's power."
+fi
