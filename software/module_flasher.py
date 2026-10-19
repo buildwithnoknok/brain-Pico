@@ -63,6 +63,7 @@ _ERRMSG = {
     6: "BOOT with no valid app",
     7: "app unhealthy - stage-1 stopped booting it after 3 failed attempts",
     8: "VERIFY_STAGE1: staged image is not a stage-1 for this layout (bad header)",
+    9: "VERIFY: image is not an app for this chip / flash layout (no matching app header)",
 }
 
 
@@ -164,7 +165,9 @@ class ModuleFlasher:
     def erase(self):
         if not self._write(BL_ADDR, [CMD_ERASE]):
             raise FlashError("ERASE not acknowledged")
-        self._wait_ready(timeout=3.0)
+        # V003: 11 KB; the PicoHub's CH32X035 erases its whole 57 KB app region
+        # (57 x 1 KB), during which its I2C ISR stalls too (DEV-124).
+        self._wait_ready(timeout=10.0)
 
     def write_chunk(self, offset, data):
         """Program one ≤64-byte page at app-relative offset (0xFF-padded to 64)."""

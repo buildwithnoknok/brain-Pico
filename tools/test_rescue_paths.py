@@ -5,6 +5,7 @@
 #
 # Proves that no connected boot skips the parked-module rescue, and that a
 # rescue that cannot help is reported loudly:
+#   3. DEV-124: the PicoHub (carrier) is always resolved; the V003 stage-1 pass skips its X035.
 #   1. check_and_flash_modules() runs the cache rescue on every early return:
 #      no module_firmware / HTTPS session failed / update not due / nothing
 #      resolved (GitHub unreachable).
@@ -130,6 +131,45 @@ check("successful rescue: event, no alert, no STILL PARKED",
 ns["_field_alerts"].clear(); evs.clear()
 ns["_rescue_parked"](FakeConductor(None), real_cached)
 check("nothing parked: silent", not evs and not ns["_field_alerts"])
+
+# ── 3. DEV-124: the carrier (PicoHub) is always in the OTA pass ─────────────
+print("\nDEV-124: the PicoHub's own firmware")
+seen_mf = []
+ns["_ota_check_due"] = lambda: True
+ns["_resolve_module_firmware"] = lambda session, mf: (seen_mf.append(dict(mf)), ({}, None))[1]
+acm.get_radio_socketpool = lambda r: object()
+sys.modules["adafruit_requests"].Session = lambda pool, ctx: object()
+ns["log"] = lambda msg: None
+for label, mf in (("product with no module_firmware", None), ("product with a buzzer", MF)):
+    seen_mf.clear()
+    ns["check_and_flash_modules"](mf)
+    check("%s: picohub resolved too" % label, bool(seen_mf) and "picohub" in seen_mf[0], seen_mf)
+check("the product's own floors are kept", bool(seen_mf) and seen_mf[0].get("buzzer") == {"min": "3.3.1"})
+
+
+class FakeHub:
+    _uid_hex, address = "7777777777777777", 0x08
+
+
+class StageConductor:
+    _FW_GROUPS = (("buzzer", "buzzer"), ("_picohub_fw", "picohub"))
+    buzzer, _picohub_fw = [], [FakeHub()]
+    bl_reads = []
+
+    def by_uid(self, uid):
+        return FakeHub() if uid == FakeHub._uid_hex else None
+
+    def bootloader_version(self, entry):
+        self.bl_reads.append(entry)
+
+
+ns["_cache_read"] = lambda key: (b"s1", {"version": "1.2.0"})
+ns["_field_alerts"].clear(); evs.clear()
+sc = StageConductor()
+ns["_stage1_pass"](sc, {"version": "1.2.0", "layout": 2, "url": "x", "size": 1, "crc32": "0"})
+check("stage-1 pass: X035 skipped without a bootloader round trip", not sc.bl_reads, sc.bl_reads)
+check("stage-1 pass: no alert, no event for the X035", not ns["_field_alerts"] and not evs,
+      (ns["_field_alerts"], evs))
 
 print("\n%s (%d failure%s)" % ("PASS" if not fails else "FAIL", fails, "" if fails == 1 else "s"))
 sys.exit(1 if fails else 0)

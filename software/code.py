@@ -1,5 +1,14 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.23 (status op reports the PicoHub power manager — DEV-123)
+# Version: 0.24 (the PicoHub power manager is kept up to date — DEV-124)
+#
+# v0.24 changes (Sam): DEV-124 — the carrier's own firmware joins the module OTA
+#   pass. Products never list the board they sit on, so check_and_flash_modules()
+#   always adds CARRIER_FIRMWARE ("picohub", no floor) to the manifest's types:
+#   its index.json is resolved, the image cached, and the power manager updated
+#   (and rescued when parked) like any module. A brain without a PicoHub only
+#   pays one cached download per published version. The stage-1 pass skips the
+#   PicoHub (STAGE1_OWN_LINE): its CH32X035 stage-1 has its own version line, so
+#   comparing it with the published CH32V003 stage-1 would raise a daily alert.
 #
 # v0.23 changes (Sue): DEV-123 — the status op carries `power`: the noknok
 #   PicoHub's status (charger contract, input, 5 V rail, temperature, rails,
@@ -331,7 +340,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.23"
+CODE_VERSION = "0.24"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -1586,6 +1595,12 @@ def _semver3(s):
         return None
 
 
+# Module types whose bootloader is another chip family than the stage-1 published in
+# the registry (the CH32V003 one): their stage-1 is never touched by _stage1_pass().
+# The PicoHub's CH32X035 stage-1 (layout 3) has its own version line; an over-the-air
+# X035 stage-1 rollout would need its own registry entry (not wired yet, DEV-124).
+STAGE1_OWN_LINE = {"picohub": "CH32X035"}
+
 def _stage1_pass(c, s1):
     """Bring every I2C module's stage-1 bootloader up to the published version.
 
@@ -1623,6 +1638,12 @@ def _stage1_pass(c, s1):
     for mf_key, uid in targets:
         m = c.by_uid(uid) if uid else None
         if m is None:
+            continue
+        if mf_key in STAGE1_OWN_LINE:
+            # Another chip family: its stage-1 has its own versions and layout, so the
+            # published (CH32V003) stage-1 is not for it. Without this the pass would
+            # compare unrelated version numbers and raise a field alert every day.
+            log(f"[bl] {mf_key} {uid}: {STAGE1_OWN_LINE[mf_key]} bootloader, own stage-1 line — skipped")
             continue
         entry = {"bus": "i2c", "address": m.address, "uid": uid, "type": mf_key}
         if not hasattr(m, "bootloader"):
@@ -1979,6 +2000,10 @@ def _verify_image(image, size, crc32):
         if got != want:
             raise ValueError("image crc32 %08x != declared %08x" % (got, want))
 
+# Firmware of the board the brain sits on, resolved and updated on every OTA pass
+# whatever the product declares (manifest key -> floor spec, like module_firmware).
+CARRIER_FIRMWARE = {"picohub": {}}
+
 def check_and_flash_modules(module_firmware):
     """Bring every connected module (I2C + USB) up to the manifest's
     module_firmware{} versions before product.py runs. Headless (Pico already
@@ -2006,6 +2031,10 @@ def check_and_flash_modules(module_firmware):
     (PID 4E42): not bricked (it can be flashed again), but discover() skips
     bootloader-PID devices and there is no USB rescue, so it is not re-flashed
     automatically."""
+    # The carrier's firmware is not the product's business: always in (DEV-124).
+    module_firmware = dict(module_firmware or {})
+    for mtype, spec in CARRIER_FIRMWARE.items():
+        module_firmware.setdefault(mtype, spec)
     if not module_firmware:
         # Nothing to update, but a parked module must still be rescued.
         _rescue_from_cache("product declares no module_firmware")

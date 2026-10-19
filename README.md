@@ -419,7 +419,13 @@ if hub:
 - `status()` / `source_caps()` are CRC-checked, retried once, then raise `noknok.PicoHubError`
   (also when the board does not answer). Nothing is polled in the background: one I2C exchange per
   call. The `status` op of `/rpc` carries the same dict as `power`.
-- No firmware update for the PicoHub yet (no bootloader on the X035 until DEV-124).
+- Firmware update (v1.17 / code.py 0.24, DEV-124): the X035 runs the noknok I2C bootloader (flash
+  layout 3), so the brain updates it like any module: manifest key `picohub` in `firmware_report()` /
+  `update_all()`, rescued by `rescue_parked_module()` when an update was cut. Products never list the
+  board they sit on, so `code.py` always adds `picohub` to the types its daily OTA pass resolves
+  (`CARRIER_FIRMWARE`), and its stage-1 pass leaves the X035 alone (`STAGE1_OWN_LINE`: the published
+  stage-1 is the CH32V003 one). After an update the power manager enumerates again at `0x7F` and gets
+  its usual address back.
 - Modules without a driver now keep their address reserved in the saved state, like the PicoHub,
   so after a Pico reboot no newcomer can be given an address that is still in use.
 - Test: `tools/test_picohub.py` (host, tier S, a fake power manager speaking the command map).

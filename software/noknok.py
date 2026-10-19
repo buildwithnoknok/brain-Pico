@@ -89,6 +89,10 @@
 #             CRC-checked, one retry, then PicoHubError. Modules without a driver
 #             now keep their address reserved in the saved state. No OTA for
 #             0x07 until its bootloader exists (DEV-124).
+# v1.17 (Sam): DEV-124 — firmware update for the PicoHub power manager (type
+#             0x07, CH32X035, bootloader layout 3): "picohub" joins the firmware
+#             groups and the parked-module rescue map; the X035 stage-1's
+#             refusal of a foreign image (error 9) has a plain message.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -109,7 +113,7 @@ import json
 import os
 import struct
 
-__version__ = "1.16"
+__version__ = "1.17"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -1383,8 +1387,15 @@ class Conductor:
     # module list attribute -> manifest module_firmware{} key
     # I2C modules carry a runtime address; USB modules are identified by serial.
     _FW_GROUPS     = (("buzzer", "buzzer"), ("knob", "knob"), ("ledbutton", "led_button"),
-                      ("display", "display"))
+                      ("display", "display"), ("_picohub_fw", "picohub"))
     _USB_FW_GROUPS = (("leds", "usb_leds"), ("leds16", "usb_leds_16x"))
+
+    @property
+    def _picohub_fw(self):
+        """The carrier's power manager as a firmware group (a list, like the
+        other types): c.picohub is a single object, None without a PicoHub."""
+        hub = getattr(self, "picohub", None)
+        return [hub] if hub is not None else []
 
     @staticmethod
     def _parse_semver(s):
@@ -1700,11 +1711,13 @@ class Conductor:
 
     # Type code (as saved in noknok_state.json) -> manifest module_firmware key.
     _TYPE_TO_MF_KEY = {TYPE_BUZZER: "buzzer", TYPE_KNOB: "knob",
-                       TYPE_LEDBUTTON: "led_button", TYPE_DISPLAY: "display"}
+                       TYPE_LEDBUTTON: "led_button", TYPE_DISPLAY: "display",
+                       TYPE_PICOHUB: "picohub"}
     # Types with a driver but deliberately NO firmware update yet (no bootloader
     # on the module): OTA would only fail, and retry every day. Move into
-    # _TYPE_TO_MF_KEY + _FW_GROUPS when the bootloader exists.
-    _NO_OTA_YET = {TYPE_PICOHUB: ("picohub", "DEV-124: X035 bootloader")}
+    # _TYPE_TO_MF_KEY + _FW_GROUPS when the bootloader exists. Empty since
+    # DEV-124 (the PicoHub's X035 got its bootloader); kept for the registry test.
+    _NO_OTA_YET = {}
 
     def rescue_parked_module(self, get_image, logfn=print, state_file="noknok_state.json"):
         """

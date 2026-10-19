@@ -15,7 +15,7 @@
 #   - after a Pico reboot the PicoHub (which keeps its address) is restored and
 #     its address is never handed to a newcomer; a module type WITHOUT a driver
 #     keeps its address reserved the same way
-#   - 0x07 stays out of the firmware report (no OTA until DEV-124)
+#   - 0x07 is in the firmware report as "picohub" (OTA since DEV-124)
 #
 # Run from the repo root:   python -I tools/test_picohub.py
 
@@ -225,8 +225,10 @@ check("counted, version read (0.2.0)", n == 2 and p.firmware_version == "0.2.0",
 check("in the registry by UID", c.by_uid("7777777777777777") is p)
 state = noknok.store().get("state")
 check("saved with type 7 (its address is remembered)", state["7777777777777777"]["type"] == 0x07)
-check("NOT in the firmware report (no OTA until DEV-124)",
-      all(r["uid"] != "7777777777777777" for r in c.firmware_report({"picohub": {"version": "9.9.9"}})))
+_rep = [r for r in c.firmware_report({"picohub": {"version": "9.9.9"}}, layout_gate=False)
+        if r["uid"] == "7777777777777777"]
+check("in the firmware report as 'picohub' (OTA since DEV-124)",
+      len(_rep) == 1 and _rep[0]["type"] == "picohub" and _rep[0]["bus"] == "i2c", _rep)
 
 # ── status ───────────────────────────────────────────────────────────────────
 print("\nstatus()")

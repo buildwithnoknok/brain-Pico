@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## noknok.py 1.17 + code.py 0.24 - 2026-10-19
+
+- DEV-124 - firmware update for the PicoHub's power manager (module type `0x07`, CH32X035, bootloader flash layout 3). `noknok.py`: `picohub` joins the firmware groups (`firmware_report()`, `update_all()`) and the parked-module rescue map; `module_flasher`: plain message for the X035 bootloader's new error 9 (image not built for this chip) and a 10 s erase timeout (the X035 erases 57 KB). `code.py`: the board the brain sits on is always part of the daily OTA pass (`CARRIER_FIRMWARE`), whatever the product lists; the stage-1 pass skips the X035 (`STAGE1_OWN_LINE`), whose stage-1 has its own version line, instead of raising a daily alert. Host tests: `tools/test_picohub.py` (PicoHub now in the firmware report), `tools/test_rescue_paths.py` (carrier always resolved, stage-1 pass skips it). Bench: module repo `firmware/test/bl_x035_bench.py`. Breaking: no.
+
 ## noknok.py 1.16 + code.py 0.23 - 2026-10-19
 
 - DEV-123 - new driver `NoknokPicoHub` for the noknok PicoHub's power manager (module type `0x07`), available as `c.picohub` (`None` without one): `status()`, `source_caps()`, `set_rail()`, `cycle_rail()`, `reset_pico()`, `set_min_input_voltage()`, `clear_faults()`. Replies are CRC-checked with one retry, then `noknok.PicoHubError`; steering calls return the board's result code. The `status` op of `/rpc` carries the power status as `power`, and no longer lists modules without a driver. Modules without a driver now keep their address reserved in the saved state, so after a brain reboot a new module can no longer be given an address that is still in use. The PicoHub gets no firmware update from the brain yet. New host test `tools/test_picohub.py`; `tools/test_registry_complete.py` knows types listed in the registry that are deliberately not updated yet. Breaking: no.
