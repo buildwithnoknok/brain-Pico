@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## noknok.py 1.16 + code.py 0.23 - 2026-10-19
+
+- DEV-123 - new driver `NoknokPicoHub` for the noknok PicoHub's power manager (module type `0x07`), available as `c.picohub` (`None` without one): `status()`, `source_caps()`, `set_rail()`, `cycle_rail()`, `reset_pico()`, `set_min_input_voltage()`, `clear_faults()`. Replies are CRC-checked with one retry, then `noknok.PicoHubError`; steering calls return the board's result code. The `status` op of `/rpc` carries the power status as `power`, and no longer lists modules without a driver. Modules without a driver now keep their address reserved in the saved state, so after a brain reboot a new module can no longer be given an address that is still in use. The PicoHub gets no firmware update from the brain yet. New host test `tools/test_picohub.py`; `tools/test_registry_complete.py` knows types listed in the registry that are deliberately not updated yet. Breaking: no.
+
 ## code.py 0.22 - 2026-10-18
 
 - DEV-100 - setup now tells the app when the WiFi join fails. New op `wifi.scan` lists the networks the device can see. `provision` (and the `/connect` form) refuse a network that is not visible (`reason: network_not_found`, hotspot kept; `force` for a hidden network) and answer with a `join_id`. A failed join is remembered in RAM and shown in `hello` as `setup.last_join` (`auth` / `not_found` / `timeout` / `other` / `not_saved`) once the hotspot is back; a wrong password stops retrying at once; the device plays its alert and blinks its own LED. The browser page says "Connecting...", not "Connected!". Nothing new is written to the filesystem. New host test `tools/test_setup_join.py`. Breaking: no (app 1.5.3 and older keep working, without the feedback).

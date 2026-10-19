@@ -83,6 +83,12 @@
 #             turn, still ~3 s), one shared address space, c.i2c_b, module.i2c_bus,
 #             "i2c_bus" in the saved state and firmware_report(); rescue probes
 #             both buses; Conductor.deinit() releases both.
+# v1.16 (Sue): DEV-123 — NoknokPicoHub driver (type 0x07, the noknok PicoHub's
+#             power manager) as c.picohub: status(), source_caps(), set_rail(),
+#             cycle_rail(), reset_pico(), set_min_input_voltage(), clear_faults();
+#             CRC-checked, one retry, then PicoHubError. Modules without a driver
+#             now keep their address reserved in the saved state. No OTA for
+#             0x07 until its bootloader exists (DEV-124).
 #
 # Quick start:
 #   from noknok import Conductor
@@ -103,7 +109,7 @@ import json
 import os
 import struct
 
-__version__ = "1.15"
+__version__ = "1.16"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -1212,6 +1218,7 @@ class Conductor:
     TYPE_KNOB      = 0x02
     TYPE_LEDBUTTON = 0x03
     TYPE_DISPLAY   = 0x05
+    TYPE_PICOHUB   = 0x07    # noknok PicoHub power manager (DEV-123), c.picohub
 
     # Standard system commands — reserved ecosystem range 0xB0-0xBF, honoured by
     # every noknok module (see DEV-1 / the bootloader doc). 0xB0 = ENTER_BOOTLOADER.
@@ -1244,6 +1251,7 @@ class Conductor:
         self.knob      = []    # NoknokKnob instances
         self.ledbutton = []    # NoknokLedButton instances
         self.display   = []    # NoknokDisplay instances
+        self.picohub   = None  # NoknokPicoHub - the carrier's power manager, None without one
         self.leds      = []    # NoknokLEDs (USB, 8x RGB) instances, populated by enumerate_usb()
         self.leds16    = []    # NoknokLEDs16 (USB, 16x RGBW) instances, ditto (DEV-46)
         self.role      = {}    # role_name → module object, populated by load_roles()
@@ -1693,6 +1701,10 @@ class Conductor:
     # Type code (as saved in noknok_state.json) -> manifest module_firmware key.
     _TYPE_TO_MF_KEY = {TYPE_BUZZER: "buzzer", TYPE_KNOB: "knob",
                        TYPE_LEDBUTTON: "led_button", TYPE_DISPLAY: "display"}
+    # Types with a driver but deliberately NO firmware update yet (no bootloader
+    # on the module): OTA would only fail, and retry every day. Move into
+    # _TYPE_TO_MF_KEY + _FW_GROUPS when the bootloader exists.
+    _NO_OTA_YET = {TYPE_PICOHUB: ("picohub", "DEV-124: X035 bootloader")}
 
     def rescue_parked_module(self, get_image, logfn=print, state_file="noknok_state.json"):
         """
@@ -1856,11 +1868,23 @@ class Conductor:
             module, type_name, lst = NoknokLedButton(i2c, address=address), "noknokledbutton", self.ledbutton
         elif module_type == self.TYPE_DISPLAY:
             module, type_name, lst = NoknokDisplay(i2c, address=address), "noknokdisplay", self.display
+        elif module_type == self.TYPE_PICOHUB:
+            module, type_name, lst = NoknokPicoHub(i2c, address=address), "noknokpicohub", None
         else:
+            # No driver: keep its address so it is never handed out twice (it
+            # keeps it, e.g. a power manager over a Pico reboot), see _save_state.
+            if uid_hex:
+                self._unknown[uid_hex] = {"address": address, "type": module_type,
+                                          "i2c_bus": bus_name}
             return None, "unknown(0x%02X)" % module_type
         module._uid_hex = uid_hex
         module.i2c_bus = bus_name           # "A" / "B" - state record, OTA, diagnostics
-        lst.append(module)
+        if lst is not None:
+            lst.append(module)
+        elif self.picohub is None:          # one carrier per brain
+            self.picohub = module
+        else:
+            print("  a second PicoHub (0x%02X) - c.picohub stays the first one" % address)
         return module, type_name
 
     def enumerate(self, total_timeout_sec=10):
@@ -1878,8 +1902,10 @@ class Conductor:
         self.knob      = []
         self.ledbutton = []
         self.display   = []
+        self.picohub   = None
         self._registry = {}
         self.role      = {}
+        self._unknown  = {}      # uid -> {"address", "type", "i2c_bus"} of modules without a driver
 
         if not self._init_i2c():
             print("  No I2C bus (no pins in settings.toml, no pull-ups, or no I2C "
@@ -1964,7 +1990,7 @@ class Conductor:
 
         # ── Summary ───────────────────────────────────────────────────────────
         total = sum([len(self.buzzer), len(self.knob), len(self.ledbutton),
-                     len(self.display)])
+                     len(self.display), 1 if self.picohub else 0])
         if new_found == 0 and restored > 0:
             print(f"No new modules. {restored} module(s) already assigned:")
             for uid, m in self._registry.items():
@@ -2077,6 +2103,8 @@ class Conductor:
                     t = self.TYPE_LEDBUTTON
                 elif isinstance(module, NoknokDisplay):
                     t = self.TYPE_DISPLAY
+                elif isinstance(module, NoknokPicoHub):
+                    t = self.TYPE_PICOHUB
                 else:
                     t = 0
                 entry = {"address": module.address, "type": t,
@@ -2088,8 +2116,16 @@ class Conductor:
                     entry["bl"] = data[uid_hex]["bl"]     # keep a value read on an earlier boot
                 data[uid_hex] = entry
                 live_addrs.add(module.address)
+        # Modules without a driver keep their address reserved too (DEV-123:
+        # found with the PicoHub before its driver existed - not saved, so after
+        # a Pico reboot its address was handed to a newcomer: two devices, one
+        # address). Restore cannot rebuild them, but the address stays taken.
+        for uid_hex, info in (getattr(self, "_unknown", None) or {}).items():
+            data[uid_hex] = dict(info)
+            live_addrs.add(info["address"])
         for uid_hex, info in data.items():
-            if uid_hex in self._registry or not isinstance(info, dict):
+            if (uid_hex in self._registry or uid_hex in (getattr(self, "_unknown", None) or {})
+                    or not isinstance(info, dict)):
                 continue
             if info.get("address") in live_addrs:
                 info["address"] = None
@@ -3007,6 +3043,244 @@ class LedButtonStatus:
                 f"press_event={self.press_event}, "
                 f"release_event={self.release_event}, "
                 f"count={self.count})")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# noknok PicoHub (MOD-0011) power manager — type 0x07 (DEV-123, ADR-004)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class PicoHubError(OSError):
+    """The PicoHub's power manager did not answer, or its reply failed the CRC
+    twice. A product that uses c.picohub catches this (the board itself keeps
+    running safely without the brain: it decides everything inside the board)."""
+
+
+class NoknokPicoHub:
+    """
+    Driver for the noknok PicoHub's power manager (CH32X035, module type 0x07).
+    The protocol (command map) is specified in module-I2C-picohub-MOD-0011
+    firmware/readme.md, "I2C interface"; design: ADR-004. The board decides
+    everything inside itself (charger contract, input voltage, protection); the
+    brain reads telemetry and steers, and the board refuses what a safety rule
+    forbids.
+
+    Normally obtained via the Conductor (None on a brain without a PicoHub):
+        c = Conductor(); c.enumerate()
+        hub = c.picohub
+        if hub:
+            s = hub.status()
+            print(s["contract_v"], "V", s["vin"], "V in", s["temp_c"], "C")
+
+    Reading (CRC-checked, one retry, then PicoHubError):
+        hub.status()          -> dict, see status()
+        hub.source_caps()     -> [(volts, amps), ...] the charger offers
+        hub.firmware_version  -> "0.2.0" (read at enumeration)
+
+    Steering (each returns the board's result code, see RESULT_TEXT):
+        hub.set_rail("bus_b" | "usb" | "mezz", True | False | "auto")
+        hub.cycle_rail("bus_a" | "bus_b" | "usb" | "mezz", ms=250)
+        hub.set_min_input_voltage(15 | 20 | None)   # for a mezzanine that needs it
+        hub.reset_pico(ms=100)                      # reboots THIS brain
+        hub.clear_faults()
+
+    It never polls by itself: every call is one I2C exchange on demand.
+    """
+
+    MODULE_TYPE = 0x07
+
+    # results of the steering commands
+    APPLIED, INTERLOCK, NO_POWER, INVALID, UNKNOWN = 0, 1, 2, 3, 0xFF
+    RESULT_TEXT = {0: "applied", 1: "held off by an interlock",
+                   2: "held off by a fault or too little power",
+                   3: "invalid (length, value or key)", 0xFF: "unknown command"}
+
+    _CMD_STATUS     = 0x10
+    _CMD_CAPS       = 0x11
+    _CMD_CLEAR      = 0x12
+    _CMD_SET_RAIL   = 0x20
+    _CMD_CYCLE_RAIL = 0x21
+    _CMD_RESET_PICO = 0x22
+    _CMD_MIN_VIN    = 0x23
+    _KEY            = 0x5A          # required by CYCLE_RAIL / RESET_PICO
+
+    RAILS = {"bus_a": 0, "bus_b": 1, "usb": 2, "mezz": 3}   # bus_a: cycle_rail only
+    _WANT = {False: 0, "off": 0, True: 1, "on": 1, "auto": 2}
+
+    _PD_STATE = ("none", "negotiating", "contract", "failed")
+    _RAIL_BITS = (("bus_a", 0x01), ("bus_b", 0x02), ("usb", 0x04),
+                  ("mezz", 0x08), ("buck", 0x10))
+    _INPUT_BITS = (("usb_device", 0x01), ("mezz_present", 0x02), ("mezz_fault", 0x04),
+                   ("min_set", 0x08), ("min_suspended", 0x10))
+    _FAULT_BITS = (("input_overcurrent", 0x01), ("heat_shed", 0x02), ("heat_critical", 0x04),
+                   ("mezz_fault", 0x08), ("rail_5v_low", 0x10), ("pd_failed", 0x20),
+                   ("temp_sensor", 0x40))
+    _NOTICE_BITS = (("limited_power", 0x01), ("weak_charger", 0x02), ("hot", 0x04),
+                    ("usb_held_by_mezz", 0x08), ("usb_held_for_power", 0x10),
+                    ("min_not_met", 0x20))
+    _RESET_CAUSE = ("power_on", "watchdog", "other", "software")
+
+    def __init__(self, i2c, address=0x08):
+        self.i2c      = i2c
+        self.address  = address
+        self._uid_hex = None   # set by Conductor.enumerate()
+        self.last_result = None
+
+    # ── transport ────────────────────────────────────────────────────────────
+    def _write(self, data):
+        _service()                      # DEV-34: pump the app channel (before the lock)
+        while not self.i2c.try_lock():
+            pass
+        try:
+            self.i2c.writeto(self.address, bytes(data))
+            return True
+        except OSError:
+            return False
+        finally:
+            self.i2c.unlock()
+
+    def _read(self, n):
+        _service()
+        buf = bytearray(n)
+        while not self.i2c.try_lock():
+            pass
+        try:
+            self.i2c.readfrom_into(self.address, buf)
+            return buf
+        except OSError:
+            return None
+        finally:
+            self.i2c.unlock()
+
+    def _query(self, cmd, n, length_of):
+        """Command + read of a CRC-terminated reply. `length_of(buf)` gives the
+        number of bytes the CRC covers. One retry, then PicoHubError."""
+        why = "no answer"
+        for _ in range(2):
+            if self._write([cmd]):
+                buf = self._read(n)
+                if buf is not None:
+                    k = length_of(buf)
+                    if k is not None and k < n and _crc8(buf[:k]) == buf[k]:
+                        return buf
+                    why = "bad CRC"
+        raise PicoHubError("PicoHub at 0x%02X: %s (command 0x%02X)" % (self.address, why, cmd))
+
+    def _command(self, data):
+        """Steering command: write, read the result byte. Returns the code;
+        raises PicoHubError if the board does not answer (one retry)."""
+        for _ in range(2):
+            if self._write(data):
+                buf = self._read(1)
+                if buf is not None:
+                    self.last_result = buf[0]
+                    return buf[0]
+        raise PicoHubError("PicoHub at 0x%02X: no answer (command 0x%02X)" % (self.address, data[0]))
+
+    @staticmethod
+    def _u16(b, i):
+        return b[i] | (b[i + 1] << 8)
+
+    @staticmethod
+    def _flags(byte, table):
+        return {name: bool(byte & bit) for name, bit in table}
+
+    # ── reading ──────────────────────────────────────────────────────────────
+    def status(self):
+        """One GET_STATUS. Returns a dict:
+          pd_state   "none" (Type-C current only) | "negotiating" | "contract" | "failed"
+          contract_v, contract_a   the charger contract (capped at 3 A)
+          vin, iin, v5v            input V / A, 5 V rail V
+          temp_c                   board temperature next to the buck
+          rails    {bus_a, bus_b, usb, mezz, buck: on?}
+          inputs   {usb_device, mezz_present, mezz_fault, min_set, min_suspended}
+          faults   [names] latched until clear_faults(): input_overcurrent, heat_shed,
+                   heat_critical, mezz_fault, rail_5v_low, pd_failed, temp_sensor
+          warnings [names] live notices: limited_power (5 V-only charger, not an
+                   error), weak_charger, hot, usb_held_by_mezz, usb_held_for_power,
+                   min_not_met
+          reset_cause  why the power manager last restarted
+        Raises PicoHubError (no answer / bad CRC twice)."""
+        b = self._query(self._CMD_STATUS, 20, lambda buf: 19)
+        u16 = self._u16
+        t = u16(b, 12)
+        if t & 0x8000:
+            t -= 0x10000
+        faults = self._flags(b[16], self._FAULT_BITS)
+        notices = self._flags(b[17], self._NOTICE_BITS)
+        return {
+            "format":     b[0],
+            "pd_state":   self._PD_STATE[b[1]] if b[1] < 4 else b[1],
+            "contract_v": u16(b, 2) / 1000,
+            "contract_a": u16(b, 4) / 1000,
+            "vin":        u16(b, 6) / 1000,
+            "iin":        u16(b, 8) / 1000,
+            "v5v":        u16(b, 10) / 1000,
+            "temp_c":     t / 10,
+            "rails":      self._flags(b[14], self._RAIL_BITS),
+            "inputs":     self._flags(b[15], self._INPUT_BITS),
+            "faults":     [n for n, on in faults.items() if on],
+            "warnings":   [n for n, on in notices.items() if on],
+            "reset_cause": self._RESET_CAUSE[b[18]] if b[18] < 4 else b[18],
+        }
+
+    def source_caps(self):
+        """What the charger offers (fixed PDOs): [(volts, amps), ...]. Empty
+        for a charger without USB-PD. Raises PicoHubError."""
+        def covered(buf):
+            n = buf[0]
+            return 1 + 4 * n if n <= 7 else None
+        b = self._query(self._CMD_CAPS, 30, covered)
+        return [(self._u16(b, 1 + 4 * i) / 1000, self._u16(b, 3 + 4 * i) / 1000)
+                for i in range(b[0])]
+
+    # ── steering ─────────────────────────────────────────────────────────────
+    def set_rail(self, rail, want):
+        """Switch a rail: rail "bus_b", "usb" (host port J2 VBUS) or "mezz"
+        (MEZZ_EN); want True/"on", False/"off" or "auto". The wish survives a
+        Pico reboot; the board still applies its interlocks (e.g. "usb" on with
+        no device plugged in answers INTERLOCK). Bus A cannot be switched off,
+        only cycled. Returns the result code."""
+        if rail not in ("bus_b", "usb", "mezz") or want not in self._WANT:
+            raise ValueError("set_rail(rail in bus_b/usb/mezz, want True/False/'auto')")
+        return self._command([self._CMD_SET_RAIL, self.RAILS[rail], self._WANT[want]])
+
+    def cycle_rail(self, rail, ms=250):
+        """Power-cycle a rail for `ms` (bus_a 50-2000 ms, others 50-5000 ms),
+        then back to its wish. Starts 20 ms after the call. Modules on a cycled
+        bus lose power and enumerate again (call c.enumerate() ~3 s later); the
+        PicoHub itself keeps its address. Returns the result code."""
+        if rail not in self.RAILS:
+            raise ValueError("cycle_rail(rail in bus_a/bus_b/usb/mezz, ms)")
+        ms = int(ms)
+        return self._command([self._CMD_CYCLE_RAIL, self.RAILS[rail],
+                              ms & 0xFF, (ms >> 8) & 0xFF, self._KEY])
+
+    def reset_pico(self, ms=100):
+        """Hold the Pico in reset for `ms` (10-1000), 50 ms after the call: this
+        brain reboots. Modules keep power and their addresses. Returns the
+        result code (if the reboot did not happen first)."""
+        ms = int(ms)
+        return self._command([self._CMD_RESET_PICO, ms & 0xFF, (ms >> 8) & 0xFF, self._KEY])
+
+    def set_min_input_voltage(self, volts=None):
+        """Ask for at least 15 or 20 V input (a mezzanine that needs it), or
+        None/0 for no minimum. The board otherwise picks the voltage by demand.
+        Survives a Pico reboot. NO_POWER = the charger cannot reach it (the
+        board takes the highest it can). Returns the result code."""
+        v = int(volts or 0)
+        if v not in (0, 15, 20):
+            raise ValueError("set_min_input_voltage(15, 20 or None)")
+        return self._command([self._CMD_MIN_VIN, v])
+
+    def clear_faults(self):
+        """Clear the latched faults (and a 3-sheds suspension). Returns the result code."""
+        return self._command([self._CMD_CLEAR])
+
+    def role_cue(self, on=True):
+        """No light or sound of its own: role assignment never picks a PicoHub."""
+        return False
+
+    def __repr__(self):
+        return "NoknokPicoHub(0x%02X)" % self.address
 
 # ═════════════════════════════════════════════════════════════════════════════
 # COLOURS — shared by the display driver (and anything else that needs RGB565)

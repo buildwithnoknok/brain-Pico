@@ -394,6 +394,36 @@ as a 1-bit-per-pixel blit, so nothing below needs firmware support (v0.2.0+; v0.
   I²C stream exactly like the firmware (its `font8x8.h` included) and prints the panel as
   ASCII art — 71 checks, run it before touching the driver.
 
+**noknok PicoHub power manager — `c.picohub` (v1.16, DEV-123).** The carrier's CH32X035 is an
+ordinary I2C module (type `0x07`) that decides everything inside the board itself: charger contract,
+input voltage by demand, protection. The brain reads and steers; the board refuses what a safety
+rule forbids. `c.picohub` is `None` on a brain without one. Protocol: the module repo's
+[`firmware/readme.md`](https://github.com/buildwithnoknok/module-I2C-picohub-MOD-0011/blob/main/firmware/readme.md)
+("I2C interface").
+
+```python
+hub = c.picohub
+if hub:
+    s = hub.status()   # contract_v/_a, vin, iin, v5v, temp_c, rails{}, inputs{}, faults[], warnings[], ...
+    hub.source_caps()                  # [(5.0, 3.0), (9.0, 3.0), ...] what the charger offers
+    hub.set_min_input_voltage(20)      # a mezzanine needs 20 V (None = no minimum)
+    hub.set_rail("usb", "auto")        # "bus_b" / "usb" / "mezz": True, False or "auto"
+    hub.cycle_rail("bus_a", 300)       # power-cycle a bus; its modules enumerate again
+    hub.reset_pico(100)                # reboots this brain; modules keep their addresses
+    hub.clear_faults()
+```
+
+- Steering calls return the board's result code: `hub.APPLIED` 0, `INTERLOCK` 1 (e.g. `"usb"` on
+  with nothing plugged in), `NO_POWER` 2 (fault or charger too weak), `INVALID` 3;
+  `hub.RESULT_TEXT[code]` says it in words. Wishes and the minimum survive a Pico reboot.
+- `status()` / `source_caps()` are CRC-checked, retried once, then raise `noknok.PicoHubError`
+  (also when the board does not answer). Nothing is polled in the background: one I2C exchange per
+  call. The `status` op of `/rpc` carries the same dict as `power`.
+- No firmware update for the PicoHub yet (no bootloader on the X035 until DEV-124).
+- Modules without a driver now keep their address reserved in the saved state, like the PicoHub,
+  so after a Pico reboot no newcomer can be given an address that is still in use.
+- Test: `tools/test_picohub.py` (host, tier S, a fake power manager speaking the command map).
+
 ### Required CircuitPython libs (/lib)
 - `adafruit_httpserver/`
 - `adafruit_requests.mpy`

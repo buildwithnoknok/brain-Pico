@@ -1,5 +1,11 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.22 (setup tells the app when the WiFi join fails — DEV-100)
+# Version: 0.23 (status op reports the PicoHub power manager — DEV-123)
+#
+# v0.23 changes (Sue): DEV-123 — the status op carries `power`: the noknok
+#   PicoHub's status (charger contract, input, 5 V rail, temperature, rails,
+#   faults, warnings) when the brain sits on one, else null. One I2C read per
+#   status call, nothing polled in the background. Modules without a driver
+#   are left out of `modules` (they used to show as "nonetype").
 #
 # v0.22 changes (Sue): DEV-100 — /connect and the provision op used to answer
 #   "accepted" at once and the app showed Done even when the join then failed.
@@ -325,7 +331,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.22"
+CODE_VERSION = "0.23"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -934,12 +940,21 @@ def _h_status(args, msg):
     since = int(args.get("since") or 0)
     c = nk.conductor()
     modules = []
+    power = None
     if c is not None:
         for m in c._registry.values():
+            if m is None:
+                continue                 # a module type without a driver
             modules.append({"type": type(m).__name__.replace("Noknok", "").lower(),
                             "uid": getattr(m, "_uid_hex", None) or getattr(m, "serial", None),
                             "fw": getattr(m, "firmware_version", None),
                             "bus": getattr(m, "i2c_bus", None) or "usb"})   # "A"/"B"/"usb" (DEV-74)
+        hub = getattr(c, "picohub", None)
+        if hub is not None:              # DEV-123: the PicoHub's power manager, one I2C read
+            try:
+                power = hub.status()
+            except Exception as e:
+                power = {"error": str(e)}
     return {
         "state": _device_state(),
         "strikes": _crash_count(),
@@ -950,6 +965,7 @@ def _h_status(args, msg):
         "link": rpc.link_stats(),
         "last_bad_request": rpc._last_bad,
         "modules": modules,
+        "power": power,                  # PicoHub power status or null (DEV-123)
         "events": ev[since:],
         "events_total": len(ev),
     }

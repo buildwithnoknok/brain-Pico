@@ -74,6 +74,10 @@ reg_keys = set((reg.get("modules") or {}).keys())
 print("registry:", src, "version", reg.get("registry_version"))
 
 C = noknok.Conductor
+# Types with a driver but deliberately no OTA yet (no bootloader on the module),
+# each with the ticket that adds it: listed in the registry, not updated by the brain.
+no_ota = dict(getattr(C, "_NO_OTA_YET", {}))      # type byte -> (manifest key, why)
+no_ota_keys = {k for k, _ in no_ota.values()}
 i2c_keys = {k for _, k in C._FW_GROUPS}
 usb_keys = {k for _, k in C._USB_FW_GROUPS}
 brain_keys = i2c_keys | usb_keys
@@ -82,13 +86,20 @@ print("\nBrain type tables vs registry")
 for k in sorted(brain_keys):
     check("brain type %-14s has a registry entry" % k, k in reg_keys)
 for k in sorted(reg_keys - brain_keys):
-    check("registry entry %-12s is a type the brain knows" % k, False)
+    check("registry entry %-12s is a type the brain knows" % k, k in no_ota_keys,
+          "(no OTA yet: %s)" % [w for kk, w in no_ota.values() if kk == k][0] if k in no_ota_keys else "")
+for tb, (k, why) in sorted(no_ota.items()):
+    check("no-OTA type %-12s has a registry entry (for later)" % k, k in reg_keys, why)
 
 # Every I2C type byte must name a manifest key, and that key a firmware group.
 type_bytes = {v: n for n, v in vars(C).items()
               if n.startswith("TYPE_") and isinstance(v, int)}
 check("found the I2C type table (Conductor.TYPE_*)", len(type_bytes) >= 4, len(type_bytes))
 for tb, name in sorted(type_bytes.items()):
+    if tb in no_ota:
+        check("I2C 0x%02X %-14s -> no OTA yet, NOT in the OTA map" % (tb, name),
+              tb not in C._TYPE_TO_MF_KEY, no_ota[tb][1])
+        continue
     key = C._TYPE_TO_MF_KEY.get(tb)
     check("I2C 0x%02X %-14s -> manifest key" % (tb, name), key in i2c_keys, key or "missing")
 
