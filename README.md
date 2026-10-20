@@ -295,6 +295,18 @@ Earlier features:
   cache. When it cannot help (no cached image, wrong layout, unknown module) the brain logs
   `MODULE STILL PARKED`, writes the `[RESCUE]` event and plays the buzzer/LED alert; the next
   boot retries. Test: `tools/test_rescue_paths.py` (host, tier S).
+- **USB modules: update and rescue around a hard reset (DEV-133, code.py 0.27).** The Pico's
+  PIO-USB host does not see a USB module re-enumerate within one session (DEV-45), so the brain
+  never waits for one: a USB update sends the module into its bootloader (`[FW] ... PENDING`) and
+  hard-resets; the next boot's `Conductor.usb_fw_pass()` (run by `get_conductor()` right after
+  `enumerate_all()`) flashes every module it finds at PID 4E42 from the cache, hard-resets again,
+  and the boot after verifies the version (`[USBFW] ... flashed` / `verified`). The same pass
+  rescues a USB module left in its bootloader for any reason (type remembered per USB serial in
+  the Store, key `usb`); at most 2 flashes and 2 requests per module, then `gave_up` + alert.
+  After an X035 (PicoHub) update or rescue on a brain with USB host pins the brain hard-resets
+  before the product too (DEV-134: J2 is off while the X035 is in its bootloader). Tests:
+  `tools/test_usb_fw_pass.py` (host, tier S), `tools/bench/bench_dev133_*.py`,
+  `bench_dev134_park_x035.py` (bench, tier M).
 - **No firmware check at setup.** The app shows no "update available" notice: module updates
   happen silently in this post-WiFi pass. The setup-time `POST /firmware/check` route was removed
   in code.py 0.19 (DEV-99) because, offline on the hotspot, it could only ever say "no update".
