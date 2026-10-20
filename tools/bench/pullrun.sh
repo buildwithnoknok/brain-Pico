@@ -22,11 +22,11 @@ while [ $n -lt $ROUNDS ]; do
   usb 0; sleep 3; usb 1
   pkill -f '[p]ico.py run pr_update'
   wait_port || { echo "round $n: Pico port did not come back" >> ~/bob/pullrun.log; brick=$((brick+1)); continue; }
-  sleep 12
+  sleep ${WAIT:-12}   # WAIT=100 NOREC=1: let the brain's own start-up rescue fix a parked power manager
   started=$(grep -c "PR START" ~/bob/pr/r_$n.txt); pushed=$(grep -c "PR PUSHED" ~/bob/pr/r_$n.txt)
   s=$(classify)
   case "$s" in
-    *parked*) parked=$((parked+1)); rec=$(timeout 60 python3 pico.py run pr_recover.py 40 2>&1 | grep "PR RECOVERED"); s="$s -> $rec" ;;
+    *parked*) parked=$((parked+1)); [ "${NOREC:-0}" = 1 ] && s="$s ** BRAIN DID NOT RESCUE IT **"; rec=$(timeout 60 python3 pico.py run pr_recover.py 40 2>&1 | grep "PR RECOVERED"); s="$s -> $rec" ;;
     *none*|*unreadable*) brick=$((brick+1)) ;;
     *"app (1, 0, 3, 0)"*) old=$((old+1)) ;;
     *"app (1, 0, 3, 1)"*) new=$((new+1)) ;;
