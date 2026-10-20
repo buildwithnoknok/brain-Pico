@@ -1,5 +1,14 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.28 (one WiFi scan per boot, none after a failed join — DEV-136)
+# Version: 0.29 (product download streamed to the file — DEV-139)
+#
+# v0.29 changes (Sue): DEV-139 — download_and_save_script() used response.text,
+#   which needs the whole product twice in one block each (bytes + str: 2 x 36 KB
+#   for Smart Lamp Maxi). After setup the heap is fragmented and the download
+#   failed on EVERY boot ("allocating 36027 bytes"): provisioned, no product.
+#   Now the body is streamed to product.py.tmp in 1 KB pieces, checked against
+#   Content-Length (truncated -> retry), compile-checked from the file (a
+#   MemoryError there is logged and skipped; a SyntaxError still refuses) and
+#   renamed over product.py.
 #
 # v0.28 changes (Sue): DEV-136 — 0.25 scanned in station mode before EVERY
 #   start_ap(); right after a router "Authentication failure" that scan hung
@@ -364,6 +373,7 @@
 # precompiled .mpy (tools/build_mpy.ps1, DEV-38) avoids the on-device compile.
 import noknok as nk          # filesystem policy helpers (DEV-18) + settings.toml
 import noknok_rpc as rpc     # Device Protocol v1: dispatcher + /rpc carrier (DEV-34)
+import gc
 import json
 import os
 import sys
@@ -377,7 +387,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.28"
+CODE_VERSION = "0.29"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -932,6 +942,52 @@ def _join_reason(err):
 
 # ── Script download ────────────────────────────────────────────────────────────
 
+DOWNLOAD_CHUNK = 1024
+
+def _remove_quiet(path):
+    try:
+        with nk.writable():
+            os.remove(path)
+    except OSError:
+        pass
+
+def _stream_to_tmp(response, tmp):
+    """Write the HTTP body to `tmp` in DOWNLOAD_CHUNK pieces (DEV-139), never
+    holding it whole. Returns (ok, bytes_written, content_length_or_None, err);
+    err is "readonly" when the file cannot be opened for writing, else the
+    network error text. Always closes the response."""
+    expected = None
+    try:
+        expected = int(response.headers.get("content-length"))
+    except Exception:
+        pass
+    got = 0
+    opened = False
+    try:
+        nk.ensure_dir(tmp)
+        with nk.writable():
+            with open(tmp, "wb") as fh:
+                opened = True
+                for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK):
+                    fh.write(chunk)
+                    got += len(chunk)
+                fh.flush()
+            try:
+                os.sync()
+            except Exception:
+                pass
+        return True, got, expected, None
+    except OSError as e:
+        if not opened:
+            return False, got, expected, "readonly"
+        _remove_quiet(tmp)
+        return False, got, expected, "download interrupted: %r" % (e,)
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+
 def download_and_save_script(script_url=None):
     """Download product script from GitHub and save as product.py.
     Uses adafruit_connection_manager so DNS and the SSL context are set up
@@ -958,9 +1014,11 @@ def download_and_save_script(script_url=None):
     context = adafruit_connection_manager.get_radio_ssl_context(wifi.radio)
     session = adafruit_requests.Session(pool, context)
 
+    tmp = PRODUCT_SCRIPT_FILE + ".tmp"
     for attempt in range(1, 4):  # up to 3 tries
         log(f"[download] Attempt {attempt}: fetching {url}")
         try:
+            gc.collect()
             response = session.get(url, timeout=30)
 
             if response.status_code != 200:
@@ -968,28 +1026,49 @@ def download_and_save_script(script_url=None):
                 response.close()
                 return False
 
-            content = response.text
-            response.close()
+            # DEV-139: stream to <file>.tmp in 1 KB pieces. response.text needed
+            # the whole script TWICE in one block each (bytes + str, 36 KB for
+            # Smart Lamp Maxi); after setup the heap is fragmented and that
+            # failed on every boot ("allocating 36027 bytes").
+            ok, got, expected, err = _stream_to_tmp(response, tmp)
+            if not ok:
+                if err == "readonly":
+                    log(f"[download] CANNOT save {PRODUCT_SCRIPT_FILE} — filesystem "
+                        "read-only (drive visible to a PC? see settings.toml)")
+                    return False
+                raise OSError(err)                      # network error: retry
+            if expected is not None and got != expected:
+                _remove_quiet(tmp)
+                raise OSError("truncated: %d of %d bytes" % (got, expected))
 
-            # Compile before it replaces the running copy: a truncated or
-            # half-served download must never take a working product down
-            # (DEV-18). Same bytecode exec() builds later, so no extra cost.
+            # Compile before it replaces the running copy: a half-served
+            # download must never take a working product down (DEV-18). Read
+            # back from the file; if memory is too tight for that, the size
+            # check above stands in and run_product()'s three strikes judge it.
+            gc.collect()
             try:
-                compile(content, PRODUCT_SCRIPT_FILE, "exec")
+                with open(tmp, "r") as fh:
+                    compile(fh.read(), PRODUCT_SCRIPT_FILE, "exec")
             except SyntaxError as e:
                 log(f"[download] REFUSED — {PRODUCT_SCRIPT_FILE} does not compile: {e}")
+                _remove_quiet(tmp)
                 return False
+            except MemoryError:
+                log("[download] compile check skipped (not enough memory now) — "
+                    "size verified, the product start will judge it (DEV-139)")
             except NameError:
                 pass   # build without compile(); exec() will judge it
+            gc.collect()
 
             try:
-                nk.write_atomic(PRODUCT_SCRIPT_FILE, content)   # temp + rename
+                with nk.writable():
+                    os.rename(tmp, PRODUCT_SCRIPT_FILE)   # replaces the old copy
             except OSError:
                 log(f"[download] CANNOT save {PRODUCT_SCRIPT_FILE} — filesystem "
                     "read-only (drive visible to a PC? see settings.toml)")
                 return False
 
-            log(f"[download] SUCCESS — saved {PRODUCT_SCRIPT_FILE} ({len(content)} bytes) from {url}")
+            log(f"[download] SUCCESS — saved {PRODUCT_SCRIPT_FILE} ({got} bytes) from {url}")
             return True
 
         except Exception as e:
