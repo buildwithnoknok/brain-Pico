@@ -1,5 +1,13 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.24 (the PicoHub power manager is kept up to date — DEV-124)
+# Version: 0.25 (no WiFi scan while the setup hotspot runs — DEV-130)
+#
+# v0.25 changes (Sue): DEV-130 — a WiFi scan with the setup hotspot up could
+#   block forever inside CircuitPython's scan iterator and freeze the web server
+#   (setup dead until a power cycle). The brain now scans ONCE in station mode
+#   right before each start_ap() (boot and every hotspot restart after a failed
+#   join) and keeps that list: wifi.scan and the provision pre-check read it
+#   while the AP runs (wifi.scan adds live:false + age_s); _scan_networks()
+#   refuses outright with the AP up and stops collecting after 10 s.
 #
 # v0.24 changes (Sam): DEV-124 — the carrier's own firmware joins the module OTA
 #   pass. Products never list the board they sit on, so check_and_flash_modules()
@@ -340,7 +348,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.24"
+CODE_VERSION = "0.25"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -1070,14 +1078,32 @@ _JOIN_BOOT = "%04x" % (int.from_bytes(os.urandom(2), "little"),)
 _join_seq  = 0
 _last_join = None           # {"join_id", "ssid", "ok", "reason", "attempts", "detail"}
 
+# DEV-130: NEVER scan while the hotspot runs. On CircuitPython 10.3.1 / Pico 2 W
+# a scan with the AP up can block forever INSIDE one next() of the scan iterator
+# (C code waits while the radio says "scan active"), which froze the whole web
+# server. No Python time limit can break that, so the rule is structural: the
+# brain scans once right BEFORE each start_ap() (plain station mode, the normal
+# path) and wifi.scan / the provision pre-check read that list while the AP runs.
+_scan_cache = None          # list from _scan_networks(), or None (no scan / failed)
+_scan_at    = None          # time.monotonic() of that scan
+
+SCAN_BUDGET_S = 10          # stop collecting after this long (results that trickle)
+
 def _scan_networks():
     """Networks the radio can see: [{"ssid", "rssi", "open"}], strongest first,
     without our own hotspot, at most 25. None if scanning is not possible right
-    now (e.g. not supported while the hotspot runs) - callers then skip the
-    check instead of refusing anything."""
+    now - callers then skip the check instead of refusing anything. Refuses
+    outright while the hotspot runs (DEV-130)."""
+    if wifi.radio.ap_active:
+        log("[ap] WiFi scan refused while the hotspot runs (DEV-130)")
+        return None
     nets = {}
+    deadline = time.monotonic() + SCAN_BUDGET_S
     try:
         for n in wifi.radio.start_scanning_networks():
+            if time.monotonic() > deadline:
+                log("[ap] WiFi scan took too long - using what was found so far")
+                break
             name = n.ssid
             if not name or name == AP_SSID:
                 continue
@@ -1099,13 +1125,33 @@ def _scan_networks():
         return None
     return sorted(nets.values(), key=lambda x: -x["rssi"])[:25]
 
+def _refresh_scan_cache():
+    """Scan now (hotspot must be down) and keep the result for the AP session."""
+    global _scan_cache, _scan_at
+    _scan_cache = _scan_networks()
+    _scan_at = time.monotonic()
+    if _scan_cache is not None:
+        log(f"[ap] {len(_scan_cache)} WiFi network(s) visible before the hotspot starts")
+
+def _visible_networks():
+    """(networks or None, live). With the hotspot up: the list scanned before it
+    started (live False). Without it (home WiFi): a fresh scan (live True)."""
+    if wifi.radio.ap_active:
+        return _scan_cache, False
+    return _scan_networks(), True
+
 def _h_wifi_scan(args, msg):
     """wifi.scan op (DEV-100): the networks the device itself can see, so the
-    app offers a list instead of a typed name. AP time only in practice."""
-    nets = _scan_networks()
+    app offers a list instead of a typed name. On the hotspot this is the list
+    from just before the hotspot started (DEV-130): live false + age_s, so the
+    app knows that "search again" cannot bring a newer one."""
+    nets, live = _visible_networks()
     if nets is None:
-        return {"available": False, "networks": []}
-    return {"available": True, "networks": nets}
+        return {"available": False, "networks": [], "live": live}
+    r = {"available": True, "networks": nets, "live": live}
+    if not live and _scan_at is not None:
+        r["age_s"] = int(time.monotonic() - _scan_at)
+    return r
 
 def _do_provision(ssid, password, script_url, module_firmware, product_id,
                   config_defaults=None, force=False):
@@ -1122,7 +1168,7 @@ def _do_provision(ssid, password, script_url, module_firmware, product_id,
         # DEV-100: refuse at once, hotspot kept, when the network is not even
         # visible (typo, out of range). force=True skips it (hidden network).
         if not force:
-            nets = _scan_networks()
+            nets = _scan_cache          # never a live scan with the AP up (DEV-130)
             if nets is not None and ssid not in [n["ssid"] for n in nets]:
                 log(f"[ap] '{ssid}' is not visible from here - not trying it")
                 return {"accepted": False, "reason": "network_not_found", "networks": nets}
@@ -1370,6 +1416,7 @@ def run_ap_provisioning():
     Retries (restarts the AP) if the WiFi join fails.
     """
     while True:  # outer loop lets us rebuild the AP after a failed WiFi attempt
+        _refresh_scan_cache()        # DEV-130: the only scan of this AP session
         wifi.radio.start_ap(ssid=AP_SSID, password=AP_PASSWORD)
         ap_ip = str(wifi.radio.ipv4_address_ap)
         log(f"[ap] Hotspot started: '{AP_SSID}' — http://{ap_ip}")

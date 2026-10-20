@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## code.py 0.25 - 2026-10-20
+
+- DEV-130 - setup could freeze for good: a WiFi scan while the setup hotspot runs can block forever inside CircuitPython 10.3.1 on the Pico 2 W (seen 1 in 4 setups), and the web server stopped answering until a power cycle. The brain now never scans with the hotspot up: it scans once right before the hotspot starts (at boot and before every restart after a failed join) and keeps that list. `wifi.scan` returns it with `live: false` and `age_s` while the hotspot runs (a fresh scan only on home WiFi, `live: true`); the `provision` check for an unknown network uses the same list. A scan also stops collecting after 10 s. Bench script `tools/bench/bench_dev130_scan_then_ap.py`; host test `tools/test_setup_join.py` extended. Breaking: no (the app's "search again" shows the same list until the hotspot restarts).
+
 ## noknok.py 1.17 + code.py 0.24 - 2026-10-19
 
 - DEV-124 - firmware update for the PicoHub's power manager (module type `0x07`, CH32X035, bootloader flash layout 3). `noknok.py`: `picohub` joins the firmware groups (`firmware_report()`, `update_all()`) and the parked-module rescue map; `module_flasher`: plain message for the X035 bootloader's new error 9 (image not built for this chip) and a 10 s erase timeout (the X035 erases 57 KB). `code.py`: the board the brain sits on is always part of the daily OTA pass (`CARRIER_FIRMWARE`), whatever the product lists; the stage-1 pass skips the X035 (`STAGE1_OWN_LINE`), whose stage-1 has its own version line, instead of raising a daily alert. Host tests: `tools/test_picohub.py` (PicoHub now in the firmware report), `tools/test_rescue_paths.py` (carrier always resolved, stage-1 pass skips it). Bench: module repo `firmware/test/bl_x035_bench.py`. Breaking: no.

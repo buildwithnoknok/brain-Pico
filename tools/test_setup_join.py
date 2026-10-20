@@ -10,6 +10,9 @@
 #     (network_not_found, credentials NOT handed to the join loop), accepts a
 #     visible one with a join_id, skips the check with force=True, and does not
 #     refuse anything when the scan itself fails
+#   - DEV-130: NO live scan while the hotspot runs; the list is scanned once
+#     before start_ap() and wifi.scan / the provision pre-check read that cache
+#     (live false + age_s); a scan that trickles results stops after its budget
 #   - join errors are classified: auth / not_found / timeout / other
 #   - a failed join is remembered (RAM) with the request's join_id and alerts
 #
@@ -59,7 +62,10 @@ class Radio:
     scan_fails = False
     stopped = 0
 
+    scans = 0
+
     def start_scanning_networks(self):
+        Radio.scans += 1
         if Radio.scan_fails:
             raise RuntimeError("Wifi is in access point mode.")
         return iter(Radio.scan)
@@ -92,19 +98,70 @@ def check(name, cond, extra=""):
         fails += 1
 
 
+def before_ap():
+    """What run_ap_provisioning() does before start_ap(): one station-mode scan."""
+    Radio.ap_active = False
+    ns["_refresh_scan_cache"]()
+    Radio.ap_active = True
+
+
 print("wifi.scan")
 Radio.scan = [Net("Home", -70), Net("Home", -48), Net("noknok-setup", -20, True),
               Net("Cafe", -60, True), Net("", -30)]
 Radio.scan_fails = False
+Radio.ap_active = True
+Radio.scans = 0
+r = ns["_scan_networks"]()
+check("DEV-130: _scan_networks refuses while the hotspot runs", r is None and Radio.scans == 0, r)
+r = ns["_h_wifi_scan"]({}, {})
+check("DEV-130: no list yet + AP up -> available false, radio untouched",
+      r["available"] is False and Radio.scans == 0, r)
+before_ap()
+check("one scan before the hotspot starts", Radio.scans == 1)
 r = ns["_h_wifi_scan"]({}, {})
 names = [n["ssid"] for n in r["networks"]]
 check("available, strongest first, deduplicated", r["available"] and names == ["Home", "Cafe"], names)
 check("own hotspot and hidden (empty) names left out", "noknok-setup" not in names and "" not in names)
 check("strongest reading kept for a repeated name", r["networks"][0]["rssi"] == -48)
 check("open flag", r["networks"][1]["open"] is True and r["networks"][0]["open"] is False)
-Radio.scan_fails = True
+check("DEV-130: served from the cache: live false, age_s, no new scan",
+      r["live"] is False and "age_s" in r and Radio.scans == 1, r)
+Radio.ap_active = False
 r = ns["_h_wifi_scan"]({}, {})
-check("scan impossible -> available false, empty list", r == {"available": False, "networks": []}, r)
+check("home WiFi (no AP): live scan", r["live"] is True and Radio.scans == 2, r)
+Radio.scan_fails = True
+before_ap()
+r = ns["_h_wifi_scan"]({}, {})
+check("scan impossible -> available false, empty list",
+      r["available"] is False and r["networks"] == [], r)
+
+print("\nscan time budget (DEV-130)")
+
+
+class _Clock:
+    t = 0.0
+
+    @staticmethod
+    def monotonic():
+        return _Clock.t
+
+
+def trickle():
+    for i in range(100):
+        _Clock.t += 1.0                    # each result arrives one second later
+        yield Net("N%d" % i, -50 - i)
+
+
+real_time = ns["time"]
+ns["time"] = _Clock
+Radio.scan_fails = False
+Radio.ap_active = False
+Radio.scan = trickle()
+r = ns["_scan_networks"]()
+check("results that keep trickling stop after SCAN_BUDGET_S",
+      r is not None and 0 < len(r) <= ns["SCAN_BUDGET_S"] + 1, len(r or []))
+ns["time"] = real_time
+Radio.ap_active = True
 
 print("\nprovision on the hotspot")
 pending = ns["pending"]
@@ -117,11 +174,14 @@ def provision(ssid, force=False):
 
 Radio.scan_fails = False
 Radio.scan = [Net("Home", -50)]
+before_ap()
+scans = Radio.scans
 r = provision("Hoem")
 check("typo / not visible -> accepted false, network_not_found",
       r.get("accepted") is False and r.get("reason") == "network_not_found", r)
 check("  ...credentials NOT handed to the join loop", pending["ready"] is False)
 check("  ...the visible networks come back for the app", [n["ssid"] for n in r["networks"]] == ["Home"])
+check("  ...DEV-130: checked against the cached list, no scan with the AP up", Radio.scans == scans)
 r = provision("Home")
 check("visible -> accepted with a join_id + uptime",
       r.get("accepted") is True and r.get("join_id") and "uptime" in r, r)
@@ -133,8 +193,10 @@ check("each request gets a new join_id", r2["join_id"] != first)
 r = provision("HiddenNet", force=True)
 check("force=True skips the check (hidden network)", r.get("accepted") is True)
 Radio.scan_fails = True
+before_ap()
 r = provision("Anything")
 check("scan impossible -> nothing refused", r.get("accepted") is True)
+check("no provision path ever scanned with the AP up", Radio.scans == scans + 1)
 
 print("\njoin errors")
 jr = ns["_join_reason"]
