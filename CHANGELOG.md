@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## code.py 0.26 - 2026-10-20
+
+- DEV-132 - a large product (Smart Lamp Maxi) could crash with `MemoryError` a few seconds after it started, on the boot where the daily module update check ran (5 of 6 such boots, crash strike 1 of 3). The check's internet work leaves the memory fragmented. The brain now restarts its software once after that check, before the product, so the product always starts on clean memory; the restarted run skips the check (a marker byte in `nvm[5]`), so it cannot loop when the update server is unreachable. Costs a few seconds once a day. New host test `tools/test_post_ota_reload.py`. Breaking: no.
+
 ## code.py 0.25 - 2026-10-20
 
 - DEV-130 - setup could freeze for good: a WiFi scan while the setup hotspot runs can block forever inside CircuitPython 10.3.1 on the Pico 2 W (seen 1 in 4 setups), and the web server stopped answering until a power cycle. The brain now never scans with the hotspot up: it scans once right before the hotspot starts (at boot and before every restart after a failed join) and keeps that list. `wifi.scan` returns it with `live: false` and `age_s` while the hotspot runs (a fresh scan only on home WiFi, `live: true`); the `provision` check for an unknown network uses the same list. A scan also stops collecting after 10 s. Bench script `tools/bench/bench_dev130_scan_then_ap.py`; host test `tools/test_setup_join.py` extended. Breaking: no (the app's "search again" shows the same list until the hotspot restarts).

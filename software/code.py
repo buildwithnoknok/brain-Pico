@@ -1,5 +1,13 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.25 (no WiFi scan while the setup hotspot runs — DEV-130)
+# Version: 0.26 (clean heap for the product after an online OTA pass — DEV-132)
+#
+# v0.26 changes (Sue): DEV-132 — after a boot whose daily OTA check was due
+#   (TLS session, registry/index fetches, downloads, flashing) a large product
+#   (Smart Lamp Maxi, 36 KB) failed with MemoryError seconds after it started
+#   (strike 1/3, 5 of 6 such boots): the heap was fragmented, ~35 KB free vs
+#   75-100 KB. Now, once the pass went online, the brain plays any alert and
+#   then reloads once (fresh VM) before the product; a marker byte in nvm[5]
+#   makes that run skip the pass (cache rescue only), so it can never loop.
 #
 # v0.25 changes (Sue): DEV-130 — a WiFi scan with the setup hotspot up could
 #   block forever inside CircuitPython's scan iterator and freeze the web server
@@ -348,7 +356,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.25"
+CODE_VERSION = "0.26"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -1863,6 +1871,42 @@ def _ota_check_due():
         return True
     return (time.time() - last) >= OTA_CHECK_INTERVAL_S
 
+# ── A clean heap for the product after an online OTA pass (DEV-132) ────────────
+# The online pass (TLS session, registry/index fetches, downloads, flash
+# buffers) leaves the heap fragmented: the 36 KB Smart Lamp Maxi then failed
+# 9-20 s after it started with "MemoryError ... allocating 17920 bytes" on 5 of
+# 6 boots whose check was due (0 of ~15 quiet boots); free memory 35 KB vs
+# 75-100 KB. gc.collect() cannot defragment, so after a pass that went online
+# the brain reloads once (fresh VM, same WiFi) and the product starts on the
+# quiet path. A marker byte in nvm makes that reloaded run skip the pass, so a
+# check that stays due (GitHub unreachable) can never loop.
+POST_OTA_NVM_INDEX = 5               # one byte; nvm[0]=crash, [1:5]=OTA time, [64:]=Store
+POST_OTA_MAGIC     = 0xA5
+_ota_went_online   = False           # check_and_flash_modules() passed the due check
+_skip_ota_once     = False           # this run IS the reload after a pass
+
+def _take_post_ota_marker():
+    """True (and clears it) when the previous run reloaded after its OTA pass."""
+    try:
+        if microcontroller.nvm[POST_OTA_NVM_INDEX] == POST_OTA_MAGIC:
+            microcontroller.nvm[POST_OTA_NVM_INDEX] = 0
+            return True
+    except Exception:
+        pass
+    return False
+
+def _reload_for_clean_heap():
+    """After an online OTA pass: set the marker and reload. No marker, no reload."""
+    if not _ota_went_online:
+        return
+    try:
+        microcontroller.nvm[POST_OTA_NVM_INDEX] = POST_OTA_MAGIC
+    except Exception as e:
+        log(f"[boot] cannot set the post-OTA marker ({e!r}) — starting without the reload")
+        return
+    log("[boot] OTA pass done — reloading once for a clean heap before the product (DEV-132)")
+    supervisor.reload()
+
 # ── Telling the customer something went wrong ──────────────────────────────────
 # Every OTA / rescue outcome is otherwise log-only, and a customer never reads
 # a log. Until the app can show device status over the home network, the
@@ -2078,6 +2122,11 @@ def check_and_flash_modules(module_firmware):
     (PID 4E42): not bricked (it can be flashed again), but discover() skips
     bootloader-PID devices and there is no USB rescue, so it is not re-flashed
     automatically."""
+    global _ota_went_online
+    if _skip_ota_once:
+        # The reload right after today's pass (DEV-132): no network work again.
+        _rescue_from_cache("first run after the post-OTA reload")
+        return
     # The carrier's firmware is not the product's business: always in (DEV-124).
     module_firmware = dict(module_firmware or {})
     for mtype, spec in CARRIER_FIRMWARE.items():
@@ -2104,6 +2153,7 @@ def check_and_flash_modules(module_firmware):
     if not _ota_check_due():
         _rescue_from_cache("update check not due (last < 24 h ago)")
         return
+    _ota_went_online = True          # from here on the heap gets churned (DEV-132)
     # Resolve the manifest's floors into concrete versions + URLs via the module
     # registry. Two small JSON fetches; everything downstream then works on the
     # {version, url} shape firmware_report() has always taken.
@@ -2471,6 +2521,8 @@ def main():
         supervisor.reload()
     log_new_boot()
     log("[boot] noknok Pico W — starting")
+    global _skip_ota_once
+    _skip_ota_once = _take_post_ota_marker()     # DEV-132: read + clear every run
     try:
         if microcontroller.cpu.reset_reason == microcontroller.ResetReason.WATCHDOG:
             event("[WDT] watchdog reset — the previous run hung (bench watchdog)")
@@ -2552,6 +2604,7 @@ def main():
                 log(f"[fw] check_and_flash_modules error (ignored): {e!r}")
             _release_conductor()
             alert_customer()
+            _reload_for_clean_heap()         # DEV-132: only after an online OTA pass
             start_app_channel()              # after the last download, before the product
             run_product(connected=True)
         else:
