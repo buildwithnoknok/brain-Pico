@@ -1,5 +1,20 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.26 (clean heap for the product after an online OTA pass — DEV-132)
+# Version: 0.27 (USB module updates and rescue around a hard reset — DEV-133/134)
+#
+# v0.27 changes (Sam): DEV-133 / DEV-134 — the Pico PIO-USB host does not see a
+#   USB module re-enumerate within one host session (DEV-45); a fresh host
+#   always does. A LEDs 16x update (0xB0, then waiting for PID 4E42) therefore
+#   failed and left the module in its bootloader, and after a PicoHub X035
+#   flash or rescue (J2 VBUS off while it is in its bootloader) the USB module
+#   was gone until a hard reset. Now: a USB update only asks the module into
+#   its bootloader ("PENDING", noknok.py 1.18); every boot that rescues runs
+#   Conductor.usb_fw_pass() after enumeration, which flashes any module found
+#   at PID 4E42 from the cache (= USB rescue) and verifies the version one boot
+#   later; and the brain HARD-resets instead of the DEV-132 soft reload before
+#   the product whenever a USB module was asked/flashed or the X035 was flashed
+#   or rescued on a brain with USB host pins. The nvm[5] marker still skips the
+#   pass after a reset that followed an online pass. Each hard reset costs one
+#   boot (~25 s), only on a day an update or rescue happens.
 #
 # v0.26 changes (Sue): DEV-132 — after a boot whose daily OTA check was due
 #   (TLS session, registry/index fetches, downloads, flashing) a large product
@@ -356,7 +371,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.26"
+CODE_VERSION = "0.27"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -636,6 +651,8 @@ def get_conductor(rescue_get_image=None):
                 _rescue_parked(c, rescue_get_image)
             found = c.enumerate_all()       # ~3 s — discovers I2C + USB modules
             log(f"[roles] Enumeration done — {found} module(s) found")
+            if rescue_get_image is not None:
+                _usb_fw(c)                  # DEV-133: pending USB updates + USB rescue
             _conductor = c
         except Exception as e:
             log(f"[roles] Conductor init failed: {e}")
@@ -663,6 +680,8 @@ def _rescue_parked(c, get_image):
     event(f"[RESCUE] uid={res.get('uid')} type={res.get('type')} "
           f"reason={res.get('reason')} action={res.get('action')} "
           f"detail={res.get('detail')}")
+    if res.get("type") == "picohub" and res.get("action") == "reflashed":
+        _need_hard_reset_for_usb("the PicoHub power manager was rescued (J2 was off)")
     if res.get("action") != "reflashed":
         # Report it loudly (DEV-97): the product starts a module short, so say
         # so plainly in the log, in the event history the app reads (above),
@@ -672,6 +691,69 @@ def _rescue_parked(c, get_image):
             f"retried on the next boot")
         _field_alerts.append("rescue %s %s" % (res.get("action"), res.get("uid")))
 
+
+# ── USB modules: everything around a hard reset (DEV-133 / DEV-134) ────────────
+# This host session will not see a USB module come back once it re-enumerated
+# or lost VBUS (DEV-45). A hard reset gives a fresh host (the cold-boot reload in
+# main() runs before any USB host exists), which always finds it. So every step
+# that makes a USB module re-enumerate only asks for a hard reset here, and
+# main() does it before the product starts instead of the DEV-132 soft reload.
+_hard_reset_why = None
+
+def _usb_configured():
+    try:
+        return nk.pins("usb") is not None
+    except Exception:
+        return False
+
+def _need_hard_reset_for_usb(why):
+    """Ask main() for a hard reset before the product - only if this brain has a
+    USB host at all (an I2C-only brain loses nothing to a soft reload)."""
+    global _hard_reset_why
+    if _usb_configured() and _hard_reset_why is None:
+        _hard_reset_why = why
+        log(f"[usb] hard reset before the product: {why}")
+
+def _cached_usb_image(entry):
+    """Image for a USB module from the on-device cache (size/crc32-checked). USB
+    images carry no flash layout (the V203 bootloader has one fixed layout).
+    Hands the version back so usb_fw_pass() can check it one boot later."""
+    image, meta = _cache_read(entry["type"])
+    entry["version"] = meta.get("version")
+    log(f"[usb] using cached {entry['type']} {meta.get('version')} ({len(image)} B)")
+    return image
+
+def _usb_fw(c):
+    """Conductor.usb_fw_pass() with the cache as image source, results to the
+    event log, problems to the customer alert, a hard reset when it moved a
+    module. Best-effort: never stops the boot."""
+    try:
+        results = c.usb_fw_pass(_cached_usb_image, logfn=log)
+    except Exception as e:
+        log(f"[usb] firmware pass failed (ignored): {e!r}")
+        return
+    for r in results:
+        event(f"[USBFW] {r.get('type')} uid={r.get('uid')} action={r.get('action')} "
+              f"detail={r.get('detail')}")
+        if r.get("action") in ("failed", "gave_up", "unknown"):
+            _field_alerts.append("usb %s %s" % (r.get("action"), r.get("uid")))
+    if getattr(c, "usb_needs_reset", False):
+        _need_hard_reset_for_usb("a USB module was flashed or asked into its bootloader")
+
+def _hard_reset_if_needed():
+    """Hard reset if a USB step asked for one. After an online pass the nvm[5]
+    marker is set first, so the run after the reset skips the pass (DEV-132)."""
+    if _hard_reset_why is None:
+        return
+    if _ota_went_online:
+        try:
+            microcontroller.nvm[POST_OTA_NVM_INDEX] = POST_OTA_MAGIC
+        except Exception:
+            pass
+    _release_conductor()
+    event(f"[BOOT] hard reset before the product: {_hard_reset_why}")
+    time.sleep(0.5)
+    microcontroller.reset()
 
 def _rescue_from_cache(why):
     """Parked-module rescue with the on-device cache as the only image source.
@@ -2118,10 +2200,10 @@ def check_and_flash_modules(module_firmware):
     nothing resolved) all run it from the on-device cache (DEV-97); the full
     online pass runs it with a freshly refreshed cache. If it cannot help (no
     cached image, wrong layout, unknown module), _rescue_parked() reports it
-    loudly and the next boot tries again. A failed USB flash leaves the module in its bootloader
-    (PID 4E42): not bricked (it can be flashed again), but discover() skips
-    bootloader-PID devices and there is no USB rescue, so it is not re-flashed
-    automatically."""
+    loudly and the next boot tries again. A USB module is updated around a hard
+    reset (DEV-133): asked into its bootloader here, flashed from the cache by
+    usb_fw_pass() on the next boot (which also rescues any module found at PID
+    4E42), verified on the boot after."""
     global _ota_went_online
     if _skip_ota_once:
         # The reload right after today's pass (DEV-132): no network work again.
@@ -2277,6 +2359,15 @@ def check_and_flash_modules(module_firmware):
     for r in results:
         v   = verify.get(r["uid"])
         now = v["installed"] if v else None
+        if r.get("pending"):
+            # USB (DEV-133): asked into its bootloader; flashed after the hard
+            # reset by usb_fw_pass(), verified on the boot after that.
+            event(f"[FW]    {r['type']:<11} uid={r['uid']} bus={r['bus']}  "
+                  f"{r['installed']} -> {r['required']}  PENDING (hard reset, then flash)")
+            _need_hard_reset_for_usb("USB update of %s pending" % r["type"])
+            continue
+        if r["updated"] and r["type"] == "picohub":
+            _need_hard_reset_for_usb("the PicoHub power manager was updated (J2 was off)")
         if r["updated"] and now == r["required"]:
             event(f"[FW]    {r['type']:<11} uid={r['uid']} bus={r['bus']}  "
                   f"{r['installed']} -> {r['required']}  OK (verified {now})")
@@ -2604,6 +2695,7 @@ def main():
                 log(f"[fw] check_and_flash_modules error (ignored): {e!r}")
             _release_conductor()
             alert_customer()
+            _hard_reset_if_needed()          # DEV-133/134: USB module moved -> fresh host
             _reload_for_clean_heap()         # DEV-132: only after an online OTA pass
             start_app_channel()              # after the last download, before the product
             run_product(connected=True)
@@ -2622,6 +2714,7 @@ def main():
             log("[boot] offline — running the product without updates")
             rescue_offline()
             alert_customer()
+            _hard_reset_if_needed()      # DEV-133/134: a USB module was rescued
             start_app_channel()          # hook only; carrier comes up if the network appears
             run_product(connected=False)
         else:

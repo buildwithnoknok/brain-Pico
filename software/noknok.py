@@ -93,6 +93,14 @@
 #             0x07, CH32X035, bootloader layout 3): "picohub" joins the firmware
 #             groups and the parked-module rescue map; the X035 stage-1's
 #             refusal of a foreign image (error 9) has a plain message.
+# v1.18 (Sam): DEV-133 — USB module updates go around a hard reset of the brain
+#             (the Pico PIO-USB host misses a re-enumeration within one session,
+#             DEV-45). update_module() on USB only records the update in the
+#             Store ("usb") and sends 0xB0, returning "pending"; usb_fw_pass(),
+#             run after enumerate_all() on the next boot, flashes every module it
+#             finds in its bootloader (PID 4E42) from the cache (= USB rescue),
+#             verifies the version one boot later, at most 2 flashes and 2 0xB0
+#             requests per serial. USB serial -> type is remembered in the Store.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -113,7 +121,7 @@ import json
 import os
 import struct
 
-__version__ = "1.17"
+__version__ = "1.18"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -1576,6 +1584,163 @@ class Conductor:
             raise OSError("I2C bus %s is not up" % (entry.get("i2c_bus") or "A"))
         return bus
 
+    # ── USB firmware: around a hard reset (DEV-133) ───────────────────────────
+    # The Pico PIO-USB host does not see a module re-enumerate (app -> bootloader
+    # -> app) within one host session (DEV-45); a host that starts fresh always
+    # does. So a USB update never waits for a re-enumeration: it records the
+    # update in the Store, sends 0xB0 and the caller hard-resets the brain. On
+    # the next boot discover() sees the module at PID 4E42 and usb_fw_pass()
+    # flashes it; one more hard reset and the boot after verifies the version.
+    # The same pass rescues any module found in its bootloader for another reason
+    # (an interrupted flash): its type is known from the Store, keyed by serial
+    # (the bootloader reports the same chip-UID serial as the app).
+    USB_UPDATE_VIA_RESET = True       # False = the old in-session flash (bench only)
+    USB_MAX_FLASHES      = 2          # flash attempts per serial before giving up
+    USB_MAX_ASKS         = 2          # 0xB0 requests per serial before giving up
+    _USB_TYPE_TO_MF_KEY  = {0x04: "usb_leds", 0x06: "usb_leds_16x"}
+    USB_STORE_KEY        = "usb"      # serial -> {type, pending, asks, tries, flashed}
+    _USB_CYCLE_KEYS      = ("pending", "asks", "tries", "flashed")
+
+    def _usb_records(self):
+        data = store().get(self.USB_STORE_KEY)
+        return json.loads(json.dumps(data)) if isinstance(data, dict) else {}
+
+    def _usb_save(self, recs, before=None):
+        if before is not None and json.dumps(recs) == before:
+            return                      # unchanged: no Store write
+        store().set(self.USB_STORE_KEY, recs)
+
+    def _remember_usb_types(self, found):
+        """serial -> manifest key for every USB app seen, so a module later found
+        in its bootloader (which cannot say its type) can be rescued."""
+        recs = self._usb_records()
+        before = json.dumps(recs)
+        for serial, _name, module in found:
+            mf_key = self._USB_TYPE_TO_MF_KEY.get(getattr(module, "MODULE_TYPE", None))
+            if mf_key:
+                recs.setdefault(serial, {})["type"] = mf_key
+        self._usb_save(recs, before)
+
+    def _usb_flasher(self):
+        if getattr(self, "_usb_fl", None) is None:
+            import noknok_usb
+            self._usb_fl = noknok_usb.UsbModuleFlasher()
+        return self._usb_fl
+
+    def usb_fw_pass(self, get_image, logfn=print):
+        """Finish pending USB updates and rescue USB modules left in their
+        bootloader. Call right after enumerate_all(). `get_image(entry) -> bytes`
+        as for update_all() (code.py passes the on-device cache; it may set
+        entry["version"] to the image's version for the check one boot later).
+
+        Returns a list of {uid, type, action, detail}; action is one of
+        flashed, asked, verified, failed, gave_up, unknown. Sets
+        self.usb_needs_reset = True when the brain must hard-reset before the
+        product runs (a module was flashed or asked into its bootloader: this
+        host session will not see it come back)."""
+        self.usb_needs_reset = False
+        results = []
+        parked = list(getattr(self, "usb_parked", None) or [])
+        recs = self._usb_records()
+        if not parked and not any(isinstance(r, dict) and r.get("pending")
+                                  for r in recs.values()):
+            return results              # the normal boot: nothing to do, no write
+        before = json.dumps(recs)
+
+        for serial in parked:
+            rec = recs.setdefault(serial, {})
+            mf_key = rec.get("type")
+            if not mf_key:
+                logfn("[usb] module %s is in its bootloader, type unknown - "
+                      "needs a manual flash" % serial)
+                results.append({"uid": serial, "type": None, "action": "unknown",
+                                "detail": "serial not in the Store"})
+                continue
+            if rec.get("tries", 0) >= self.USB_MAX_FLASHES:
+                logfn("[usb] %s %s still in its bootloader after %d flashes - giving up"
+                      % (mf_key, serial, rec["tries"]))
+                results.append({"uid": serial, "type": mf_key, "action": "gave_up",
+                                "detail": "%d flashes" % rec["tries"]})
+                continue
+            rec["tries"] = rec.get("tries", 0) + 1
+            rec["pending"] = True
+            rec.pop("flashed", None)
+            self._usb_save(recs)        # count the attempt BEFORE flashing
+            before = json.dumps(recs)
+            entry = {"type": mf_key, "bus": "usb", "uid": serial, "address": None}
+            try:
+                image = get_image(entry)
+                if not image:
+                    raise ValueError("no image available for %s" % mf_key)
+                logfn("[usb] %s %s is in its bootloader - flashing %d bytes (attempt %d)"
+                      % (mf_key, serial, len(image), rec["tries"]))
+                self._usb_flasher().flash(image, serial=serial, confirm_app=False)
+                rec["flashed"] = entry.get("version") or "?"
+                self.usb_needs_reset = True
+                results.append({"uid": serial, "type": mf_key, "action": "flashed",
+                                "detail": "%d bytes, version %s" % (len(image), rec["flashed"])})
+            except Exception as e:
+                logfn("[usb] flashing %s %s FAILED: %s" % (mf_key, serial, e))
+                results.append({"uid": serial, "type": mf_key, "action": "failed",
+                                "detail": str(e)})
+
+        for m in list(getattr(self, "leds", [])) + list(getattr(self, "leds16", [])):
+            serial = getattr(m, "_uid_hex", None)
+            rec = recs.get(serial) if serial else None
+            if not isinstance(rec, dict) or not rec.get("pending"):
+                continue
+            flashed = rec.get("flashed")
+            if flashed:
+                # Flashed on the previous boot; now running as the app again.
+                ok = flashed == "?" or flashed == m.firmware_version
+                results.append({"uid": serial, "type": rec.get("type"),
+                                "action": "verified" if ok else "failed",
+                                "detail": "running %s (flashed %s)" % (m.firmware_version, flashed)})
+                for k in self._USB_CYCLE_KEYS:
+                    rec.pop(k, None)
+                continue
+            # Asked into the bootloader but back as the app: it lost power before
+            # it was flashed (the request lives in its SRAM). Ask once more.
+            if rec.get("asks", 0) >= self.USB_MAX_ASKS:
+                results.append({"uid": serial, "type": rec.get("type"), "action": "gave_up",
+                                "detail": "did not stay in its bootloader after %d requests"
+                                          % rec["asks"]})
+                for k in self._USB_CYCLE_KEYS:
+                    rec.pop(k, None)
+                continue
+            rec["asks"] = rec.get("asks", 0) + 1
+            self._usb_save(recs)
+            before = json.dumps(recs)
+            try:
+                if self._usb_flasher().request_bootloader(serial):
+                    self.usb_needs_reset = True
+                    results.append({"uid": serial, "type": rec.get("type"), "action": "asked",
+                                    "detail": "0xB0 again (request %d)" % rec["asks"]})
+            except Exception as e:
+                results.append({"uid": serial, "type": rec.get("type"), "action": "failed",
+                                "detail": "0xB0: %s" % e})
+        self._usb_save(recs, before)
+        return results
+
+    def _usb_request_update(self, entry):
+        """update_module() for a USB module (DEV-133): record, then 0xB0."""
+        serial = entry.get("uid")
+        if not serial:
+            raise ValueError("USB update needs the module's serial")
+        recs = self._usb_records()
+        rec = recs.setdefault(serial, {})
+        if rec.get("asks", 0) >= self.USB_MAX_ASKS:
+            raise RuntimeError("asked into its bootloader %d times already - giving up"
+                               % rec["asks"])
+        rec["type"] = entry.get("type") or rec.get("type")
+        rec["pending"] = True
+        rec["asks"] = rec.get("asks", 0) + 1
+        rec.pop("flashed", None)
+        self._usb_save(recs)            # BEFORE 0xB0: a power cut after it keeps the record
+        if not self._usb_flasher().request_bootloader(serial):
+            raise RuntimeError("running app (PID 4E4E) %s not found" % serial)
+        return "pending"
+
     def update_module(self, entry, image, progress=None):
         """
         Flash one module's firmware. `entry` is a firmware_report() dict (needs
@@ -1585,6 +1750,10 @@ class Conductor:
         handle), so the Conductor's existing instance for it goes stale — call
         enumerate()/enumerate_usb()/enumerate_all() afterwards to refresh. update_all()
         does this for you. Returns True on success; raises on failure.
+
+        USB (DEV-133): with USB_UPDATE_VIA_RESET the module is only asked into its
+        bootloader and "pending" is returned; the caller must hard-reset the brain,
+        and usb_fw_pass() on the next boot flashes it (get_image there).
         """
         bus = entry.get("bus")
         if bus == "i2c":
@@ -1593,6 +1762,8 @@ class Conductor:
                                                         progress=progress)
             return True
         if bus == "usb":
+            if self.USB_UPDATE_VIA_RESET:
+                return self._usb_request_update(entry)
             import noknok_usb
             noknok_usb.UsbModuleFlasher().flash(image, serial=entry.get("uid"),
                                                 progress=progress)
@@ -1856,9 +2027,13 @@ class Conductor:
                     raise ValueError("no image available")
                 logfn("Updating %s (%s -> %s) over %s..."
                       % (r["type"], r["installed"], r["required"], r["bus"]))
-                self.update_module(r, image, progress=progress)
-                r2["updated"], r2["error"] = True, None
-                logfn("  OK")
+                res = self.update_module(r, image, progress=progress)
+                if res == "pending":
+                    r2["updated"], r2["error"], r2["pending"] = False, None, True
+                    logfn("  PENDING - in its bootloader, flashed after a hard reset (DEV-133)")
+                else:
+                    r2["updated"], r2["error"] = True, None
+                    logfn("  OK")
             except Exception as e:
                 r2["updated"], r2["error"] = False, str(e)
                 logfn("  FAILED: %s" % e)
@@ -2042,11 +2217,19 @@ class Conductor:
         print("Enumerating noknok USB modules...")
         self.leds = []
         self.leds16 = []
+        self.usb_parked = []
         try:
             found = noknok_usb.discover(dp, dm)
         except Exception as e:
             print("  USB discovery failed:", e)
             return 0
+        self.usb_parked = list(getattr(noknok_usb, "last_bootloaders", None) or [])
+        for serial in self.usb_parked:
+            print("  module in its USB bootloader (PID 4E42)  serial: %s" % serial)
+        try:
+            self._remember_usb_types(found)
+        except Exception as e:
+            print("  could not remember the USB module types:", e)
 
         for serial, type_name, module in found:
             if type_name == "noknokleds":

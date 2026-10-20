@@ -23,7 +23,8 @@
 import time
 import struct
 
-__version__ = "1.1"   # 1.1 = DEV-46: LEDs 16x + dispatch on the 0xF0 type byte
+__version__ = "1.2"   # 1.2 = DEV-133: discover() notes bootloader devices, request_bootloader()
+                      # 1.1 = DEV-46: LEDs 16x + dispatch on the 0xF0 type byte
 
 try:
     import usb.core
@@ -418,8 +419,15 @@ _USB_TYPES = {
 }
 
 APP_PID = 0x4E4E   # every noknok USB application (the bootloader is 0x4E42)
+BL_PID  = 0x4E42   # the noknok USB bootloader (same chip-UID serial as the app)
 
 _host_port = None
+
+# Serials (lower-case) of the noknok USB modules the last discover() saw sitting
+# in their bootloader (PID 4E42). discover() does not return them (they have no
+# driver), but the Conductor's USB firmware pass flashes them (DEV-133): this is
+# how a module left in its bootloader by an update gets its app back.
+last_bootloaders = []
 
 
 def available():
@@ -459,9 +467,11 @@ def discover(dp=None, dm=None, settle_sec=3, max_sec=20, empty_grace=6):
     Each module's serial (chip-UID hex) is the stable identity; the Conductor
     keys its registry by it, exactly like an I2C UID.
     """
+    global last_bootloaders
     ensure_host_port(dp, dm)
     found = {}                          # serial(lower) -> (type_name, module)
     skipped = set()                     # serials that answered an unknown type
+    in_bl = set()                       # serials seen in their bootloader (PID 4E42)
     start = time.monotonic()
     last_new = None
     while True:
@@ -475,8 +485,15 @@ def discover(dp=None, dm=None, settle_sec=3, max_sec=20, empty_grace=6):
             break                       # found some, settled
         for d in usb.core.find(find_all=True):
             try:
-                if d.idVendor != NOKNOK_VID or d.idProduct != APP_PID:
-                    continue            # not ours, or a module sitting in its bootloader
+                if d.idVendor != NOKNOK_VID:
+                    continue            # not ours
+                if d.idProduct == BL_PID:
+                    s = d.serial_number         # same chip-UID serial as its app
+                    if s:
+                        in_bl.add(s.lower())
+                    continue            # no driver; the USB firmware pass handles it
+                if d.idProduct != APP_PID:
+                    continue
             except Exception:
                 continue
             try:
@@ -512,6 +529,7 @@ def discover(dp=None, dm=None, settle_sec=3, max_sec=20, empty_grace=6):
             found[key] = (type_name, mod)
             last_new = now
         time.sleep(0.3)
+    last_bootloaders = sorted(in_bl)
     return [(k, t, m) for k, (t, m) in found.items()]
 
 
@@ -661,6 +679,23 @@ class UsbModuleFlasher:
     def present(self, serial=None):
         """True if a noknok USB bootloader (PID 4E42) is on the bus."""
         return self._find(self.PID_BOOTLOADER, serial) is not None
+
+    def request_bootloader(self, serial):
+        """Send 0xB0 to the running app with this serial and do NOT wait for the
+        bootloader to appear (DEV-133). The Pico PIO-USB host does not reliably
+        see a device re-enumerate within one host session (DEV-45), so the
+        caller hard-resets the brain and flashes the module on the next boot,
+        when a fresh host finds it at PID 4E42. Returns True if the app was found
+        and the command was sent. The bootloader has no timeout: the module waits
+        there until it is flashed or loses power."""
+        app = self._find(self.PID_APP, serial)
+        if app is None:
+            return False
+        try:
+            self._send(app, [self.APP_CMD_ENTER])
+        except Exception:
+            pass        # the module resets immediately; the write need not complete
+        return True
 
     def enter_bootloader(self, serial=None, timeout=8.0):
         """Flip a running app into the bootloader: find it (PID 4E4E), send 0xB0,
