@@ -116,6 +116,7 @@ check("16x found as NoknokLEDs16 (after 2 silent polls)",
 check("unknown type 0x09 skipped", "ccccnew" not in found)
 check("unknown type probed only once", dnew.writes.count(b"\xF0") == 1)
 check("bootloader PID ignored", "ddddbl" not in found and not dbl.writes)
+check("  ...but noted in last_bootloaders (DEV-133)", nu.last_bootloaders == ["ddddbl"])
 check("foreign VID ignored", "eeeeforeign" not in found and not dfor.writes)
 check("exactly two modules", len(found) == 2)
 check("firmware version read", found["bbbb16x"][1].firmware_version == "2.2.0")
