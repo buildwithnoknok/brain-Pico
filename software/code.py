@@ -1,5 +1,11 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.27 (USB module updates and rescue around a hard reset — DEV-133/134)
+# Version: 0.28 (one WiFi scan per boot, none after a failed join — DEV-136)
+#
+# v0.28 changes (Sue): DEV-136 — 0.25 scanned in station mode before EVERY
+#   start_ap(); right after a router "Authentication failure" that scan hung
+#   for good (2 of 2), so noknok-setup never came back. Now the brain scans
+#   ONCE per boot, before the first start_ap() on a fresh radio; a hotspot
+#   restart after a failed join reuses that list (_scan_before_ap()).
 #
 # v0.27 changes (Sam): DEV-133 / DEV-134 — the Pico PIO-USB host does not see a
 #   USB module re-enumerate within one host session (DEV-45); a fresh host
@@ -371,7 +377,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.27"
+CODE_VERSION = "0.28"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -1223,6 +1229,17 @@ def _refresh_scan_cache():
     if _scan_cache is not None:
         log(f"[ap] {len(_scan_cache)} WiFi network(s) visible before the hotspot starts")
 
+def _scan_before_ap():
+    """Called before every start_ap(). DEV-130: never scan with the AP up.
+    DEV-136: and never right after a failed join either - that station-mode
+    scan hung for good after a router "Authentication failure" (2 of 2). So:
+    ONE scan per boot, on a fresh radio before the first start_ap(); every
+    restart of the hotspot reuses that list."""
+    if _scan_at is None:
+        _refresh_scan_cache()
+    else:
+        log("[ap] reusing the network list from boot (no scan after a failed join, DEV-136)")
+
 def _visible_networks():
     """(networks or None, live). With the hotspot up: the list scanned before it
     started (live False). Without it (home WiFi): a fresh scan (live True)."""
@@ -1506,7 +1523,7 @@ def run_ap_provisioning():
     Retries (restarts the AP) if the WiFi join fails.
     """
     while True:  # outer loop lets us rebuild the AP after a failed WiFi attempt
-        _refresh_scan_cache()        # DEV-130: the only scan of this AP session
+        _scan_before_ap()
         wifi.radio.start_ap(ssid=AP_SSID, password=AP_PASSWORD)
         ap_ip = str(wifi.radio.ipv4_address_ap)
         log(f"[ap] Hotspot started: '{AP_SSID}' — http://{ap_ip}")

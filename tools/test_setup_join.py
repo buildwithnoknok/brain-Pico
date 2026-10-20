@@ -198,6 +198,35 @@ r = provision("Anything")
 check("scan impossible -> nothing refused", r.get("accepted") is True)
 check("no provision path ever scanned with the AP up", Radio.scans == scans + 1)
 
+print("\nDEV-136: one scan per boot, none after a failed join")
+ns["_scan_at"] = None
+ns["_scan_cache"] = None
+Radio.scan_fails = False
+Radio.scan = [Net("Home", -50), Net("Cafe", -60)]
+Radio.ap_active = False                    # station mode, before the first start_ap()
+n0 = Radio.scans
+ns["_scan_before_ap"]()
+check("first hotspot start of the boot: one scan", Radio.scans == n0 + 1)
+Radio.scan = [Net("Other", -40)]           # what a new scan WOULD see now
+ns["_scan_before_ap"]()                    # hotspot restart after a failed join
+ns["_scan_before_ap"]()                    # ... and another one
+check("restarts after a failed join: no scan at all", Radio.scans == n0 + 1)
+Radio.ap_active = True
+r = ns["_h_wifi_scan"]({}, {})
+check("  ...the boot list is still served", [n["ssid"] for n in r["networks"]] == ["Home", "Cafe"], r)
+ns["_scan_at"] = None
+ns["_scan_cache"] = None
+Radio.scan_fails = True
+Radio.ap_active = False
+n0 = Radio.scans
+ns["_scan_before_ap"]()
+Radio.scan_fails = False
+ns["_scan_before_ap"]()
+check("boot scan failed: no retry after a failed join either", Radio.scans == n0 + 1)
+Radio.ap_active = True
+r = provision("Anything")
+check("  ...no list -> pre-check skipped, nothing refused", r.get("accepted") is True, r)
+
 print("\njoin errors")
 jr = ns["_join_reason"]
 cases = [("ConnectionError: Authentication failure", "auth"),
