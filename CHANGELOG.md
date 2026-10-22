@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## noknok.py 1.19 - 2026-10-22
+
+- DEV-108 - a landscape product (Smart Lamp Maxi) could crash at boot with "region 'bell' is off the panel" when the display missed one reply on a disturbed bus: the driver then assumed an 80x160 portrait panel. It now asks the display up to 3 times, and if there is still no answer it assumes the display's own start-up geometry, 160x80 landscape (or the orientation the product last set), logs `[display] ... no answer to GET_INFO` once, and waits 2 s before asking again. New host test `tools/test_display_fallback.py` (9 checks). Breaking: no (a product that relied on the old 80x160 fallback with a silent display now gets 160x80, which matches the real module).
+
 ## Tools: restore ends running - 2026-10-22 (no component version bumped)
 
 - DEV-114 - after `RESTORE OK` the brain sat idle at the REPL (lamp dark, no setup hotspot) until someone replugged it, because the verify steps run through `pico.py`, which stops `code.py`. `restore_brain.sh` now ends with a hard reset (also after a failed verify) and says so, so the brain starts its product or the noknok-setup WiFi by itself. Breaking: no.

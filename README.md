@@ -31,6 +31,7 @@ over I2C.
 | `display_test.py` | Interactive Display bench tool: type text to draw it; `p` = print(), `icon`, `image`, `region`/`set`, `demo`/`demo2`. See *noknok Display* under *Current versions*. |
 | `bench_dev41.py` | Display hardware check (DEV-41): native sizes, print, icons, image, regions — 8 steps, prints timings + module error byte. Pins GP20/21 (Pi4RFID bench). |
 | `../tools/display_sim.py` | Desktop simulator for the Display driver — a virtual module that decodes the I²C stream like the firmware and dumps the panel as ASCII art (71 checks). Needs `module-I2C-1.42-display` cloned next to this repo for the font. |
+| `../tools/test_display_fallback.py` | Host test (DEV-108): lost `GET_INFO` replies, the 160×80 fallback, back-off, fallback after `rotation()` (9 checks). |
 | `bench_dev46.py` | LEDs 8× + 16× on one hub behind the Pico (DEV-46): driver dispatch, white channel, `status()`, 300-frame burst, firmware report + roles. |
 | `bench_info_settings.py` | Read-only `info` settings on the Pico (live temperature, read-only rejects, no Store writes). |
 | `bench_lamp16.py` | Runs a real product script (`/lamp16_product.py`) unmodified and plays the app between its loop turns — product + settings test **without WiFi**. |
@@ -391,8 +392,9 @@ as a 1-bit-per-pixel blit, so nothing below needs firmware support (v0.2.0+; v0.
   for the module's busy flag first (the module snapshots its 72-byte RX buffer when a command
   *starts*, so back-to-back chunks could otherwise overwrite each other at 400 kHz); every
   rectangle is clipped before it is sent (the firmware rejects a blit past the edge with
-  error 3); an unplugged module never raises — draws return False and `info()` falls back to
-  80×160. **Keep print() and regions apart:** a scrolling terminal repaints full-width bands,
+  error 3); an unplugged module never raises — draws return False; if the module does not answer
+  `GET_INFO` (3 tries) the driver assumes its boot geometry 160×80 landscape, or the one the last
+  `rotation()`/`orient()` asked for, and logs `[display] ... no answer to GET_INFO` once (v1.19, DEV-108). **Keep print() and regions apart:** a scrolling terminal repaints full-width bands,
   so a region inside its path gets wiped.
 - **Plan a layout in the browser:** the [noknok Display Planner](https://buildwithnoknok.github.io/display-planner/)
   draws the regions above to scale, converts any image into a 1-bit icon, and exports the

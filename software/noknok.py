@@ -101,6 +101,11 @@
 #             finds in its bootloader (PID 4E42) from the cache (= USB rescue),
 #             verifies the version one boot later, at most 2 flashes and 2 0xB0
 #             requests per serial. USB serial -> type is remembered in the Store.
+# v1.19 (Sue): DEV-108 — NoknokDisplay no longer drops to 80x160 portrait when one
+#             GET_INFO reply is lost (a landscape product crashed "region ... is off
+#             the panel"): info() tries 3 times, then falls back to the module's boot
+#             geometry 160x80 (or the one rotation()/orient() asked for), logs that
+#             once, and backs off 2 s instead of asking again on every draw.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -121,7 +126,7 @@ import json
 import os
 import struct
 
-__version__ = "1.18"
+__version__ = "1.19"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -4370,14 +4375,23 @@ class NoknokDisplay:
 
     # Used only if GET_INFO never answers (very old firmware / bus trouble), so
     # nothing crashes. Real geometry always comes from the module itself.
-    _FALLBACK_W = 80
-    _FALLBACK_H = 160
+    # DEV-108: = the module's BOOT geometry (landscape, 160x80, firmware 0.6.0+);
+    # it was 80x160 portrait, so one missed reply on a disturbed bus made a
+    # landscape product crash ("region ... is off the panel"). After rotation()
+    # / orient() the fallback follows the geometry that was asked for.
+    _FALLBACK_W = 160
+    _FALLBACK_H = 80
+    _INFO_TRIES = 3          # GET_INFO attempts per info() call
+    _INFO_RETRY_S = 2.0      # after a failed info(), use the fallback this long
 
     def __init__(self, i2c, address=0x08):
         self.i2c        = i2c
         self.address    = address
         self._uid_hex   = None    # set by Conductor.enumerate()
         self._info      = None    # cached DisplayInfo from GET_INFO
+        self._fallback  = (self._FALLBACK_W, self._FALLBACK_H)
+        self._info_next = 0.0     # monotonic time of the next GET_INFO try after a failure
+        self._info_warned = False # "GET_INFO failed" is logged once
         self._bg        = BLACK   # last clear() colour = default text background
         self._backlight = None    # last level we set (0-255), for role_cue()
         self.auto_wait  = True    # wait for the module to finish before each draw
@@ -4469,26 +4483,35 @@ class NoknokDisplay:
         """
         if self._info is not None and not refresh:
             return self._info
-        if not self._send([self._CMD_GET_INFO]):
-            return None
-        time.sleep(0.003)                     # let the module load its reply
-        buf = self._read_raw(5)
-        if buf is None or buf[0] == 0 or buf[1] == 0:
-            return None                       # no / invalid answer, keep fallbacks
-        self._info = DisplayInfo(buf)
-        return self._info
+        if not refresh and time.monotonic() < self._info_next:
+            return None                       # failed a moment ago: don't stall every draw
+        for _ in range(self._INFO_TRIES):     # DEV-108: one missed reply is not "no answer"
+            if self._send([self._CMD_GET_INFO]):
+                time.sleep(0.003)             # let the module load its reply
+                buf = self._read_raw(5)
+                if buf is not None and buf[0] != 0 and buf[1] != 0:
+                    self._info = DisplayInfo(buf)
+                    return self._info
+            time.sleep(0.02)
+        self._info = None                     # never keep a stale size after a refresh
+        self._info_next = time.monotonic() + self._INFO_RETRY_S
+        if not self._info_warned:
+            self._info_warned = True
+            print("[display] 0x%02X: no answer to GET_INFO - assuming %dx%d"
+                  % (self.address, self._fallback[0], self._fallback[1]))
+        return None
 
     @property
     def width(self):
-        """Panel width in pixels (from the module; falls back to 80)."""
+        """Panel width in pixels (from the module; falls back to 160, landscape)."""
         i = self.info()
-        return i.width if i else self._FALLBACK_W
+        return i.width if i else self._fallback[0]
 
     @property
     def height(self):
-        """Panel height in pixels (from the module; falls back to 160)."""
+        """Panel height in pixels (from the module; falls back to 80, landscape)."""
         i = self.info()
-        return i.height if i else self._FALLBACK_H
+        return i.height if i else self._fallback[1]
 
     # ── Screen control ────────────────────────────────────────────────────────
 
@@ -4535,7 +4558,11 @@ class NoknokDisplay:
         regions are re-clipped (ones that fall off the panel are dropped —
         the dropped names are returned).
         """
-        ok = self._send([self._CMD_SET_ROTATION, orientation(rot)])
+        o = orientation(rot)
+        ok = self._send([self._CMD_SET_ROTATION, o])
+        # 80x160 panel: the odd rotations are landscape (used only if GET_INFO fails)
+        self._fallback = (self._FALLBACK_W, self._FALLBACK_H) if o & 1 else \
+                         (self._FALLBACK_H, self._FALLBACK_W)
         time.sleep(0.08)
         return self._after_geometry_change(ok)
 
@@ -4549,6 +4576,7 @@ class NoknokDisplay:
         ok = self._send([self._CMD_SET_ORIENT, int(madctl) & 0xFF,
                          int(xoff) & 0xFF, int(yoff) & 0xFF,
                          int(w) & 0xFF, int(h) & 0xFF])
+        self._fallback = (int(w) & 0xFF, int(h) & 0xFF)
         time.sleep(0.08)
         return self._after_geometry_change(ok)
 
