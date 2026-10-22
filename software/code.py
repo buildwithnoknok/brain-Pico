@@ -1,5 +1,15 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.31 (an offline brain rejoins WiFi on its own — DEV-79)
+# Version: 0.32 (no internet from a setup hotspot's DHCP lease — DEV-113)
+#
+# v0.32 changes (Sue): DEV-113 — a brain joined the home WiFi but got 192.168.4.16
+#   with no DNS (no NTP, no OTA, unreachable). 192.168.4.16 is the first lease of
+#   the CircuitPython/MicroPython setup-hotspot DHCP server, which listens on every
+#   interface: a device whose hotspot DHCP server outlives its hotspot answers DHCP
+#   on the home network too. Now: every join logs gateway, DNS and the access point
+#   (BSSID, channel, RSSI); a 192.168.4.x lease with gateway 192.168.4.1 is rejoined
+#   up to ROGUE_LEASE_TRIES times, then kept with a [WIFI] event; and the brain's own
+#   hotspot is stopped together with its DHCP server (_stop_ap, stop_dhcp_ap() where
+#   CircuitPython has it), so a brain cannot be the one handing those leases out.
 #
 # v0.31 changes (Sue): DEV-79 — a brain that booted while the router was down
 #   stayed offline until a power cycle in practice: the rejoin in noknok_rpc's
@@ -406,7 +416,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.31"
+CODE_VERSION = "0.32"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -939,8 +949,23 @@ def connect_wifi(ssid, password):
     global _wifi_error
     _wifi_error = None
     try:
-        wifi.radio.connect(ssid, password, timeout=WIFI_TIMEOUT_S)
-        log(f"[wifi] Connected — IP: {wifi.radio.ipv4_address}")
+        for lease in range(1, ROGUE_LEASE_TRIES + 1):
+            wifi.radio.connect(ssid, password, timeout=WIFI_TIMEOUT_S)
+            log(f"[wifi] Connected — IP: {wifi.radio.ipv4_address}")
+            _log_link()
+            if not _rogue_lease():
+                break
+            # DEV-113: a 192.168.4.x address with gateway 192.168.4.1 is a lease
+            # from a noknok/CircuitPython setup hotspot whose DHCP server also
+            # answers on its home-WiFi side: no internet, no DNS, unreachable.
+            log("[wifi] address came from a setup hotspot's DHCP server on this "
+                f"network (another brain in setup?) — rejoining ({lease}/{ROGUE_LEASE_TRIES})")
+            if lease == ROGUE_LEASE_TRIES:
+                event("[WIFI] got a 192.168.4.x address from a setup hotspot on the "
+                      "home network: no internet until that device leaves setup")
+                break
+            wifi.radio.stop_station()
+            time.sleep(2)
         return True
     except Exception as e:
         _wifi_error = "%s: %s" % (type(e).__name__, e)
@@ -948,6 +973,39 @@ def connect_wifi(ssid, password):
         return False
 
 _wifi_error = None          # text of the last failed join (connect_wifi)
+ROGUE_LEASE_TRIES = 3       # joins in a row before a setup-hotspot lease is accepted
+
+def _log_link():
+    """DEV-113: which access point and DHCP answer did this join get?"""
+    try:
+        ap = wifi.radio.ap_info
+        bssid = ":".join("%02X" % b for b in ap.bssid) if ap else "?"
+        log(f"[wifi] gateway {wifi.radio.ipv4_gateway}  DNS {wifi.radio.ipv4_dns}  "
+            f"AP {bssid} ch {ap.channel if ap else '?'} rssi {ap.rssi if ap else '?'}")
+    except Exception as e:
+        log(f"[wifi] link details unavailable ({e!r})")
+
+def _rogue_lease():
+    """True when the station got its address from a setup hotspot's DHCP server
+    (CircuitPython/MicroPython dhcpserver: 192.168.4.16.., gateway = itself)."""
+    try:
+        ip, gw = str(wifi.radio.ipv4_address), str(wifi.radio.ipv4_gateway)
+        return (ip.startswith("192.168.4.") and gw == "192.168.4.1"
+                and not wifi.radio.ap_active)
+    except Exception:
+        return False
+
+def _stop_ap():
+    """Stop the setup hotspot AND its DHCP server. DEV-113: CircuitPython's
+    hotspot DHCP server listens on every interface; if it outlives the hotspot,
+    the brain hands 192.168.4.x addresses to devices on the home network."""
+    wifi.radio.stop_ap()
+    stop = getattr(wifi.radio, "stop_dhcp_ap", None)
+    if stop is not None:
+        try:
+            stop()
+        except Exception as e:
+            log(f"[ap] stop_dhcp_ap: {e!r}")
 
 def _join_reason(err):
     """Classify a CircuitPython join error for the app (DEV-100): 'auth' (wrong
@@ -1701,7 +1759,7 @@ def run_ap_provisioning():
         pid  = pending["product_id"]
 
         rpc.stop_http()                          # listener dies with the AP
-        wifi.radio.stop_ap()
+        _stop_ap()
         log("[ap] Hotspot stopped — attempting WiFi join")
 
         # The Pico W radio often fails the FIRST join right after AP mode with

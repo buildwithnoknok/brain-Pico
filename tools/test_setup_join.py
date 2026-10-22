@@ -290,5 +290,50 @@ ns["_h_hello"]({"ack": "app-100"}, {})
 check("ack ignored when no join is pending", pending["acked"] is False)
 check("REPLY_GRACE_S covers one lwIP retransmit (>= 4 s)", ns["REPLY_GRACE_S"] >= 4)
 
+print("\nsetup-hotspot DHCP lease on the home network (DEV-113)")
+class ApInfo:
+    bssid, channel, rssi = bytes([0xC4, 0xEB, 0x43, 4, 0x46, 0x52]), 1, -55
+leases = []
+def _connect(ssid, pw, timeout=None):
+    ip, gw = leases.pop(0)
+    Radio.ipv4_address, Radio.ipv4_gateway, Radio.ipv4_dns = ip, gw, gw
+Radio.connect = staticmethod(_connect)
+Radio.ap_info = ApInfo()
+Radio.station_stops = 0
+def _stop_station():
+    Radio.station_stops += 1
+Radio.stop_station = staticmethod(_stop_station)
+events_seen = []
+ns["event"] = events_seen.append
+ns["time"].sleep = lambda s: None
+logged = []
+ns["log"] = logged.append
+Radio.ap_active = False
+leases[:] = [("192.168.4.16", "192.168.4.1"), ("192.168.1.242", "192.168.1.1")]
+ok = ns["connect_wifi"]("Home", "pw")
+check("rogue lease -> rejoin, router lease kept", ok and Radio.ipv4_address == "192.168.1.242"
+      and Radio.station_stops == 1 and not events_seen, Radio.ipv4_address)
+check("gateway / DNS / AP bssid logged at connect",
+      any("gateway 192.168.1.1" in l and "C4:EB:43:04:46:52" in l for l in logged))
+leases[:] = [("192.168.4.16", "192.168.4.1")] * 3
+Radio.station_stops = 0
+ok = ns["connect_wifi"]("Home", "pw")
+check("rogue lease every time -> joined, %d rejoins, one event" % Radio.station_stops,
+      ok and Radio.station_stops == ns["ROGUE_LEASE_TRIES"] - 1 and len(events_seen) == 1)
+leases[:] = [("192.168.4.20", "192.168.4.254")]
+del events_seen[:]; Radio.station_stops = 0
+ok = ns["connect_wifi"]("Home", "pw")
+check("a home network that really is 192.168.4.x (other gateway) is accepted",
+      ok and Radio.station_stops == 0 and not events_seen)
+calls = []
+Radio.stop_ap = staticmethod(lambda: calls.append("stop_ap"))
+Radio.stop_dhcp_ap = staticmethod(lambda: calls.append("stop_dhcp_ap"))
+ns["_stop_ap"]()
+check("_stop_ap also stops the hotspot's DHCP server", calls == ["stop_ap", "stop_dhcp_ap"], calls)
+del Radio.stop_dhcp_ap
+calls[:] = []
+ns["_stop_ap"]()
+check("_stop_ap without stop_dhcp_ap (older CircuitPython) still stops the AP", calls == ["stop_ap"])
+
 print("\n%s (%d failure%s)" % ("PASS" if not fails else "FAIL", fails, "" if fails == 1 else "s"))
 sys.exit(1 if fails else 0)

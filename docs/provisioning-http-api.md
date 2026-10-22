@@ -166,6 +166,14 @@ within 15 min without a power cycle, the `/rpc` channel comes up, the clock is s
 and mDNS starts (if `NOKNOK_MDNS = 1`). The module firmware check stays a boot-time
 check (next due boot). Without `product.py` the setup AP is offered, credentials kept.
 
+**A 192.168.4.x address on the home WiFi** (DEV-113, code.py 0.32): the setup hotspot's
+DHCP server (built into CircuitPython) answers on every interface, so a device whose
+hotspot DHCP server outlives its hotspot hands out `192.168.4.16..` with gateway/DNS
+`192.168.4.1` on the home network: no internet, no DNS. Every join logs `[wifi] gateway ...
+DNS ... AP <bssid> ch .. rssi ..`; such a lease is rejoined up to 3 times, then kept with a
+`[WIFI]` event. The brain stops its hotspot together with that DHCP server (`_stop_ap()`).
+Who answers DHCP on a network: `tools/bench/dhcp_offers.py`.
+
 Every step degrades to a no-op rather than failing the boot. Progress goes to
 the serial console and the event history in the runtime Store (`events()` in
 `code.py`; what DEV-36 will show the customer); `/data/log.txt` is written only

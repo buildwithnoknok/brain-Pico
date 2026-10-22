@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## code.py 0.32 - 2026-10-22
+
+- DEV-113 - after a restore a brain joined the home WiFi but got the address 192.168.4.16 with no DNS: no clock, no updates, not reachable from the app. That address is the first one handed out by the setup-hotspot DHCP server built into CircuitPython, which answers on every network interface, so any device whose hotspot DHCP server is still running can hand out such addresses on the home network. Every WiFi join now logs the gateway, DNS server and access point (BSSID, channel, signal); a 192.168.4.x address from gateway 192.168.4.1 is treated as a stray hotspot lease and the brain joins again (up to 3 times, then keeps it and records a `[WIFI]` event); and the brain stops its own hotspot together with that DHCP server. New bench tools `tools/bench/dhcp_offers.py` (who answers DHCP on this network) and `bench_dev113_rogue_dhcp.py`; `tools/test_setup_join.py` +6 checks. Breaking: no.
+
 ## code.py 0.31 + noknok_rpc.py 0.2 - 2026-10-22
 
 - DEV-79 - a brain that started while the router was down stayed offline in practice until it was unplugged: the background rejoin froze the product for up to 5 s on every attempt, and the work that normally follows a join (clock, mDNS) never ran. Now most attempts only start the join (0.5 s) and the radio finishes it in the background; every third attempt is a full one as a safety net. Attempts are spaced 30 s up to 5 min, so the brain is online within 15 min of the network coming back. Once online, the app channel comes up, the clock is synced (2 s limit) and mDNS starts when enabled. Module updates still wait for the next boot that is due. An offline start no longer counts as a "link drop" in `status.link`. New host test `tools/test_wifi_rejoin.py`, bench script `tools/bench/bench_dev79_kick.py`. Breaking: no.
