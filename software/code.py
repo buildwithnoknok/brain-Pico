@@ -1,5 +1,15 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.30 (setup reply survives the hotspot drop — DEV-141)
+# Version: 0.31 (an offline brain rejoins WiFi on its own — DEV-79)
+#
+# v0.31 changes (Sue): DEV-79 — a brain that booted while the router was down
+#   stayed offline until a power cycle in practice: the rejoin in noknok_rpc's
+#   servicing slot existed, but each attempt froze the product for 5 s and the
+#   post-join work never ran. With noknok_rpc 0.2 most attempts only start the
+#   join (0.5 s) and the link is picked up in the background; once online,
+#   _after_join() syncs the clock (NTP, 2 s budget) and starts mDNS when
+#   NOKNOK_MDNS = 1. The /rpc carrier comes up as before. The module firmware
+#   check stays a boot-time check (next due boot), as on a brain that booted
+#   online.
 #
 # v0.30 changes (Sue): DEV-141 — with the RIGHT password the app showed
 #   "Something went wrong" although the brain joined and saved: the provision
@@ -396,7 +406,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.30"
+CODE_VERSION = "0.31"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -489,11 +499,12 @@ def events():
     """The audit history, oldest first (what DEV-36 shows the customer)."""
     return list(nk.store().get(EVENTS_KEY) or [])
 
-def sync_time_ntp(pool):
+def sync_time_ntp(pool, timeout=None):
     """One-time NTP sync to set the RTC so logs get wall-clock timestamps.
     Best-effort: any failure (no adafruit_ntp.mpy, no internet, DNS) is swallowed
     and we simply keep uptime-only logging. Call this AFTER a WiFi connect.
-    `pool` is a socketpool from the radio (reuse the existing one)."""
+    `pool` is a socketpool from the radio (reuse the existing one). `timeout`
+    (s) bounds the wait for the reply when a product is already running."""
     global _rtc_synced
     if _rtc_synced:
         return
@@ -501,7 +512,8 @@ def sync_time_ntp(pool):
         import rtc
         import adafruit_ntp
         # tz_offset stays 0 -> UTC. Keeps it simple; uptime gives relative timing.
-        ntp = adafruit_ntp.NTP(pool, tz_offset=0, cache_seconds=3600)
+        kw = {"socket_timeout": timeout} if timeout else {}
+        ntp = adafruit_ntp.NTP(pool, tz_offset=0, cache_seconds=3600, **kw)
         rtc.RTC().datetime = ntp.datetime
         _rtc_synced = True
         log("[ntp] RTC synced (UTC) — wall-clock timestamps now enabled")
@@ -2661,6 +2673,18 @@ def _h_bench_wifi_drop(args, msg):
     rpc.defer(_drop)
     return {"dropping": secs}
 
+def _after_join():
+    """DEV-79: post-join work when the brain gets online while a product runs
+    (it booted offline, or the router came back). Runs from rpc.defer(), outside
+    any module transaction. Bounded: NTP waits at most 2 s, and only once."""
+    log("[wifi] online while the product runs — post-join work")
+    try:
+        sync_time_ntp(socketpool.SocketPool(wifi.radio), timeout=2)
+    except Exception as e:
+        log(f"[ntp] after join skipped ({e!r})")
+    if str(nk.env("NOKNOK_MDNS", "0")) == "1" and getattr(rpc, "_mdns", None) is None:
+        rpc.start_mdns(80, log)
+
 def start_app_channel():
     """Home-WiFi /rpc + mDNS for the product's lifetime (DEV-34). After this,
     noknok.py's drivers pump the channel between module transactions, so the
@@ -2674,7 +2698,8 @@ def start_app_channel():
             # Lets the servicing slot re-join after a router reboot (and bring
             # the carrier up on a brain that booted offline) — rate-limited,
             # bounded, never inside a module read.
-            rpc.set_wifi_credentials(creds["ssid"], creds.get("password") or "", 80)
+            rpc.set_wifi_credentials(creds["ssid"], creds.get("password") or "", 80,
+                                     on_up=_after_join)
         if str(nk.env("NOKNOK_WATCHDOG", "0")) == "1":
             rpc.arm_watchdog(8, log)
             rpc.dispatcher().register("bench.wifi_drop", _h_bench_wifi_drop)

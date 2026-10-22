@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## code.py 0.31 + noknok_rpc.py 0.2 - 2026-10-22
+
+- DEV-79 - a brain that started while the router was down stayed offline in practice until it was unplugged: the background rejoin froze the product for up to 5 s on every attempt, and the work that normally follows a join (clock, mDNS) never ran. Now most attempts only start the join (0.5 s) and the radio finishes it in the background; every third attempt is a full one as a safety net. Attempts are spaced 30 s up to 5 min, so the brain is online within 15 min of the network coming back. Once online, the app channel comes up, the clock is synced (2 s limit) and mDNS starts when enabled. Module updates still wait for the next boot that is due. An offline start no longer counts as a "link drop" in `status.link`. New host test `tools/test_wifi_rejoin.py`, bench script `tools/bench/bench_dev79_kick.py`. Breaking: no.
+
 ## noknok.py 1.19 - 2026-10-22
 
 - DEV-108 - a landscape product (Smart Lamp Maxi) could crash at boot with "region 'bell' is off the panel" when the display missed one reply on a disturbed bus: the driver then assumed an 80x160 portrait panel. It now asks the display up to 3 times, and if there is still no answer it assumes the display's own start-up geometry, 160x80 landscape (or the orientation the product last set), logs `[display] ... no answer to GET_INFO` once, and waits 2 s before asking again. New host test `tools/test_display_fallback.py` (9 checks). Breaking: no (a product that relied on the old 80x160 fallback with a silent display now gets 160x80, which matches the real module).

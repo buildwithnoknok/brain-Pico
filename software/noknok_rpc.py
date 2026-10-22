@@ -1,4 +1,12 @@
-# noknok_rpc.py  v0.1 — Device Protocol v1: message dispatcher + carriers (DEV-34)
+# noknok_rpc.py  v0.2 — Device Protocol v1: message dispatcher + carriers (DEV-34)
+#
+# v0.2 (Sue): DEV-79 — an offline brain rejoins WiFi without stalling the
+#   product: most rejoin attempts only START the join (LINK_KICK_S, 0.5 s) and
+#   service() then watches for the link once a second while the radio finishes
+#   in the background; every LINK_FULL_EVERY-th attempt is a full LINK_JOIN_S
+#   attempt as a safety net. set_wifi_credentials(on_up=) runs post-join work
+#   (code.py: NTP, mDNS) once the link is back. An offline boot no longer
+#   counts as a link drop.
 #
 # One JSON message protocol, transport-agnostic (Confluence 113868802 §2):
 #
@@ -34,7 +42,7 @@
 import json
 import time
 
-__version__ = "0.1"
+__version__ = "0.2"
 
 SERVICE_INTERVAL = 0.05     # s between carrier polls from the implicit hook
 SOCKET_TIMEOUT   = 1.0      # s a stalled client may hold poll(). 0.2 s dropped the
@@ -42,7 +50,12 @@ SOCKET_TIMEOUT   = 1.0      # s a stalled client may hold poll(). 0.2 s dropped 
                             # packet can trail its headers by hundreds of ms.
 MAX_BODY         = 4096     # bytes; a settings.set is ~100, a provision ~600
 LINK_CHECK_S     = 30       # how often service() looks at the WiFi link
-LINK_JOIN_S      = 5        # blocking budget for one rejoin attempt
+LINK_JOIN_S      = 5        # blocking budget for a FULL rejoin attempt
+LINK_KICK_S      = 0.5      # budget of a kick: start the join, finish in the background
+LINK_FULL_EVERY  = 3        # every 3rd attempt is a full one (if kicks never complete);
+                            # 0 = kicks only (once the bench proves background joins)
+LINK_POLL_S      = 1.0      # while the link is down: how often to look (cheap)
+LINK_MAX_S       = 300      # longest pause between attempts (DEV-79: join <= 15 min)
 
 
 class BodyTooLarge(Exception):
@@ -229,53 +242,89 @@ _deferred = []
 _logfn    = print
 _err_next = 0.0             # rate limit for poll-error log lines
 _link     = {"ssid": None, "password": None, "next": 0.0, "was_up": True,
-             "drops": 0, "rejoins": 0, "port": 80, "backoff": LINK_CHECK_S}
+             "drops": 0, "rejoins": 0, "port": 80, "backoff": LINK_CHECK_S,
+             "retry_at": 0.0, "on_up": None}
 
-def set_wifi_credentials(ssid, password, port=80):
-    """Let service() re-join the home network after a router reboot and bring
-    the HTTP carrier back (Sam #6). Rate-limited (LINK_CHECK_S), bounded
-    (LINK_JOIN_S), only from the servicing slot — never inside a module read."""
+def set_wifi_credentials(ssid, password, port=80, on_up=None):
+    """Let service() re-join the home network after a router reboot, or join it
+    for the first time on a brain that booted offline (DEV-79), and bring the
+    HTTP carrier back (Sam #6). Rate-limited, bounded, only from the servicing
+    slot — never inside a module read. on_up() runs (deferred) each time the
+    link comes back: post-join work such as NTP."""
     _link["ssid"], _link["password"], _link["port"] = ssid, password, port
+    _link["on_up"] = on_up
+    try:
+        import wifi
+        _link["was_up"] = bool(wifi.radio.connected)   # offline boot = not a "drop"
+    except Exception:
+        pass
+
+def _radio_up():
+    import wifi
+    return bool(wifi.radio.connected) and wifi.radio.ipv4_address is not None
+
+def _link_up(how):
+    """The link is (back) up: reset the backoff, rebuild the carrier, run on_up."""
+    _link["backoff"] = LINK_CHECK_S
+    _link["retry_at"] = 0.0
+    back = not _link["was_up"]
+    _link["was_up"] = True
+    if back:
+        import wifi
+        _logfn("[wifi] %s — %s" % (how, wifi.radio.ipv4_address))
+    if _carrier is None or _carrier.server is None:
+        _restart_http()                     # first time online, or after a drop
+    if back and _link["on_up"] is not None:
+        defer(_link["on_up"])
 
 def _watch_link(now):
-    """Called from service(): note drops, rejoin once per LINK_CHECK_S."""
+    """Called from service(): note drops, rejoin with backoff (DEV-79).
+
+    Up: look again in LINK_CHECK_S. Down: look every LINK_POLL_S (a kicked join
+    may complete in the background), and start a new attempt when its backoff
+    (30 -> 60 -> 120 -> 240 -> 300 s) is over. A kick blocks the product for at
+    most LINK_KICK_S; every LINK_FULL_EVERY-th attempt blocks up to LINK_JOIN_S
+    so the brain still joins if a kick cannot finish on its own."""
     if not _link["ssid"] or now < _link["next"]:
         return
     try:
-        import wifi
-        up = bool(wifi.radio.connected)
+        up = _radio_up()
     except Exception:
         return
     if up:
         _link["next"] = now + LINK_CHECK_S
-        _link["backoff"] = LINK_CHECK_S
-        if not _link["was_up"]:
-            _logfn("[wifi] link is back")
-        _link["was_up"] = True
-        if _carrier is None or _carrier.server is None:
-            _restart_http()                 # first time online, or after a drop
+        _link_up("link is back" if _link["rejoins"] == 0 else
+                 "joined (attempt %d)" % _link["rejoins"])
         return
     if _link["was_up"]:
         _link["drops"] += 1
-        _logfn("[wifi] link DOWN — rejoin with backoff (%d s .. 300 s)" % LINK_CHECK_S)
+        _logfn("[wifi] link DOWN — rejoin with backoff (%d s .. %d s)"
+               % (LINK_CHECK_S, LINK_MAX_S))
     _link["was_up"] = False
-    # Each failed attempt blocks the product for up to LINK_JOIN_S, so a brain
-    # whose router is off for hours must not pay that every 30 s: back off
-    # 30 → 60 → 120 → 240 → 300 s.
+    _link["next"] = now + LINK_POLL_S
+    if now < _link["retry_at"]:
+        return                              # waiting: backoff, or a kicked join running
     backoff = _link.get("backoff", LINK_CHECK_S)
-    _link["next"] = now + backoff
-    _link["backoff"] = min(300, backoff * 2)
+    _link["retry_at"] = now + backoff
+    _link["backoff"] = min(LINK_MAX_S, backoff * 2)
     _link["rejoins"] += 1
+    full = bool(LINK_FULL_EVERY) and _link["rejoins"] % LINK_FULL_EVERY == 0
     try:
-        import gc
+        import gc, wifi
         gc.collect()
-        wifi.radio.connect(_link["ssid"], _link["password"] or "", timeout=LINK_JOIN_S)
-        _logfn("[wifi] rejoined — %s" % wifi.radio.ipv4_address)
-        _link["was_up"] = True
-        _link["backoff"] = LINK_CHECK_S
-        _restart_http()
+        wifi.radio.connect(_link["ssid"], _link["password"] or "",
+                           timeout=LINK_JOIN_S if full else LINK_KICK_S)
     except Exception as e:
-        _logfn("[wifi] rejoin failed: %r" % (e,))
+        # A kick usually "fails" with a timeout while the join goes on; the
+        # next LINK_POLL_S look sees the link if it completes.
+        _logfn("[wifi] rejoin attempt %d (%s): %r — next in %d s"
+               % (_link["rejoins"], "full" if full else "kick", e, backoff))
+        return
+    try:
+        if _radio_up():
+            _link_up("rejoined (attempt %d)" % _link["rejoins"])
+    except Exception:
+        pass
 
 def _restart_http():
     """The listener does not survive a lost link — rebuild it."""

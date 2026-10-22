@@ -160,8 +160,11 @@ handled, because it is the first point at which the Pico has internet:
 **If the WiFi join fails** (router down, out of range): nothing is deleted.
 With `product.py` present the product runs offline — no OTA, no NTP, but a
 module parked after a power cut is still rescued from the on-device image
-cache — and the credentials are retried on the next boot. Without
-`product.py` the setup AP is offered, credentials kept.
+cache — and the credentials are retried **while the product runs** (code.py 0.31 /
+noknok_rpc 0.2, DEV-79; see *Link* below): once the router is back the brain joins
+within 15 min without a power cycle, the `/rpc` channel comes up, the clock is synced
+and mDNS starts (if `NOKNOK_MDNS = 1`). The module firmware check stays a boot-time
+check (next due boot). Without `product.py` the setup AP is offered, credentials kept.
 
 Every step degrades to a no-op rather than failing the boot. Progress goes to
 the serial console and the event history in the runtime Store (`events()` in
@@ -193,7 +196,8 @@ home LAN); pairing / authorisation is DEV-35. Implementation: `software/noknok_r
   drivers pump the channel, throttled to 50 ms; ~1 ms idle, 10–100 ms per request,
   ≤ 240 ms when a phone stalls mid-request — soak, DEV-34 comment 10829). A product
   idling in `time.sleep()` should use `c.sleep()`; otherwise replies wait for its next
-  module read. **Offline brains have no channel** (AP-on-demand = DEV-35).
+  module read. **An offline brain has no channel** until its WiFi rejoin succeeds
+  (code.py 0.31, DEV-79); AP-on-demand = DEV-35.
 - **Round trip ≈ 13 ms** on a quiet LAN (18 Sep 2026). ⚠ That depends on
   `wifi.radio.power_management = NONE`, which `noknok_rpc.start_http()` sets
   (`no_power_save()`). In the CYW43's default power-save mode the radio only listens every
@@ -222,8 +226,12 @@ key ≤ 32 chars, string ≤ 256 chars, all values ≤ 1 KB JSON; scalars only (
 **Write policy (nvm wear + power cuts):** a scope is written after 5 s without changes, at the
 latest 60 s after the first change, never two writes closer than 30 s; forced before any
 reboot / switch / crash reload. **Link:** the servicing slot watches the WiFi link every 30 s
-and re-joins with backoff (30 s → 5 min, ≤ 5 s blocking per attempt), restarting the carrier;
-`status.link` reports `drops` / `rejoins` / `backoff`.
+(every 1 s while it is down) and re-joins with backoff (30 s → 5 min), also on a brain that
+booted offline. Since noknok_rpc 0.2 (DEV-79) an attempt is a 0.5 s "kick" that lets the radio
+finish the join in the background; every 3rd attempt is a full one (≤ 5 s blocking) as a
+safety net (`LINK_FULL_EVERY`, 0 = kicks only). Once the link is up the carrier restarts and
+code.py's post-join work runs (NTP with a 2 s budget, mDNS if enabled).
+`status.link` reports `drops` / `rejoins` / `backoff`; an offline boot is not a drop.
 
 `product_id` (the manifest id) is new and optional on `/connect` and `provision`; it is
 stored with the credentials so the app can fetch the right `config_schema` later.

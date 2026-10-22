@@ -218,7 +218,9 @@ setup-time writes into `/data`, `settings.toml` for pins and drive visibility; s
   the cache. The gate refuses per module, not per type. Any refused/failed update or rescue
   plays the buzzer error motif and flashes the LED Buttons red before the product starts.
 - **Runs offline.** A failed WiFi join never deletes `wifi.json` any more; if `product.py`
-  exists the product runs without updates and the credentials are retried next boot. Only the
+  exists the product runs without updates and the brain keeps retrying the join in the
+  background while it runs (code.py 0.31, DEV-79): it is online within 15 min of the router
+  coming back, no power cycle (module updates wait for the next due boot). Only the
   factory-reset gesture removes them. (It used to wipe them after three attempts and fall into
   AP mode — a router hiccup meant a full re-setup, and no product until then.)
 - **Three-strikes crash recovery.** A `product.py` exception restarts it with backoff; the count
