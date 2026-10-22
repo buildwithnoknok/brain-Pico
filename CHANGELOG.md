@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## Tools: restore ends running - 2026-10-22 (no component version bumped)
+
+- DEV-114 - after `RESTORE OK` the brain sat idle at the REPL (lamp dark, no setup hotspot) until someone replugged it, because the verify steps run through `pico.py`, which stops `code.py`. `restore_brain.sh` now ends with a hard reset (also after a failed verify) and says so, so the brain starts its product or the noknok-setup WiFi by itself. Breaking: no.
+
 ## code.py 0.30 - 2026-10-22
 
 - DEV-141 - setup with the right WiFi password could end with "Something went wrong talking to the device" in the app although the device joined and saved: the reply to `provision` was still on its way when the setup hotspot closed 1 s later, and the restart after the join lost it. The hotspot now stays up until the app confirms the reply (`hello` with `ack`) or 5 s pass. `provision` accepts an optional app-chosen `join_id`, and `hello.setup.received` names the last accepted one, so an app can still follow a join whose reply was lost. `tools/test_setup_join.py` +16 checks. Breaking: no (additive; older apps get the 5 s wait).

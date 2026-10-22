@@ -45,7 +45,7 @@ It ends with `RESTORE OK` (and exit code 0) or `RESTORE FAILED`.
 
 | File | Runs on | What |
 |---|---|---|
-| `restore_brain.sh` | host | The whole procedure: backup → reformat → copy → reset → verify. Options `--data DIR`, `--yes`, `--no-backup`. |
+| `restore_brain.sh` | host | The whole procedure: backup → reformat → copy → reset → verify → final hard reset (the brain is left running its product or the setup WiFi, DEV-114). Options `--data DIR`, `--yes`, `--no-backup`. |
 | `backup_brain.sh [DEST]` | host | Read-only copy of everything on the Pico to `DEST` (default `~/pico-backup-<date>`). Safe on a damaged filesystem. **Keep `DEST` out of git** — it can hold `wifi.json` (the customer's WiFi password). |
 | `erase_fs.py` | Pico | `storage.erase_filesystem()`. Destroys all files; the board resets itself. |
 | `hard_reset.py` | Pico | A real reset, so `boot.py` runs again (a soft reload does not). |
