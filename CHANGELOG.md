@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## code.py 0.30 - 2026-10-22
+
+- DEV-141 - setup with the right WiFi password could end with "Something went wrong talking to the device" in the app although the device joined and saved: the reply to `provision` was still on its way when the setup hotspot closed 1 s later, and the restart after the join lost it. The hotspot now stays up until the app confirms the reply (`hello` with `ack`) or 5 s pass. `provision` accepts an optional app-chosen `join_id`, and `hello.setup.received` names the last accepted one, so an app can still follow a join whose reply was lost. `tools/test_setup_join.py` +16 checks. Breaking: no (additive; older apps get the 5 s wait).
+
 ## code.py 0.29 - 2026-10-20
 
 - DEV-139 - after a successful setup the product could fail to download on every boot ("memory allocation failed, allocating 36027 bytes"): the device was set up but never started its product. The download now goes straight to a temporary file in small pieces instead of being held in memory twice, is checked for completeness against its announced size, then replaces `product.py`. The compile check before replacing stays; when memory is too tight for it, it is skipped and logged, and the product start judges the file (three-strikes crash recovery). New host test `tools/test_download_stream.py`. Breaking: no.

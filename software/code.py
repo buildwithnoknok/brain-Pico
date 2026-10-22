@@ -1,5 +1,14 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.29 (product download streamed to the file — DEV-139)
+# Version: 0.30 (setup reply survives the hotspot drop — DEV-141)
+#
+# v0.30 changes (Sue): DEV-141 — with the RIGHT password the app showed
+#   "Something went wrong" although the brain joined and saved: the provision
+#   reply was still in flight when the hotspot dropped 1 s later (one lost frame,
+#   lwIP retransmits after ~3 s), and the reset after the join lost it for good.
+#   Now the hotspot stays up until the app acks the reply (hello args.ack) or
+#   REPLY_GRACE_S (5 s) passes; provision takes an app-chosen join_id, and
+#   hello.setup.received names the last accepted one, so the app can follow a
+#   join even when the reply is lost.
 #
 # v0.29 changes (Sue): DEV-139 — download_and_save_script() used response.text,
 #   which needs the whole product twice in one block each (bytes + str: 2 x 36 KB
@@ -387,7 +396,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.29"
+CODE_VERSION = "0.30"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -1094,7 +1103,12 @@ def _device_state():
     return "provisioned"
 
 def _h_hello(args, msg):
-    """Who am I, what am I running, can you reach me later. Open op."""
+    """Who am I, what am I running, can you reach me later. Open op.
+    DEV-141: args.ack = the join_id the app just got back from provision ->
+    the reply arrived, the setup loop may drop the hotspot now."""
+    ack = args.get("ack") if isinstance(args, dict) else None
+    if ack and pending.get("ready") and ack == pending.get("join_id"):
+        pending["acked"] = True
     creds = load_wifi_credentials() or {}
     url = creds.get("script_url") or ""
     try:
@@ -1117,7 +1131,9 @@ def _h_hello(args, msg):
         "online": bool(wifi.radio.connected),
         "ap": bool(wifi.radio.ap_active),
         "config": _config_status(),     # DEV-74: pins in use + problems (app: "setup incomplete")
-        "setup": {"last_join": _last_join},   # DEV-100: why the last setup join failed (RAM)
+        # DEV-100: why the last setup join failed (RAM). DEV-141: received = the
+        # join_id of the last accepted provision (app: "did it get my request?").
+        "setup": {"last_join": _last_join, "received": _received_join},
         "carrier": "wifi",
         "uptime": round(time.monotonic(), 1),
         "ops": rpc.dispatcher().ops(),
@@ -1252,6 +1268,25 @@ def _h_settings_reset(args, msg):
 _JOIN_BOOT = "%04x" % (int.from_bytes(os.urandom(2), "little"),)
 _join_seq  = 0
 _last_join = None           # {"join_id", "ssid", "ok", "reason", "attempts", "detail"}
+_received_join = None       # DEV-141: join_id of the last provision this boot accepted
+
+# DEV-141: the provision reply must reach the phone BEFORE the hotspot drops.
+# The old fixed 1 s was too short: one lost radio frame and lwIP retransmits
+# only after ~3 s, by which time the AP is gone. On a successful join the brain
+# then resets and the reply is lost for good (app: "Something went wrong").
+# So the brain keeps serving for up to REPLY_GRACE_S and stops early once the
+# app proves it has the reply (hello with args.ack = that join_id).
+REPLY_GRACE_S = 5
+
+def _clean_join_id(v):
+    """An app-chosen join_id (DEV-141), or None if absent/unsafe. Letters,
+    digits and '-', at most 32 chars: it is echoed in hello and logs."""
+    if not isinstance(v, str) or not 0 < len(v) <= 32:
+        return None
+    for ch in v:
+        if not (ch.isalpha() or ch.isdigit() or ch == "-"):
+            return None
+    return v
 
 # DEV-130: NEVER scan while the hotspot runs. On CircuitPython 10.3.1 / Pico 2 W
 # a scan with the AP up can block forever INSIDE one next() of the scan iterator
@@ -1340,14 +1375,14 @@ def _h_wifi_scan(args, msg):
     return r
 
 def _do_provision(ssid, password, script_url, module_firmware, product_id,
-                  config_defaults=None, force=False):
+                  config_defaults=None, force=False, join_id=None):
     """Two situations, one op:
     - On the setup AP: hand the credentials to run_ap_provisioning()'s loop,
       which stops the AP, verifies the join, saves and hard-resets (as today).
     - On home WiFi (product running): a product switch. ssid/password may be
       omitted to keep the current network. Save, drop product.py, hard-reset;
       the boot path downloads the new script before any Conductor exists."""
-    global _join_seq
+    global _join_seq, _received_join
     if wifi.radio.ap_active:
         if not ssid:
             return {"ok": False, "error": "ssid required"}
@@ -1358,8 +1393,14 @@ def _do_provision(ssid, password, script_url, module_firmware, product_id,
             if nets is not None and ssid not in [n["ssid"] for n in nets]:
                 log(f"[ap] '{ssid}' is not visible from here - not trying it")
                 return {"accepted": False, "reason": "network_not_found", "networks": nets}
-        _join_seq += 1
-        join_id = "%s-%d" % (_JOIN_BOOT, _join_seq)
+        # DEV-141: the app may choose the join_id, so it can still follow the
+        # join when this reply is lost on the way back.
+        join_id = _clean_join_id(join_id)
+        if join_id is None:
+            _join_seq += 1
+            join_id = "%s-%d" % (_JOIN_BOOT, _join_seq)
+        _received_join = join_id
+        pending["acked"]           = False
         pending["join_id"]         = join_id
         pending["ssid"]            = ssid
         pending["password"]        = password or ""
@@ -1424,7 +1465,7 @@ def register_ops():
     d.register("provision", lambda a, m: _do_provision(
         a.get("ssid"), a.get("password"), a.get("script_url"),
         a.get("module_firmware"), a.get("product_id"), a.get("config_defaults"),
-        bool(a.get("force"))))
+        bool(a.get("force")), a.get("join_id")))
     d.register("wifi.scan", _h_wifi_scan)          # DEV-100
 
 def _json(request, obj):
@@ -1627,8 +1668,20 @@ def run_ap_provisioning():
                 last_beat = now
             time.sleep(0.01)
 
-        # Credentials received — give the success page a moment to flush
-        time.sleep(1)
+        # Credentials received. DEV-141: keep the hotspot and the server up
+        # until the app acks the reply (hello args.ack) or REPLY_GRACE_S runs
+        # out (browser form, older app), so a lost frame can be retransmitted.
+        end = time.monotonic() + REPLY_GRACE_S
+        while time.monotonic() < end and not pending.get("acked"):
+            rpc.service(force=True)
+            time.sleep(0.01)
+        if pending.get("acked"):
+            log("[ap] App confirmed the reply — dropping the hotspot")
+            for _ in range(20):              # ~0.2 s: let the ack's own reply leave
+                rpc.service(force=True)
+                time.sleep(0.01)
+        else:
+            log(f"[ap] No ack from the app within {REPLY_GRACE_S} s — continuing")
         ssid = pending["ssid"]
         pw   = pending["password"]
         su   = pending["script_url"]

@@ -249,5 +249,46 @@ check("last_join carries the request's join_id, ok false, reason",
       lj["join_id"] == "abcd-7" and lj["ok"] is False and lj["reason"] == "auth", lj)
 check("module alert + onboard LED", alerts and "wifi join failed: auth" in alerts[-1] and blinks)
 
+print("\nDEV-141: app-chosen join_id, received, ack")
+Radio.scan_fails = False
+Radio.scan = [Net("Home", -50)]
+before_ap()
+
+
+def provision_with(join_id):
+    pending["ready"] = False
+    return ns["_do_provision"]("Home", "pw", "https://x/p.py", None, "lamp", None,
+                               False, join_id)
+
+sys.modules["microcontroller"].cpu = types.SimpleNamespace(uid=b"\x01\x02")
+Radio.connected = False
+for fn in ("_device_state", "_config_status", "load_wifi_credentials"):
+    ns[fn] = lambda *a, **k: None
+
+r = provision_with("app-1a2b3c4d")
+check("app join_id is used and echoed", r.get("join_id") == "app-1a2b3c4d", r)
+check("  ...join loop armed with it, not acked yet",
+      pending["join_id"] == "app-1a2b3c4d" and pending["acked"] is False)
+h = ns["_h_hello"]({}, {})
+check("hello.setup.received = last accepted join_id",
+      h["setup"]["received"] == "app-1a2b3c4d", h["setup"])
+for bad in ("x" * 33, "a b", "a/../b", "", 42, None):
+    r = provision_with(bad)
+    check("unsafe/absent join_id %-12r -> brain makes its own" % (bad if bad != "x" * 33 else "33 chars",),
+          r.get("join_id") and r["join_id"] != bad and r["join_id"].startswith(ns["_JOIN_BOOT"]), r)
+r = provision_with("app-99")
+ns["_h_hello"]({"ack": "app-other"}, {})
+check("hello with another join_id does not ack", pending["acked"] is False)
+ns["_h_hello"]({}, {})
+check("plain hello does not ack", pending["acked"] is False)
+ns["_h_hello"]({"ack": "app-99"}, {})
+check("hello ack = our join_id -> acked", pending["acked"] is True)
+r = provision_with("app-100")
+check("next provision resets the ack", pending["acked"] is False)
+pending["ready"] = False
+ns["_h_hello"]({"ack": "app-100"}, {})
+check("ack ignored when no join is pending", pending["acked"] is False)
+check("REPLY_GRACE_S covers one lwIP retransmit (>= 4 s)", ns["REPLY_GRACE_S"] >= 4)
+
 print("\n%s (%d failure%s)" % ("PASS" if not fails else "FAIL", fails, "" if fails == 1 else "s"))
 sys.exit(1 if fails else 0)
