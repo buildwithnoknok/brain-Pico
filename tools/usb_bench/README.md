@@ -18,6 +18,8 @@ Copy `pico.py` and these files to the bench host, then run them ON THE PICO with
 | `leds_stress.py` | Pico | 300 back-to-back 8× `0x04` frames, then prints the frame the ring must show |
 | `hard_reset.py` | Pico | `microcontroller.reset()`: recovers a stuck USB host port (a soft reset does not) |
 | `listen.py` | bench host | Passively read the Pico console for N seconds (shows whether the Pico is wedged: 0 bytes) |
+| `reattach_loop.py` | Pico | DEV-45 minimal repro: app → 0xB0 → bootloader → BOOT → app, ×10, **no flash writes**, VID/PID only (never reads a string descriptor). Prints how long each re-appearance took or `NOT SEEN` |
+| `cp_swap.sh` | bench host | Install a CircuitPython `.uf2` on the bench Pico remotely (UF2 loader via `pico.py`, copy, print the new version). For CP A/B tests |
 
 If the Pico is wedged (no console output, Ctrl-C ignored), even `hard_reset.py` can't run: unplug
 the Pico's USB for ~3 s.
