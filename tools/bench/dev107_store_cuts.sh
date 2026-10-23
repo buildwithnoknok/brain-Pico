@@ -18,6 +18,7 @@
 # dmesg, a passive listen + one Ctrl-C, then a data-only port cycle (uhubctl -l 1-1 -p 4,
 # no VBUS cut on this hub? uptime tells) and the console again, then one more pico.py try.
 # A brain that stays dead is recovered with a ganged cut (that boot is then probed as usual).
+# HAND=1 bash dev107_store_cuts.sh N: no Pi-side cut, a person pulls + replugs during each tone.
 #
 # Logs: ~/dev107/run.log (one line per round + HANG blocks), ~/dev107/r<n>_*.log.
 # Watch: grep -E 'ROUND|HANG|tally' ~/dev107/run.log
@@ -40,6 +41,16 @@ cut() {
     echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a off >/dev/null; sleep 3
     echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a on  >/dev/null
 }
+# HAND=1: a person pulls the brain's cable during the tone and plugs it back in (the original
+# DEV-107 condition: data lines break and re-make mechanically). Returns 1 if nobody pulled.
+PORT_GLOB="/dev/serial/by-id/usb-Raspberry_Pi_Pico*-if00"
+hand_cut() {
+    for t in $(seq 1 250); do ls $PORT_GLOB >/dev/null 2>&1 || break; sleep 0.1; done
+    ls $PORT_GLOB >/dev/null 2>&1 && return 1
+    for t in $(seq 1 1200); do ls $PORT_GLOB >/dev/null 2>&1 && return 0; sleep 0.1; done
+    return 0
+}
+HAND=${HAND:-0}
 up() { $RPC "$IP" hello 2>&1 | grep -E '"uptime"|ERROR' | tr -d ' \n'; }
 
 diag() {   # $1 = round
@@ -91,7 +102,7 @@ for i in $(seq 1 "$ROUNDS"); do
         fi
         continue
     fi
-    sleep "$(( RANDOM % 6 )).$(( RANDOM % 10 ))"; sleep 0.5
+    [ "$HAND" = 1 ] || { sleep "$(( RANDOM % 6 )).$(( RANDOM % 10 ))"; sleep 0.5; }
     mode=late
     if [ $((i % 2)) = 0 ]; then
         mode=capture
@@ -99,7 +110,16 @@ for i in $(seq 1 "$ROUNDS"); do
         cpid=$!
         sleep 0.3
     fi
-    cut
+    if [ "$HAND" = 1 ]; then
+        if ! hand_cut; then
+            wait $pid 2>/dev/null
+            [ $mode = capture ] && kill $cpid 2>/dev/null
+            say "ROUND $i: $phase NOT pulled (no unplug within 25 s) - control round | prev verify: $verdict"
+            continue
+        fi
+    else
+        cut
+    fi
     wait $pid 2>/dev/null
     if [ $mode = capture ]; then
         wait $cpid
