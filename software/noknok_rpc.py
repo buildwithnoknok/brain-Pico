@@ -1,4 +1,4 @@
-# noknok_rpc.py  v0.2 — Device Protocol v1: message dispatcher + carriers (DEV-34)
+# noknok_rpc.py  v0.3 — Device Protocol v1: message dispatcher + carriers (DEV-34)
 #
 # v0.2 (Sue): DEV-79 — an offline brain rejoins WiFi without stalling the
 #   product: most rejoin attempts only START the join (LINK_KICK_S, 0.5 s) and
@@ -7,6 +7,9 @@
 #   attempt as a safety net. set_wifi_credentials(on_up=) runs post-join work
 #   (code.py: NTP, mDNS) once the link is back. An offline boot no longer
 #   counts as a link drop.
+# v0.3 (Sue): DEV-79 bench — on the Pico 2 W a 0.5 s kick finished the join in
+#   the background 5/5 (link up ~3 s later; bench_dev79_kick.py, 23 Oct), so the
+#   full 5 s safety-net attempts are off by default: LINK_FULL_EVERY = 0.
 #
 # One JSON message protocol, transport-agnostic (Confluence 113868802 §2):
 #
@@ -42,7 +45,7 @@
 import json
 import time
 
-__version__ = "0.2"
+__version__ = "0.3"
 
 SERVICE_INTERVAL = 0.05     # s between carrier polls from the implicit hook
 SOCKET_TIMEOUT   = 1.0      # s a stalled client may hold poll(). 0.2 s dropped the
@@ -52,8 +55,8 @@ MAX_BODY         = 4096     # bytes; a settings.set is ~100, a provision ~600
 LINK_CHECK_S     = 30       # how often service() looks at the WiFi link
 LINK_JOIN_S      = 5        # blocking budget for a FULL rejoin attempt
 LINK_KICK_S      = 0.5      # budget of a kick: start the join, finish in the background
-LINK_FULL_EVERY  = 3        # every 3rd attempt is a full one (if kicks never complete);
-                            # 0 = kicks only (once the bench proves background joins)
+LINK_FULL_EVERY  = 0        # 0 = kicks only (bench-proven 23 Oct: kicks finish in the
+                            # background); N = every Nth attempt is a full LINK_JOIN_S one
 LINK_POLL_S      = 1.0      # while the link is down: how often to look (cheap)
 LINK_MAX_S       = 300      # longest pause between attempts (DEV-79: join <= 15 min)
 

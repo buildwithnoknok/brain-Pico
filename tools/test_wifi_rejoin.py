@@ -76,11 +76,14 @@ def check(name, ok):
     if not ok:
         fails.append(name)
 
-def run(model, net_back_s, minutes=40):
-    """Brain boots offline at t=0 (product runs), router back at net_back_s."""
+def run(model, net_back_s, minutes=40, full_every=None):
+    """Brain boots offline at t=0 (product runs), router back at net_back_s.
+    full_every: override LINK_FULL_EVERY (the foreground model needs the safety net)."""
     clock.t = 0.0
     del logs[:]
     rpc, radio = fresh(model)
+    if full_every is not None:
+        rpc.LINK_FULL_EVERY = full_every
     ups = []
     rpc.set_wifi_credentials("home", "pw", 80, on_up=lambda: ups.append(clock.t))
     radio.net_at = net_back_s
@@ -93,9 +96,13 @@ def run(model, net_back_s, minutes=40):
         clock.t += 0.05
     return rpc, radio, joined_at, ups
 
+rpc0, _ = fresh("background")
+check("default LINK_FULL_EVERY = 0 (kicks only, bench 23 Oct)", rpc0.LINK_FULL_EVERY == 0)
 for model in ("background", "foreground"):
     for back in (0.0, 45.0, 400.0, 1000.0):
-        rpc, radio, joined, ups = run(model, back)
+        # background = the Pico 2 W as measured (default, kicks only); foreground = a
+        # radio whose kicks never finish: needs the safety net (LINK_FULL_EVERY = 3)
+        rpc, radio, joined, ups = run(model, back, full_every=None if model == "background" else 3)
         late = None if joined is None else joined - back
         check("%s, router back at %4.0f s: joined within 15 min (%s s)"
               % (model, back, "never" if late is None else "%.0f" % late),
@@ -108,7 +115,7 @@ for model in ("background", "foreground"):
                   len(after) == 1)
 
 # attempts are spaced by the backoff and at most every 5 min, never in a burst
-rpc, radio, joined, ups = run("foreground", 10 ** 9, minutes=60)
+rpc, radio, joined, ups = run("foreground", 10 ** 9, minutes=60, full_every=3)
 gaps = [b[0] - a[0] for a, b in zip(radio.calls, radio.calls[1:])]
 check("router never back: attempts spaced 30 s .. 300 s (%s)" % [int(g) for g in gaps[:6]],
       gaps and min(gaps) >= 29 and max(gaps) <= 306)
@@ -117,7 +124,7 @@ check("router never back: only every 3rd attempt is a full one (%d of %d)" % (fu
       fulls == len(radio.calls) // 3)
 stall = sum(t for _, t in radio.calls)
 # before DEV-79: 15 attempts x 5 s = 75 s per hour, each a 5 s freeze
-check("router never back: product stalled %.1f s in 60 min (<= 30 s, was 75 s)" % stall, stall <= 30.0 + 1e-6)
+check("safety net on, router never back: product stalled %.1f s in 60 min (<= 30 s, was 75 s)" % stall, stall <= 30.0 + 1e-6)
 rpc.LINK_FULL_EVERY = 0
 rpc2, radio2 = rpc, radio
 clock.t = 0.0; del logs[:]

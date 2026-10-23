@@ -236,8 +236,8 @@ latest 60 s after the first change, never two writes closer than 30 s; forced be
 reboot / switch / crash reload. **Link:** the servicing slot watches the WiFi link every 30 s
 (every 1 s while it is down) and re-joins with backoff (30 s → 5 min), also on a brain that
 booted offline. Since noknok_rpc 0.2 (DEV-79) an attempt is a 0.5 s "kick" that lets the radio
-finish the join in the background; every 3rd attempt is a full one (≤ 5 s blocking) as a
-safety net (`LINK_FULL_EVERY`, 0 = kicks only). Once the link is up the carrier restarts and
+finish the join in the background (bench-proven on the Pico 2 W: link up ~3 s later, 5/5;
+noknok_rpc 0.3 runs kicks only, `LINK_FULL_EVERY = 0`; N = every Nth attempt a full ≤ 5 s one). Once the link is up the carrier restarts and
 code.py's post-join work runs (NTP with a 2 s budget, mDNS if enabled).
 `status.link` reports `drops` / `rejoins` / `backoff`; an offline boot is not a drop.
 
