@@ -299,7 +299,8 @@ Earlier features:
   `MODULE STILL PARKED`, writes the `[RESCUE]` event and plays the buzzer/LED alert; the next
   boot retries. Test: `tools/test_rescue_paths.py` (host, tier S).
 - **USB modules: update and rescue around a hard reset (DEV-133, code.py 0.27).** The Pico's
-  PIO-USB host does not see a USB module re-enumerate within one session (DEV-45), so the brain
+  PIO-USB host does not see a USB module re-enumerate within one session on a PicoHub without
+  D± pull-downs (DEV-45: RP2350 erratum E9; MOD-0011 rev 1.0, fixed in rev 1.1), so the brain
   never waits for one: a USB update sends the module into its bootloader (`[FW] ... PENDING`) and
   hard-resets; the next boot's `Conductor.usb_fw_pass()` (run by `get_conductor()` right after
   `enumerate_all()`) flashes every module it finds at PID 4E42 from the cache, hard-resets again,
