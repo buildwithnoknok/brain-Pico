@@ -112,6 +112,12 @@
 #             DEV-147 — bootloader_version() sends 0xB0 a second time after 200 ms
 #             when the module did not appear at 0x7E (healthy modules missed the
 #             first one after an OTA flash / on due boots).
+# v1.21 (Sue): DEV-119 — enumerate() scans each bus once after the restore and
+#             never hands out an address where something already answers (a
+#             Qwiic / Stemma QT board at a fixed address), logging it. Restore is
+#             identity-checked, INTERIM (ADR-005): a remembered address is only
+#             trusted if its 0xB1 reply starts with PROTOCOL_VERSION (3 tries);
+#             _restore_identity() is the one place DEV-21 swaps for 0xB4 GET_ID.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -132,7 +138,7 @@ import json
 import os
 import struct
 
-__version__ = "1.20"
+__version__ = "1.21"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -1355,6 +1361,19 @@ class Conductor:
         finally:
             bus.unlock()
 
+    def _scan(self, bus):
+        """Addresses that ACK on `bus` (busio's scan: 0x08-0x77, so the 0x7E/0x7F
+        bootloader and hand-out addresses are not touched). [] on a bus error."""
+        _service()
+        while not bus.try_lock():
+            pass
+        try:
+            return list(bus.scan())
+        except OSError:
+            return []
+        finally:
+            bus.unlock()
+
     def _write(self, addr, data, i2c=None):
         bus = i2c if i2c is not None else self.i2c
         if bus is None:
@@ -2145,6 +2164,16 @@ class Conductor:
         used     = {m.address for m in self._registry.values() if m is not None}
         reserved = {info.get("address") for info in known.values()
                     if isinstance(info, dict) and info.get("address")}
+        # DEV-119: an address where something already answers is never handed
+        # out - a Qwiic / Stemma QT board at a fixed address (SSD1306 0x3C,
+        # VEML7700 0x10, ...) or a noknok module whose saved state was lost. One
+        # scan per bus; addresses are one space across both buses.
+        for bus_name, bus in self._buses():
+            for a in self._scan(bus):
+                if 0x08 <= a <= 0x77 and a not in used:
+                    used.add(a)
+                    print("  [enum] device at 0x%02X (bus %s) is not a known noknok "
+                          "module - address skipped" % (a, bus_name))
 
         def pick_address(uid_hex):
             a = known.get(uid_hex, {}).get("address") if isinstance(known.get(uid_hex), dict) else None
@@ -2363,6 +2392,25 @@ class Conductor:
             return
         store().set("state", data)
 
+    def _restore_identity(self, addr, bus, type_code):
+        """Is the device at a remembered address still a noknok module? Returns its
+        (protocol_version, "x.y.z") or None.
+
+        INTERIM check (DEV-119, ADR-005): the saved type must be plausible and the
+        0xB1 GET_VERSION reply must start with PROTOCOL_VERSION; three tries, so a
+        module that is briefly busy is not dropped for the whole boot. Weaker than
+        an identity read (a foreign chip CAN return 0x01), so it stops the common
+        phantom only. DEV-21 replaces the body with the 0xB4 GET_ID check (valid
+        CRC8 and the saved UID) - keep it the one place restore asks."""
+        if not isinstance(type_code, int) or not 0 < type_code < 0xFF:
+            return None
+        for attempt in range(3):
+            proto, ver = self.read_version(addr, bus)
+            if proto == self.PROTOCOL_VERSION:
+                return (proto, ver)
+            time.sleep(0.02)
+        return None
+
     def _restore_state(self, filename=None):
         """
         Load saved state and ping each module at its known address.
@@ -2396,12 +2444,21 @@ class Conductor:
                 continue   # that bus is off this boot - keep the entry, try next time
             if self._read(addr, 1, bus) is None:
                 continue   # module not responding (or moved to the other bus: the 0x7F sweep finds it)
+            version = self._restore_identity(addr, bus, type_code)
+            if version is None:
+                # Something answers, but not as a noknok module: a foreign board
+                # now sits on the old address (DEV-119). No object for it; the
+                # entry stays (rescue may still need UID -> type) and enumerate()'s
+                # scan keeps the address from being handed out.
+                print("  state: 0x%02X (bus %s) answers but not as a noknok module - "
+                      "%s not restored" % (addr, bus_name, uid_hex))
+                continue
             claimed.add(addr)
 
             module, _ = self._make_module(type_code, bus_name, addr, uid_hex)
 
             if module is not None:
-                self._apply_version(module, addr)
+                module.protocol_version, module.firmware_version = version
                 if "bl" in info:
                     bl = info["bl"]
                     module.bootloader = tuple(bl) if bl else None

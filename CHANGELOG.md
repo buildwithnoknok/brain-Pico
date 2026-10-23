@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## noknok.py 1.21 - 2026-10-23
+
+- DEV-119 - a Qwiic / Stemma QT board plugged into a noknok bus could be given trouble: the brain handed noknok modules addresses without checking whether something already answered there (an OLED at 0x3C, a light sensor at 0x10, ...), so two chips shared one address. And if a remembered module was gone and a foreign board now sat on its old address, the brain treated that board as the module. Now each bus is scanned once at start-up and any address where something answers is skipped (`[enum] device at 0x.. (bus A) is not a known noknok module - address skipped`), and a remembered module is only restored if it answers the noknok version command (0xB1) like a noknok module (3 tries, so a busy module is not lost). That restore check is an interim one: a full identity check (0xB4 GET_ID, ADR-005) follows with DEV-21. New host test `tools/test_foreign_device.py` (20 checks). Breaking: no.
+
 ## noknok.py 1.20 + code.py 0.34 - 2026-10-23
 
 - DEV-106 - after a successful stage-1 (bootloader) update through `Conductor.stage1_update()` the brain kept remembering the OLD bootloader version, so a module whose old stage-1 could not state its layout stayed blocked from every later app update. `stage1_update()` now remembers the version it read back after the install (module, Conductor and saved state), for every caller; `code.py` no longer does it on its own. New host test `tools/test_stage1_bl.py`. Breaking: no (code.py 0.34 needs noknok.py 1.20; they ship together).
