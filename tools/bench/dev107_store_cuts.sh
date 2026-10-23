@@ -76,8 +76,8 @@ for i in $(seq 1 "$ROUNDS"); do
         kill -0 $pid 2>/dev/null || break
         sleep 0.1
     done
-    phase=$(grep -m1 '^ROUND ' "$R" | cut -c1-30)
-    verdict=$(grep -m1 -E 'PASS|FAIL' "$R" | cut -c1-90)
+    phase=$(grep -a -m1 -E '^ROUND .*(must survive|known unsafe)' "$R" | cut -c1-30)
+    verdict=$(grep -a -m1 -E 'PASS|FAIL' "$R" | cut -c1-90)
     if [ $started = 0 ]; then
         wait $pid
         hangs=$((hangs + 1))
