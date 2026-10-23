@@ -21,6 +21,7 @@ Copy `pico.py` and these files to the bench host, then run them ON THE PICO with
 | `reattach_loop.py` | Pico | DEV-45 minimal repro: app → 0xB0 → bootloader → BOOT → app, ×10, **no flash writes**, VID/PID only (never reads a string descriptor). Prints how long each re-appearance took or `NOT SEEN` |
 | `ota_loop.py` | Pico | DEV-45 acceptance: 10 full USB OTA round trips (0xB0 → erase/write/verify → app back, then 0xB1) in one host session via `UsbModuleFlasher`. `put` the app image as `/leds16.bin` first |
 | `build_embed.py` | bench host | Packs `noknok_usb.py` + an app image into `ota_loop.py`, for a Pico whose filesystem can't be written (drive write-protected from both sides): `python3 build_embed.py noknok_usb.py noknok_leds.bin ota_loop.py > ota_embedded.py`, then `pico.py run ota_embedded.py 900` |
+| `j2_cycle_loop.py` | Pico | DEV-45: MOD-0011 cuts J2 power (CYCLE_RAIL, 500 ms) ×5; the module must be seen leaving AND coming back in one host session (= a user unplug/re-plug) |
 | `e9_test.py` | Pico | RP2350 erratum E9 check on the USB host's D+ (fresh boot, MOD-0011 at 0x30): the X035 switches J2 off; D+ stays high on the internal pull-down = E9 latch, the reason a directly attached module is never seen leaving |
 | `cp_swap.sh` | bench host | Install a CircuitPython `.uf2` on the bench Pico remotely (UF2 loader via `pico.py`, copy, print the new version). For CP A/B tests |
 
