@@ -106,7 +106,7 @@ for i in $(seq 1 "$ROUNDS"); do
     mode=late
     if [ $((i % 2)) = 0 ]; then
         mode=capture
-        python3 -u "$REPO/tools/bench/boot_capture.py" 45 > "$OUT/r${i}_boot.log" 2>&1 &
+        timeout 150 python3 -u "$REPO/tools/bench/boot_capture.py" 45 > "$OUT/r${i}_boot.log" 2>&1 &
         cpid=$!
         sleep 0.3
     fi
