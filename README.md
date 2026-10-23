@@ -18,7 +18,7 @@ over I2C.
 | `noknok_rpc.py` | Device Protocol v1 (DEV-34): op dispatcher + the `POST /rpc` carrier the app talks to. Imported by `code.py` on every boot. |
 | `noknok_usb.py` | USB modules: host port, discovery (driver chosen by the `0xF0` type byte — every noknok USB app shares PID `0x4E4E`), `NoknokLEDs` (8×), `NoknokLEDs16` (16× RGBW, `status()`/`temperature()`), USB OTA flasher. Imported only by products that use USB modules. |
 | `../tools/build_mpy.ps1` | Precompiles the libraries to `.mpy` with Adafruit's `mpy-cross` (must match the Pico's CircuitPython version). |
-| `bench_fs_policy.py` / `bench_store.py` / `bench_yank.py` | DEV-18 bench scripts: filesystem read-only outside a window; Store round-trip + stable addresses; board-guided power-yank test (beeps, then a tone = pull the cable). |
+| `bench_fs_policy.py` / `bench_store.py` / `bench_yank.py` | DEV-18 bench scripts (how to run them and the pass criteria: [TESTS.md](TESTS.md)): filesystem read-only outside a window; Store round-trip + stable addresses; board-guided power-yank test (beeps, then a tone = pull the cable). |
 | `lib/` | Pinned CircuitPython libraries the brain needs (see `lib/README.md`). |
 | `module_flasher.py` | I2C OTA flasher — streams a module application `.bin` to the CH32V003 bootloader (`ModuleFlasher`). Shared by the bench tool and (later) the provisioning flow. |
 | `bench_flash.py` | Bench bring-up tool — flashes application firmware onto a blank module (bootloader only) one at a time from the REPL. See [Bench-flashing modules](#bench-flashing-modules-bring-up). |

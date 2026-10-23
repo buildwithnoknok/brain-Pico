@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## Tests documentation - 2026-10-23
+
+- DEV-76 - new `TESTS.md`: how to run the host tests and the three DEV-18 power-loss bench scripts (`bench_fs_policy.py`, `bench_store.py`, `bench_yank.py` + cleanup), expected output, pass criteria, when each is required, and the gotchas from 15 Sep. The two Pi4-side helper scripts named in the ticket are already in `tools/restore/` since DEV-84. No shipped component changed. Breaking: no.
+
 ## noknok_rpc.py 0.3 - 2026-10-23
 
 - DEV-79 - bench result: on the Pico 2 W a join that is only started (0.5 s) finishes by itself about 3 s later (5 of 5 tries). So the brain no longer makes a full 5 s join attempt every third try while it is offline: the product never pauses for more than half a second. Breaking: no.
