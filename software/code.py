@@ -1,5 +1,14 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.34 (stage-1 pass leaves "bl" to noknok.py 1.20 — DEV-106)
+# Version: 0.35 (a missed WiFi scan no longer blocks setup — DEV-150)
+#
+# v0.35 changes (Sue): DEV-150 — setup refused the home WiFi ("not visible")
+#   on every try when the one scan before the hotspot had missed it, until a
+#   reboot (1 of 2 boots on the bench). Now the scan before the hotspot makes
+#   SCAN_PASSES (2) passes and merges them, and a name refused as not visible
+#   is tried for real when it is asked for again in the same boot (a typo then
+#   fails as not_found, the normal DEV-100 path). No scan with the hotspot up
+#   (DEV-130) and none after a failed join (DEV-136), as before. Messages
+#   between app and brain unchanged.
 #
 # v0.34 changes (Sue): DEV-106 — _stage1_pass() no longer sets m.bootloader +
 #   saves the state itself after stage1_update(): noknok.py 1.20 does that inside
@@ -425,7 +434,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.34"
+CODE_VERSION = "0.35"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -1384,6 +1393,8 @@ _scan_cache = None          # list from _scan_networks(), or None (no scan / fai
 _scan_at    = None          # time.monotonic() of that scan
 
 SCAN_BUDGET_S = 10          # stop collecting after this long (results that trickle)
+SCAN_PASSES   = 2           # DEV-150: one pass missed a strong home network (1 of 2 boots)
+_refused_once = set()       # DEV-150: names refused as not visible, this boot (RAM only)
 
 def _scan_networks():
     """Networks the radio can see: [{"ssid", "rssi", "open"}], strongest first,
@@ -1422,12 +1433,25 @@ def _scan_networks():
     return sorted(nets.values(), key=lambda x: -x["rssi"])[:25]
 
 def _refresh_scan_cache():
-    """Scan now (hotspot must be down) and keep the result for the AP session."""
+    """Scan now (hotspot must be down) and keep the result for the AP session.
+    DEV-150: SCAN_PASSES passes, merged (strongest reading per name): a single
+    pass can miss a network whose beacon it did not catch, and this list is all
+    the setup session gets (no scan with the AP up, DEV-130)."""
     global _scan_cache, _scan_at
-    _scan_cache = _scan_networks()
+    merged = None
+    for _ in range(SCAN_PASSES):
+        nets = _scan_networks()
+        if nets is None:
+            continue
+        merged = merged or {}
+        for n in nets:
+            if n["ssid"] not in merged or n["rssi"] > merged[n["ssid"]]["rssi"]:
+                merged[n["ssid"]] = n
+    _scan_cache = None if merged is None else         sorted(merged.values(), key=lambda x: -x["rssi"])[:25]
     _scan_at = time.monotonic()
     if _scan_cache is not None:
-        log(f"[ap] {len(_scan_cache)} WiFi network(s) visible before the hotspot starts")
+        log(f"[ap] {len(_scan_cache)} WiFi network(s) visible before the hotspot starts "
+            f"({SCAN_PASSES} scans)")
 
 def _scan_before_ap():
     """Called before every start_ap(). DEV-130: never scan with the AP up.
@@ -1474,11 +1498,20 @@ def _do_provision(ssid, password, script_url, module_firmware, product_id,
             return {"ok": False, "error": "ssid required"}
         # DEV-100: refuse at once, hotspot kept, when the network is not even
         # visible (typo, out of range). force=True skips it (hidden network).
+        # DEV-150: the list is one boot-time scan and can miss a network that
+        # IS there, and it cannot be refreshed with the hotspot up (DEV-130).
+        # So only the FIRST request for a name is refused; the same name asked
+        # again in this boot is tried for real (a typo then fails as not_found).
         if not force:
             nets = _scan_cache          # never a live scan with the AP up (DEV-130)
             if nets is not None and ssid not in [n["ssid"] for n in nets]:
-                log(f"[ap] '{ssid}' is not visible from here - not trying it")
-                return {"accepted": False, "reason": "network_not_found", "networks": nets}
+                if ssid not in _refused_once:
+                    _refused_once.add(ssid)
+                    log(f"[ap] '{ssid}' is not visible from here - not trying it "
+                        f"(asking again tries it anyway)")
+                    return {"accepted": False, "reason": "network_not_found", "networks": nets}
+                log(f"[ap] '{ssid}' asked again - trying it although the scan did not "
+                    f"see it (DEV-150)")
         # DEV-141: the app may choose the join_id, so it can still follow the
         # join when this reply is lost on the way back.
         join_id = _clean_join_id(join_id)

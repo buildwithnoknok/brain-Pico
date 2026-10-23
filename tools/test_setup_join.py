@@ -13,6 +13,8 @@
 #   - DEV-130: NO live scan while the hotspot runs; the list is scanned once
 #     before start_ap() and wifi.scan / the provision pre-check read that cache
 #     (live false + age_s); a scan that trickles results stops after its budget
+#   - DEV-150: SCAN_PASSES scans merged before the hotspot; a name refused as
+#     not visible is tried for real when asked again in the same boot
 #   - join errors are classified: auth / not_found / timeout / other
 #   - a failed join is remembered (RAM) with the request's join_id and alerts
 #
@@ -99,7 +101,8 @@ def check(name, cond, extra=""):
 
 
 def before_ap():
-    """What run_ap_provisioning() does before start_ap(): one station-mode scan."""
+    """What run_ap_provisioning() does before start_ap(): the station-mode scan
+    (SCAN_PASSES passes, DEV-150)."""
     Radio.ap_active = False
     ns["_refresh_scan_cache"]()
     Radio.ap_active = True
@@ -117,7 +120,8 @@ r = ns["_h_wifi_scan"]({}, {})
 check("DEV-130: no list yet + AP up -> available false, radio untouched",
       r["available"] is False and Radio.scans == 0, r)
 before_ap()
-check("one scan before the hotspot starts", Radio.scans == 1)
+P = ns["SCAN_PASSES"]
+check("DEV-150: %d scan passes before the hotspot starts" % P, P >= 2 and Radio.scans == P)
 r = ns["_h_wifi_scan"]({}, {})
 names = [n["ssid"] for n in r["networks"]]
 check("available, strongest first, deduplicated", r["available"] and names == ["Home", "Cafe"], names)
@@ -125,10 +129,10 @@ check("own hotspot and hidden (empty) names left out", "noknok-setup" not in nam
 check("strongest reading kept for a repeated name", r["networks"][0]["rssi"] == -48)
 check("open flag", r["networks"][1]["open"] is True and r["networks"][0]["open"] is False)
 check("DEV-130: served from the cache: live false, age_s, no new scan",
-      r["live"] is False and "age_s" in r and Radio.scans == 1, r)
+      r["live"] is False and "age_s" in r and Radio.scans == P, r)
 Radio.ap_active = False
 r = ns["_h_wifi_scan"]({}, {})
-check("home WiFi (no AP): live scan", r["live"] is True and Radio.scans == 2, r)
+check("home WiFi (no AP): live scan (one pass)", r["live"] is True and Radio.scans == P + 1, r)
 Radio.scan_fails = True
 before_ap()
 r = ns["_h_wifi_scan"]({}, {})
@@ -196,7 +200,7 @@ Radio.scan_fails = True
 before_ap()
 r = provision("Anything")
 check("scan impossible -> nothing refused", r.get("accepted") is True)
-check("no provision path ever scanned with the AP up", Radio.scans == scans + 1)
+check("no provision path ever scanned with the AP up", Radio.scans == scans + P)
 
 print("\nDEV-136: one scan per boot, none after a failed join")
 ns["_scan_at"] = None
@@ -206,11 +210,11 @@ Radio.scan = [Net("Home", -50), Net("Cafe", -60)]
 Radio.ap_active = False                    # station mode, before the first start_ap()
 n0 = Radio.scans
 ns["_scan_before_ap"]()
-check("first hotspot start of the boot: one scan", Radio.scans == n0 + 1)
+check("first hotspot start of the boot: one scan (P passes)", Radio.scans == n0 + P)
 Radio.scan = [Net("Other", -40)]           # what a new scan WOULD see now
 ns["_scan_before_ap"]()                    # hotspot restart after a failed join
 ns["_scan_before_ap"]()                    # ... and another one
-check("restarts after a failed join: no scan at all", Radio.scans == n0 + 1)
+check("restarts after a failed join: no scan at all", Radio.scans == n0 + P)
 Radio.ap_active = True
 r = ns["_h_wifi_scan"]({}, {})
 check("  ...the boot list is still served", [n["ssid"] for n in r["networks"]] == ["Home", "Cafe"], r)
@@ -222,10 +226,59 @@ n0 = Radio.scans
 ns["_scan_before_ap"]()
 Radio.scan_fails = False
 ns["_scan_before_ap"]()
-check("boot scan failed: no retry after a failed join either", Radio.scans == n0 + 1)
+check("boot scan failed: no retry after a failed join either", Radio.scans == n0 + P)
 Radio.ap_active = True
 r = provision("Anything")
 check("  ...no list -> pre-check skipped, nothing refused", r.get("accepted") is True, r)
+
+print("\nDEV-150: a missed scan does not block setup")
+real_start = Radio.start_scanning_networks
+seq = []
+
+
+def _start(self):
+    """Each pass yields the next list from `seq`; None = that pass fails."""
+    Radio.scans += 1
+    lst = seq.pop(0) if seq else []
+    if lst is None:
+        raise RuntimeError("scan failed")
+    return iter(lst)
+
+
+ns["_refused_once"].clear()
+Radio.scan_fails = False
+Radio.start_scanning_networks = _start
+Radio.ap_active = False
+seq[:] = [[Net("Cafe", -60)], [Net("Home", -45), Net("Cafe", -70)]]
+ns["_refresh_scan_cache"]()
+names = [n["ssid"] for n in ns["_scan_cache"]]
+check("network seen by only the 2nd pass is in the list", names == ["Home", "Cafe"], names)
+check("  ...strongest reading per name across passes",
+      ns["_scan_cache"][1]["rssi"] == -60, ns["_scan_cache"])
+seq[:] = [None, [Net("Home", -45)]]
+ns["_refresh_scan_cache"]()
+check("one pass failing, the other OK -> its list is used",
+      [n["ssid"] for n in (ns["_scan_cache"] or [])] == ["Home"], ns["_scan_cache"])
+seq[:] = [None, None]
+ns["_refresh_scan_cache"]()
+check("both passes failing -> no list (pre-check skipped, as before)", ns["_scan_cache"] is None)
+seq[:] = [[Net("Cafe", -60)], [Net("Cafe", -61)]]   # both passes miss "Home"
+ns["_refresh_scan_cache"]()
+Radio.start_scanning_networks = real_start
+Radio.ap_active = True
+scans = Radio.scans
+r = provision("Home")
+check("first ask for a missed name -> refused, network_not_found (as DEV-100)",
+      r.get("accepted") is False and r.get("reason") == "network_not_found"
+      and pending["ready"] is False, r)
+r = provision("Home")
+check("same name asked again -> tried for real (join loop armed)",
+      r.get("accepted") is True and pending["ready"] is True and pending["ssid"] == "Home", r)
+check("  ...still no scan with the AP up", Radio.scans == scans)
+r = provision("Other")
+check("a different unseen name is refused on its first ask", r.get("accepted") is False, r)
+r = provision("Cafe")
+check("a visible name is accepted on the first ask", r.get("accepted") is True, r)
 
 print("\njoin errors")
 jr = ns["_join_reason"]
