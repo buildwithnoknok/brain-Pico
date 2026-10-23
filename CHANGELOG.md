@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## Tools: tests - 2026-10-23 (no component version bumped)
+
+- DEV-151 - new host test `tools/test_maxi_toggle.py`: runs the real Smart Lamp Maxi script (poc repo) against a fake LED Button + LEDs 16x and a fake clock, and checks what quick on/off toggles send to the LEDs. Breaking: no.
+
 ## code.py 0.35 - 2026-10-23
 
 - DEV-150 - first-time setup could refuse the home WiFi as "not visible" on every try, until the brain was replugged: the brain looks for networks once before it opens its setup hotspot, and that one look sometimes missed a network that was there. Now it looks twice and combines the results, and if you ask for a network it did not see, the second request for the same name is tried for real (a mistyped name then fails with the usual "can't see" message). Nothing changes in how the app talks to the brain. `tools/test_setup_join.py` +9 checks. Breaking: no.
