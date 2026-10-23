@@ -21,8 +21,14 @@ NAME=noknok-a324.local
 BP=/home/noknok/dev/brain-Pico
 ts() { date '+%F %T'; }
 echo "$(ts) STEP 0 waiting for the router to go away (unplug it now)"
-until ! ping -c 1 -W 1 $ROUTER >/dev/null 2>&1 && ! ping -c 1 -W 1 $ROUTER >/dev/null 2>&1; do sleep 2; done
-echo "$(ts) STEP 1 router gone"
+# "gone" = no answer for 30 s in a row: a short WiFi blip must not start the test
+# (23 Oct 10:58 a 3 min unplanned outage did, and was misread as the deliberate test)
+miss=0
+while [ $miss -lt 15 ]; do
+    if ping -c 1 -W 1 $ROUTER >/dev/null 2>&1; then miss=0; else miss=$((miss + 1)); fi
+    sleep 1
+done
+echo "$(ts) STEP 1 router gone (no answer for 30 s)"
 timeout 3000 python3 $BP/tools/bench/serial_listen.py 2700 > ~/dev/pico/dev79_console.log 2>&1 &
 sleep 2
 echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a off >/dev/null; sleep 4
