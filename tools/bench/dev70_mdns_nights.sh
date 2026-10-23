@@ -9,6 +9,7 @@
 #      pico.py contact of the phase), then a real USB power cut (uhubctl -l 2, ganged VBUS),
 #   2. waits for the boot, proves the reset (hello uptime small) and the mDNS state
 #      (on: noknok-XXXX.local resolves; off: it must not),
+#   2b. waits up to BOOT_WAIT_S (40 min) for a brain that booted offline to join;
 #   3. polls `hello` by IP every 30 s, and resolves the .local name every 10 min,
 #   4. a hang (10 failed hellos in a row = 5 min) ends the phase early: captures ping, ARP,
 #      the name lookup and the serial console (listen, then one Ctrl-C) BEFORE the next
@@ -28,6 +29,7 @@ PHASES=${*:-on off on}
 MAC=98:fe:54:0f:cb:ee           # bench brain Pico 2 W 82322992A5A2A324
 NAME=noknok-a324.local
 IP_GUESS=192.168.1.194
+BOOT_WAIT_S=${BOOT_WAIT_S:-2400}  # 40 min: an offline cold boot rejoins on its own (DEV-79)
 PICO=/home/noknok/dev/pico
 RPC="python3 /home/noknok/dev/brain-Pico/tools/rpc_call.py"
 OUT=$PICO/dev70; mkdir -p "$OUT"
@@ -69,11 +71,19 @@ for mode in $PHASES; do
     echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a off >/dev/null; sleep 4
     echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a on  >/dev/null
     sleep 90
-    IP=$(find_ip); up=$(uptime_of "$IP")
-    echo "$(ts) PHASE $n boot: ip=${IP:-none} uptime=${up:-none} (small = real reset)"
+    # A cold boot can come up OFFLINE (seen 23 Oct 02:57 and 03:04): the product runs and
+    # the brain joins later through its rejoin loop. Wait up to BOOT_WAIT_S for that
+    # instead of calling it a hang; how long it took is part of the result.
+    t_cut=$(( $(date +%s) - 90 )); IP=""; up=""
+    while [ $(( $(date +%s) - t_cut )) -lt $BOOT_WAIT_S ]; do
+        IP=$(find_ip); [ -n "$IP" ] && up=$(uptime_of "$IP")
+        [ -n "$up" ] && break
+        sleep 30
+    done
+    echo "$(ts) PHASE $n boot: ip=${IP:-none} uptime=${up:-none} online $(( $(date +%s) - t_cut )) s after the cut (small uptime = real reset)"
     nm=$(getent hosts "$NAME" | awk '{print $1}')
     echo "$(ts) PHASE $n name $NAME -> ${nm:-not resolved} (expect: $mode)"
-    if [ -z "$IP" ]; then echo "$(ts) FAIL no brain on the network, phase $n skipped"; continue; fi
+    if [ -z "$up" ]; then echo "$(ts) FAIL brain not online $BOOT_WAIT_S s after the cut, phase $n skipped"; continue; fi
     end=$(( $(date +%s) + HOURS * 3600 )); fails=0; polls=0; bad=0; i=0; hung=0; pu=
     while [ "$(date +%s)" -lt "$end" ]; do
         r=$($RPC "$IP" hello 2>&1 | grep -E '"uptime"|ERROR' | tr -d ' \n')
