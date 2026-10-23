@@ -4,6 +4,11 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## noknok.py 1.20 + code.py 0.34 - 2026-10-23
+
+- DEV-106 - after a successful stage-1 (bootloader) update through `Conductor.stage1_update()` the brain kept remembering the OLD bootloader version, so a module whose old stage-1 could not state its layout stayed blocked from every later app update. `stage1_update()` now remembers the version it read back after the install (module, Conductor and saved state), for every caller; `code.py` no longer does it on its own. New host test `tools/test_stage1_bl.py`. Breaking: no (code.py 0.34 needs noknok.py 1.20; they ship together).
+- DEV-147 - reading a module's bootloader version sometimes failed on a healthy module ("bootloader did not appear at 0x7E"), right after an update or on a due boot, so its stage-1 state was not refreshed that day. The brain now asks a second time after 200 ms; a second miss is still logged as before and the module always goes back to its app. Breaking: no.
+
 ## Tests documentation - 2026-10-23
 
 - DEV-76 - new `TESTS.md`: how to run the host tests and the three DEV-18 power-loss bench scripts (`bench_fs_policy.py`, `bench_store.py`, `bench_yank.py` + cleanup), expected output, pass criteria, when each is required, and the gotchas from 15 Sep. The two Pi4-side helper scripts named in the ticket are already in `tools/restore/` since DEV-84. No shipped component changed. Breaking: no.

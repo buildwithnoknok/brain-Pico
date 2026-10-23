@@ -1,5 +1,9 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.33 (join log works on the Pico 2 W — DEV-113)
+# Version: 0.34 (stage-1 pass leaves "bl" to noknok.py 1.20 — DEV-106)
+#
+# v0.34 changes (Sue): DEV-106 — _stage1_pass() no longer sets m.bootloader +
+#   saves the state itself after stage1_update(): noknok.py 1.20 does that inside
+#   stage1_update() for every caller. Needs noknok.py >= 1.20 (shipped together).
 #
 # v0.33 changes (Sue): DEV-113 bench fix — wifi.radio.ap_info raises
 #   NotImplementedError on the Pico 2 W, which swallowed the whole join log line
@@ -421,7 +425,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.33"
+CODE_VERSION = "0.34"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -2060,10 +2064,7 @@ def _stage1_pass(c, s1):
         except Exception as e:
             after, ok = None, False
             log(f"[bl] {mf_key} {uid}: stage-1 update FAILED ({e!r})")
-        m = c.by_uid(uid)
-        if m is not None and after:
-            m.bootloader = tuple(after)
-            c._save_state()
+        # stage1_update() itself remembers the new "bl" since noknok.py 1.20 (DEV-106).
         if ok:
             event(f"[BL]    {mf_key:<11} uid={uid}  stage-1 {'.'.join(map(str, have))} -> "
                   f"{s1['version']}  OK (app {app_meta.get('version')} restored)")

@@ -106,6 +106,12 @@
 #             the panel"): info() tries 3 times, then falls back to the module's boot
 #             geometry 160x80 (or the one rotation()/orient() asked for), logs that
 #             once, and backs off 2 s instead of asking again on every draw.
+# v1.20 (Sue): DEV-106 — stage1_update() remembers the stage-1 version read back
+#             after the install (module.bootloader, _bl_seen, Store "bl"), so the
+#             layout gate no longer judges the module by its old stage-1.
+#             DEV-147 — bootloader_version() sends 0xB0 a second time after 200 ms
+#             when the module did not appear at 0x7E (healthy modules missed the
+#             first one after an OTA flash / on due boots).
 #
 # Quick start:
 #   from noknok import Conductor
@@ -126,7 +132,7 @@ import json
 import os
 import struct
 
-__version__ = "1.19"
+__version__ = "1.20"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -1800,7 +1806,16 @@ class Conductor:
         f = ModuleFlasher(self._entry_bus(entry))
         f.enter_bootloader(entry["address"])
         try:
-            f.wait_for_bootloader()
+            try:
+                f.wait_for_bootloader()
+            except Exception:
+                # DEV-147: a healthy module sometimes misses the first 0xB0 (seen
+                # right after an OTA flash and on due boots, 2-3 of ~12 passes).
+                # Ask once more after 200 ms. A module already at 0x7E does not
+                # hear the second 0xB0 at its runtime address: harmless.
+                time.sleep(0.2)
+                f.enter_bootloader(entry["address"])
+                f.wait_for_bootloader()
             v = f.get_version()
         finally:
             # Whatever happened while reading (timeout, I2C error, a stale
@@ -1813,21 +1828,26 @@ class Conductor:
             except Exception:
                 pass
         self.enumerate()
-        # Remember it. Reading costs a bootloader round-trip and a re-enumeration,
-        # so the answer is kept on the module object and in the saved state (Store)
-        # ("bl": [...] or null for legacy) — one read per module lifetime, then
-        # a free comparison whenever a newer stage-1 is published.
-        uid = entry.get("uid")
-        m = self.by_uid(uid) if uid else None
-        if uid:
-            seen = getattr(self, "_bl_seen", None)
-            if seen is None:
-                seen = self._bl_seen = {}
-            seen[uid] = v               # survives the re-enumeration above
+        self._remember_bl(entry.get("uid"), v)
+        return v
+
+    def _remember_bl(self, uid, v):
+        """Keep a module's bootloader version. Reading costs a bootloader round
+        trip and a re-enumeration, so the answer is kept on the module object, in
+        _bl_seen (survives a re-enumeration) and in the saved state (Store,
+        "bl": [...] or null for legacy) — one read per module lifetime, then a free
+        comparison whenever a newer stage-1 is published. stage1_update() calls it
+        too, with the version read back after the install (DEV-106)."""
+        if not uid:
+            return
+        seen = getattr(self, "_bl_seen", None)
+        if seen is None:
+            seen = self._bl_seen = {}
+        seen[uid] = v
+        m = self.by_uid(uid)
         if m is not None:
             m.bootloader = v
             self._save_state()
-        return v
 
     @staticmethod
     def layout_of(bl_version):
@@ -1883,6 +1903,11 @@ class Conductor:
             f.flash(app_image, runtime_addr=None, progress=progress)   # already in BL
             restored = True
         self.enumerate()
+        # DEV-106: the remembered "bl" must follow the install, or the layout gate
+        # keeps judging the module by its OLD stage-1 (and refuses every app update
+        # when that one predates the layout byte).
+        if after:
+            self._remember_bl(entry.get("uid"), tuple(after))
         return {"before": before, "after": after, "app_restored": restored}
 
     # Type code (as saved in noknok_state.json) -> manifest module_firmware key.
