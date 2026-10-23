@@ -315,6 +315,16 @@ check("rogue lease -> rejoin, router lease kept", ok and Radio.ipv4_address == "
       and Radio.station_stops == 1 and not events_seen, Radio.ipv4_address)
 check("gateway / DNS / AP bssid logged at connect",
       any("gateway 192.168.1.1" in l and "C4:EB:43:04:46:52" in l for l in logged))
+class _NoApInfo:
+    def __get__(self, obj, typ=None):
+        raise NotImplementedError()
+Radio.ap_info = _NoApInfo()                   # Pico 2 W, CircuitPython 10.3.1
+del logged[:]
+leases[:] = [("192.168.1.242", "192.168.1.1")]
+ns["connect_wifi"]("Home", "pw")
+check("Pico 2 W (ap_info not implemented): gateway + DNS still logged",
+      any("gateway 192.168.1.1" in l and "DNS 192.168.1.1" in l for l in logged), logged[-1:])
+Radio.ap_info = ApInfo()
 leases[:] = [("192.168.4.16", "192.168.4.1")] * 3
 Radio.station_stops = 0
 ok = ns["connect_wifi"]("Home", "pw")

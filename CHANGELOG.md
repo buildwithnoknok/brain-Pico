@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## code.py 0.33 - 2026-10-23
+
+- DEV-113 - the new join log line was empty on the Pico 2 W ("link details unavailable"): CircuitPython does not offer the access point details (`wifi.radio.ap_info`) on this board. The gateway and DNS server are now always logged; the access point only where available. Breaking: no.
+
 ## code.py 0.32 - 2026-10-22
 
 - DEV-113 - after a restore a brain joined the home WiFi but got the address 192.168.4.16 with no DNS: no clock, no updates, not reachable from the app. That address is the first one handed out by the setup-hotspot DHCP server built into CircuitPython, which answers on every network interface, so any device whose hotspot DHCP server is still running can hand out such addresses on the home network. Every WiFi join now logs the gateway, DNS server and access point (BSSID, channel, signal); a 192.168.4.x address from gateway 192.168.4.1 is treated as a stray hotspot lease and the brain joins again (up to 3 times, then keeps it and records a `[WIFI]` event); and the brain stops its own hotspot together with that DHCP server. New bench tools `tools/bench/dhcp_offers.py` (who answers DHCP on this network) and `bench_dev113_rogue_dhcp.py`; `tools/test_setup_join.py` +6 checks. Breaking: no.

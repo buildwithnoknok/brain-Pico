@@ -1,5 +1,10 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.32 (no internet from a setup hotspot's DHCP lease — DEV-113)
+# Version: 0.33 (join log works on the Pico 2 W — DEV-113)
+#
+# v0.33 changes (Sue): DEV-113 bench fix — wifi.radio.ap_info raises
+#   NotImplementedError on the Pico 2 W, which swallowed the whole join log line
+#   ("link details unavailable"). Gateway + DNS are now always logged, the access
+#   point details only where CircuitPython has them.
 #
 # v0.32 changes (Sue): DEV-113 — a brain joined the home WiFi but got 192.168.4.16
 #   with no DNS (no NTP, no OTA, unreachable). 192.168.4.16 is the first lease of
@@ -416,7 +421,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.32"
+CODE_VERSION = "0.33"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -976,14 +981,21 @@ _wifi_error = None          # text of the last failed join (connect_wifi)
 ROGUE_LEASE_TRIES = 3       # joins in a row before a setup-hotspot lease is accepted
 
 def _log_link():
-    """DEV-113: which access point and DHCP answer did this join get?"""
+    """DEV-113: which access point and DHCP answer did this join get?
+    wifi.radio.ap_info raises NotImplementedError on the Pico 2 W (CircuitPython
+    10.3.1, bench 23 Oct), so the AP part is optional; gateway + DNS always."""
+    try:
+        line = f"[wifi] gateway {wifi.radio.ipv4_gateway}  DNS {wifi.radio.ipv4_dns}"
+    except Exception as e:
+        line = f"[wifi] gateway/DNS unavailable ({e!r})"
     try:
         ap = wifi.radio.ap_info
-        bssid = ":".join("%02X" % b for b in ap.bssid) if ap else "?"
-        log(f"[wifi] gateway {wifi.radio.ipv4_gateway}  DNS {wifi.radio.ipv4_dns}  "
-            f"AP {bssid} ch {ap.channel if ap else '?'} rssi {ap.rssi if ap else '?'}")
-    except Exception as e:
-        log(f"[wifi] link details unavailable ({e!r})")
+        if ap:
+            line += "  AP %s ch %s rssi %s" % (
+                ":".join("%02X" % b for b in ap.bssid), ap.channel, ap.rssi)
+    except Exception:
+        pass                                  # not on this port
+    log(line)
 
 def _rogue_lease():
     """True when the station got its address from a setup hotspot's DHCP server

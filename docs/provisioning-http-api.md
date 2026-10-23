@@ -170,7 +170,7 @@ check (next due boot). Without `product.py` the setup AP is offered, credentials
 DHCP server (built into CircuitPython) answers on every interface, so a device whose
 hotspot DHCP server outlives its hotspot hands out `192.168.4.16..` with gateway/DNS
 `192.168.4.1` on the home network: no internet, no DNS. Every join logs `[wifi] gateway ...
-DNS ... AP <bssid> ch .. rssi ..`; such a lease is rejoined up to 3 times, then kept with a
+DNS ...` (the access point too where CircuitPython has `ap_info`; not on the Pico 2 W); such a lease is rejoined up to 3 times, then kept with a
 `[WIFI]` event. The brain stops its hotspot together with that DHCP server (`_stop_ap()`).
 Who answers DHCP on a network: `tools/bench/dhcp_offers.py`.
 
