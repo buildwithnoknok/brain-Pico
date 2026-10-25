@@ -88,7 +88,7 @@ bricked. Only the FAT filesystem is exposed, and a brain with a broken filesyste
 shows up on a PC as a drive again (fail-open, below), so recovery is always possible:
 [`tools/restore/`](tools/restore/README.md) reformats and rebuilds a brain from this checkout
 (`restore_brain.sh`, one command, backs up first), and
-[DEV-38](https://noknokdev.atlassian.net/browse/DEV-38) will make it one drag-and-drop.
+[`tools/image/`](tools/image/README.md) builds the one-file `noknok-brain-<version>.uf2` that does it in one drag-and-drop (DEV-38; hardware acceptance pending).
 
 ### The rules
 

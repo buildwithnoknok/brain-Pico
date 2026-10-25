@@ -19,3 +19,6 @@ tools/soak/runs/
 soak_pico.log
 soak_client.log
 *.log
+
+# DEV-38 brain image output (tools/image/build_brain_uf2.py)
+build/

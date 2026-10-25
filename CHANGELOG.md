@@ -8,6 +8,10 @@ Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
 - DEV-155 - a module with the old (legacy) bootloader, such as a Knob with app 2.1.0, was taken for a module whose newer bootloader just could not state its flash layout: when asked for its version, the legacy bootloader does not stay silent as assumed, it answers its status bytes padded with zeros (0,0,0,0,0). The brain then refused that module's app updates with the wrong reason and raised a daily "stage-1 refused" alert. Now only a real stage-1 reply (protocol byte 0x01, major 1 or higher) counts; anything else means legacy (needs a one-time SWD reflash), also for a value an older brain already remembered. `module_flasher.py` changes in the same commit (`get_version()` returns None for such a reply). New host test `tools/test_legacy_bl.py` (21 checks) and bench probe `tools/bench/dev155_legacy_bl.py`. Breaking: no.
 
+## Tools: brain image - 2026-10-25 (no component version bumped)
+
+- DEV-38 - new `tools/image/build_brain_uf2.py`: builds the one-file brain image `noknok-brain-<version>-cp<CircuitPython>.uf2` (CircuitPython 10.3.1 + the complete noknok filesystem: boot.py, code.py, settings.toml, the four libraries as .mpy, lib/). Hold BOOTSEL, drag the one file, the brain is back. Pinned and checksum-verified CircuitPython, reproducible (the same commit gives the same bytes), a manifest with every checksum; the noknok Store in the Pico's nvm is kept unless `--wipe-store`. Host test `tools/test_brain_uf2.py`; build notes and the hardware test plan in `tools/image/README.md`. Not yet tried on a Pico. Breaking: no.
+
 ## Tools: bench - 2026-10-25 (no component version bumped)
 
 - DEV-105 - `software/bench_dev65.py` reported a false FAIL ("installed versions unchanged") on a brain with a USB module: the check after the run compared all modules, and the USB module only appears in the second report. It now compares only the modules from the first report and names any that went missing or changed version. Bench only, nothing ships to a brain. Breaking: no.
