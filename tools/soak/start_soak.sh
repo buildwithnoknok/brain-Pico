@@ -2,12 +2,13 @@
 # start_soak.sh - launch the overnight soak detached, so it survives the SSH
 # session going away. Safe to run from a one-shot plink command.
 #
-#   ./start_soak.sh [hours]        default 12
+#   ./start_soak.sh [hours] [soak_run.py args, e.g. --usb --hub 2]   default 12 h
 #
 # The sudo password is read from ~/.soak_sudo (chmod 600) - never from this
 # repo, which is public.
 
 HOURS=${1:-12}
+[ $# -gt 0 ] && shift
 DIR=$(dirname "$0")
 cd "$DIR" || exit 1
 
@@ -19,7 +20,7 @@ fi
 mkdir -p runs
 rm -f runs/STOP
 
-nohup python3 soak_run.py --hours "$HOURS" --dir "$DIR/runs" \
+nohup python3 soak_run.py --hours "$HOURS" --dir "$DIR/runs" "$@" \
       > runs/console.log 2>&1 &
 
 echo "soak started (pid $!), ${HOURS} h"

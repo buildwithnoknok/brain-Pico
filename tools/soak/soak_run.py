@@ -22,7 +22,7 @@
 #     $SOAK_SUDO_PW or ~/.soak_sudo (chmod 600, outside the repo).
 #   * Raw output is kept only for failing iterations, in failures/.
 #
-# Usage:  ./soak_run.py [--hours 12] [--gap 15] [--dir <outdir>] [--usb]
+# Usage:  ./soak_run.py [--hours 12] [--gap 15] [--dir <outdir>] [--usb] [--hub 2]
 #         touch <outdir>/STOP   to end the run cleanly.
 
 import json
@@ -51,6 +51,7 @@ SCENARIOS = {
 }
 PATTERN = ["cold", "cold", "short", "cold", "long",
            "cold", "storm", "cold", "short", "cold"]
+UPTIME_MAX_AFTER_CUT = 120   # s; a probe after a real cut runs well inside this
 HOLD_EVERY = 25          # every Nth iteration is an idle_hold instead
 
 PW = None
@@ -188,7 +189,7 @@ def fingerprint(rep):
     usb = rep.get("usb")
     if usb is not None:
         fp["usb"] = sorted(
-            "leds/%s/%s" % (m.get("serial"), m.get("fw"))
+            "%s/%s/%s" % (m.get("kind", "leds"), m.get("serial"), m.get("fw"))
             for m in usb.get("modules", [])
         )
     return fp
@@ -209,6 +210,7 @@ def compare(base, now):
 def main(argv):
     global PW
     hours, gap, outdir, do_usb, reps = 12.0, 15.0, os.path.join(HERE, "runs"), 0, 10
+    hub = None
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -220,6 +222,8 @@ def main(argv):
             outdir = argv[i + 1]; i += 2
         elif a == "--usb":
             do_usb = 1; i += 1
+        elif a == "--hub":
+            hub = argv[i + 1]; i += 2      # e.g. 2 = the USB 3 hub on a Pi 4B
         elif a == "--reps":
             reps = int(argv[i + 1]); i += 2
         else:
@@ -236,6 +240,8 @@ def main(argv):
         os.remove(stopfile)
 
     loc, port = find_pico_port()
+    if hub:
+        loc = hub                  # explicit hub wins over autodetect
     if not loc:
         log("FATAL: could not find the Pico on any switchable hub port")
         return 2
@@ -305,6 +311,16 @@ def main(argv):
             for b in report.get("buses", {}).values():
                 if b.get("fatal"):
                     problems.append("bus fatal: %s" % b["fatal"])
+            # Proof the cut was real: the Pico's clock restarts. A probe starts well
+            # under 2 min after power-on; a bigger uptime = only the data link dropped
+            # (or the Pico is fed from elsewhere, e.g. the PicoHub's own charger).
+            if extra >= 0 and (report.get("uptime") or 0) > UPTIME_MAX_AFTER_CUT:
+                problems.append("power cut did NOT reset the Pico (uptime %.0f s)"
+                                % report["uptime"])
+            for bname, b in report.get("buses", {}).items():
+                hub = b.get("hub") or {}
+                if hub.get("faults"):
+                    problems.append("picohub %s faults: %s" % (bname, ",".join(hub["faults"])))
             if report.get("nvm0") not in (0xFF, 0xC0):
                 problems.append("crash counter nvm0=0x%02X" % report["nvm0"])
             if (report.get("usb") or {}).get("error"):

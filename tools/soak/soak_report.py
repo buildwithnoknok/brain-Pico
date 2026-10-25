@@ -116,13 +116,16 @@ def main(argv):
     print("\n--- trends ---")
     print("boot time (s)      : %s" % trend([r.get("boot_sec") for r in recs]))
 
+    print("Pico uptime at probe: %s" % trend([(r.get("report") or {}).get("uptime")
+          for r in recs if r.get("scenario") != "idle_hold"]))
     mem = [(r.get("report") or {}).get("mem_end") for r in recs]
     print("free mem end (B)   : %s" % trend(mem))
 
-    for bus in ("i2c0", "i2c1"):
+    buses = sorted({b for r in recs for b in ((r.get("report") or {}).get("buses") or {})})
+    for bus in buses:
         en = [((r.get("report") or {}).get("buses", {}).get(bus) or {}).get("enum_sec")
               for r in recs]
-        print("%s enumerate (s) : %s" % (bus, trend(en)))
+        print("bus %s enumerate (s): %s" % (bus, trend(en)))
 
     ops = sum(sum(b.get("ok", 0) for b in
                   ((r.get("report") or {}).get("buses") or {}).values()) for r in recs)
@@ -151,6 +154,16 @@ def main(argv):
             rr[v] = rr.get(v, 0) + 1
     print("\nreset reasons      : %s" % ", ".join(
         "%s=%d" % (k, v) for k, v in sorted(rr.items(), key=lambda kv: -kv[1])))
+
+    hc = {}
+    for r in recs:
+        for b in ((r.get("report") or {}).get("buses") or {}).values():
+            v = (b.get("hub") or {}).get("reset_cause")
+            if v is not None:
+                hc[str(v)] = hc.get(str(v), 0) + 1
+    if hc:
+        print("picohub reset cause: %s" % ", ".join(
+            "%s=%d" % (k, v) for k, v in sorted(hc.items())))
 
     nv = {}
     for r in recs:

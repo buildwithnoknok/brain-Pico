@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## tools/soak - 2026-10-25
+
+- DEV-67 - soak rig brought up to date with the current brain (bench tooling only, no brain or module firmware change): the probe also reads the MOD-0011 PicoHub (GET_STATUS, read-only) and enumerates LEDs 16x, records the Pico's uptime, and the run fails an iteration whose power cut did not restart the Pico's clock; `--hub` picks the hub to switch (2 = Pi 4B USB 3 hub); the report follows the real bus names A/B. Breaking: no.
+
 ## noknok.py 1.22 - 2026-10-25
 
 - DEV-155 - a module with the old (legacy) bootloader, such as a Knob with app 2.1.0, was taken for a module whose newer bootloader just could not state its flash layout: when asked for its version, the legacy bootloader does not stay silent as assumed, it answers its status bytes padded with zeros (0,0,0,0,0). The brain then refused that module's app updates with the wrong reason and raised a daily "stage-1 refused" alert. Now only a real stage-1 reply (protocol byte 0x01, major 1 or higher) counts; anything else means legacy (needs a one-time SWD reflash), also for a value an older brain already remembered. `module_flasher.py` changes in the same commit (`get_version()` returns None for such a reply). New host test `tools/test_legacy_bl.py` (21 checks) and bench probe `tools/bench/dev155_legacy_bl.py`. Breaking: no.

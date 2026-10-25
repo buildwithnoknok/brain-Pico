@@ -24,6 +24,12 @@ Every iteration also checks: the golden module set (UID / address / firmware per
 bus), per-operation I²C error counts, the DEV-32 crash counter in `nvm[0]`,
 reset reason, and free memory.
 
+Since DEV-67 (25 Oct 2026) it also reads the MOD-0011 PicoHub power manager
+(GET_STATUS only: faults, reset cause, input voltage), enumerates LEDs and LEDs 16x
+on USB, records the Pico's uptime at every probe and FAILS an iteration whose cut did
+not restart the Pico's clock (uptime > 120 s). Bus names in the log are `A`/`B`
+(settings.toml), not `i2c0`/`i2c1`.
+
 **Not covered yet:** OTA flashing and interrupted-flash (brick) tests. Those
 need a sacrificial module — CH32V003 flash is rated ~10 k erase cycles and a
 soak would burn through that. Do not point these at production modules.
@@ -35,7 +41,8 @@ soak would burn through that. Do not point these at production modules.
 printf 'yourpassword' > ~/.soak_sudo && chmod 600 ~/.soak_sudo
 
 cd ~/dev/pico/soak
-./start_soak.sh 12            # 12 hours, detached, survives the SSH session
+./start_soak.sh 12 --usb --hub 2   # 12 hours, detached; extra args go to soak_run.py
+                              # --hub 2 = the Pi 4B's USB 3 hub, the one that cuts VBUS
 ```
 
 Then in the morning:

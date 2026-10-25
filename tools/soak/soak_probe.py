@@ -57,6 +57,9 @@ TYPE_NAME = {
 }
 
 
+hub_status = {}          # last PicoHub GET_STATUS of the current bus scan (read-only)
+
+
 class Counter:
     """Counts ok/err over module operations and remembers distinct failures."""
 
@@ -89,6 +92,9 @@ def exercise(module, kind, c):
             c.do("ledbutton.read", module.read)
             c.do("ledbutton.set_color", lambda: module.set_color(6, 0, 6))
             c.do("ledbutton.led_off", module.led_off)
+        elif kind == "picohub":
+            # GET_STATUS only: read-only. Never set_rail/cycle_rail/reset_pico.
+            c.do("picohub.status", lambda: hub_status.update(module.status()))
         elif kind == "display":
             c.do("display.status", module.status)
             c.do("display.fill_rect", lambda: module.fill_rect(0, 0, 8, 8, 0x001F))
@@ -108,8 +114,13 @@ def scan_bus(name, pins, sda, scl):
         res["n"] = n
 
         counter = Counter()
-        for kind in ("buzzer", "knob", "ledbutton", "display"):
-            for m in getattr(c, kind, []):
+        hub_status.clear()
+        # c.picohub is a single module (the carrier's power manager) or None.
+        for kind in ("buzzer", "knob", "ledbutton", "display", "picohub"):
+            mods = getattr(c, kind, [])
+            if kind == "picohub":
+                mods = [mods] if mods is not None else []
+            for m in mods:
                 res["modules"].append({
                     "uid": getattr(m, "_uid_hex", None),
                     "type": kind,
@@ -121,6 +132,10 @@ def scan_bus(name, pins, sda, scl):
                     counter.do("display.backlight", lambda: m.backlight(0.15))
                 exercise(m, kind, counter)
 
+        if hub_status:
+            res["hub"] = {k: hub_status.get(k) for k in
+                          ("pd_state", "contract_v", "vin", "v5v", "temp_c",
+                           "faults", "warnings", "reset_cause")}
         res["ok"] = counter.ok
         res["err"] = counter.err
         res["errors"] = counter.seen
@@ -167,6 +182,7 @@ def main():
         "run_reason": str(supervisor.runtime.run_reason).split(".")[-1],
         "safe_mode": str(supervisor.runtime.safe_mode_reason).split(".")[-1],
         "nvm0": microcontroller.nvm[0],
+        "uptime": round(time.monotonic(), 1),   # near 0 = the Pico really lost power
         "mem_start": gc.mem_free(),
         "hold_sec": HOLD_SEC,
         "buses": {},
@@ -185,11 +201,15 @@ def main():
             c = Conductor()
             n = c.enumerate_usb()
             u["n"] = n
-            for m in getattr(c, "leds", []):
-                u["modules"].append({
-                    "serial": getattr(m, "_uid_hex", None) or getattr(m, "serial", None),
-                    "fw": getattr(m, "firmware_version", None),
-                })
+            # LEDs (8x) and LEDs 16x: enumeration only, nothing is lit.
+            for kind, lst in (("leds", getattr(c, "leds", [])),
+                              ("leds16", getattr(c, "leds16", []))):
+                for m in lst:
+                    u["modules"].append({
+                        "kind": kind,
+                        "serial": getattr(m, "_uid_hex", None) or getattr(m, "serial", None),
+                        "fw": getattr(m, "firmware_version", None),
+                    })
         except Exception as e:                      # noqa: BLE001
             u["error"] = "%s: %s" % (type(e).__name__, e)
         finally:
