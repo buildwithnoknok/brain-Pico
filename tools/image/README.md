@@ -85,6 +85,11 @@ may ignore a drag-and-drop UF2 (CircuitPython's own UF2 too). Drag `flash_nuke.u
 
 ## Not done yet (rest of DEV-38, after a PASS)
 
-- Publish per release (GitHub Releases or `releases/`) with the `.sha256`.
+- Publish per release as a **GitHub Release on buildwithnoknok/brain-Pico** (decided by Christopher, 25 Oct 2026, DEV-158).
+  Tag `brain-<version>` (git tags are allowed on brain-Pico only; module firmware stays tag-free). Attach the
+  versioned files `noknok-brain-<version>-cp<cp-version>.uf2`, its `-wipe.uf2` and both `.sha256`, plus the fixed-name
+  aliases `noknok-brain-recovery.uf2` and `noknok-brain-wipe.uf2` (with `.sha256`), so
+  `https://github.com/buildwithnoknok/brain-Pico/releases/latest/download/noknok-brain-recovery.uf2` always works.
+  The image must contain no credentials, WiFi data or personal data (check the file list before every publish).
 - Consumer instructions (website support page, Max) and the internal factory-flash procedure
   (Confluence), and the optional "Recover my device" page in the app.
