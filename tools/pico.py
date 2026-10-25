@@ -31,9 +31,10 @@
 # Port: the by-id path is stable across re-enumeration; ttyACM numbering is not
 # (the WCH-LinkE also exposes a CDC port and grabs ttyACM0 if it enumerates first).
 
-import sys, time, glob, serial
+import os, sys, time, glob, serial
 
-PORT_GLOB = '/dev/serial/by-id/usb-Raspberry_Pi_Pico*-if00'
+# PICO_SERIAL=<serial> picks one board when several Picos are plugged in (else the first found).
+PORT_GLOB = '/dev/serial/by-id/usb-Raspberry_Pi_Pico*%s-if00' % os.environ.get('PICO_SERIAL', '')
 BAUD      = 115200
 
 CTRL_A, CTRL_B, CTRL_C, CTRL_D = b'\x01', b'\x02', b'\x03', b'\x04'

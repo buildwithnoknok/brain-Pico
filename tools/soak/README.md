@@ -43,6 +43,7 @@ printf 'yourpassword' > ~/.soak_sudo && chmod 600 ~/.soak_sudo
 cd ~/dev/pico/soak
 ./start_soak.sh 12 --usb --hub 2   # 12 hours, detached; extra args go to soak_run.py
                               # --hub 2 = the Pi 4B's USB 3 hub, the one that cuts VBUS
+                              # --serial <id> when more than one Pico is plugged in (also PICO_SERIAL=<id> for pico.py/powertest.sh)
 ```
 
 Then in the morning:

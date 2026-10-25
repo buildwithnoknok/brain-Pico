@@ -22,7 +22,7 @@
 #     $SOAK_SUDO_PW or ~/.soak_sudo (chmod 600, outside the repo).
 #   * Raw output is kept only for failing iterations, in failures/.
 #
-# Usage:  ./soak_run.py [--hours 12] [--gap 15] [--dir <outdir>] [--usb] [--hub 2]
+# Usage:  ./soak_run.py [--hours 12] [--gap 15] [--dir <outdir>] [--usb] [--hub 2] [--serial 5EEF5E2750C3EE0E]
 #         touch <outdir>/STOP   to end the run cleanly.
 
 import json
@@ -55,6 +55,7 @@ UPTIME_MAX_AFTER_CUT = 120   # s; a probe after a real cut runs well inside this
 HOLD_EVERY = 25          # every Nth iteration is an idle_hold instead
 
 PW = None
+SERIAL = ""      # --serial: the one Pico under test (several may be plugged in)
 
 
 def log(msg):
@@ -95,7 +96,7 @@ def find_pico_port():
             loc = m.group(1)
             continue
         m = re.match(r"\s*Port (\d+):.*\[(.*)\]", line)
-        if m and loc and "Pico" in m.group(2):
+        if m and loc and "Pico" in m.group(2) and SERIAL in m.group(2):
             return loc, m.group(1)
     return None, None
 
@@ -120,7 +121,7 @@ def wait_for_pico(timeout=45):
     while time.time() - t0 < timeout:
         try:
             for n in os.listdir(PORT_DIR):
-                if n.startswith("usb-Raspberry_Pi_Pico") and n.endswith("-if00"):
+                if n.startswith("usb-Raspberry_Pi_Pico") and SERIAL in n and n.endswith("-if00"):
                     time.sleep(1.5)          # let CircuitPython finish booting
                     return round(time.time() - t0, 1)
         except OSError:
@@ -208,7 +209,7 @@ def compare(base, now):
 
 
 def main(argv):
-    global PW
+    global PW, SERIAL
     hours, gap, outdir, do_usb, reps = 12.0, 15.0, os.path.join(HERE, "runs"), 0, 10
     hub = None
     i = 1
@@ -222,6 +223,8 @@ def main(argv):
             outdir = argv[i + 1]; i += 2
         elif a == "--usb":
             do_usb = 1; i += 1
+        elif a == "--serial":
+            SERIAL = argv[i + 1]; os.environ["PICO_SERIAL"] = SERIAL; i += 2
         elif a == "--hub":
             hub = argv[i + 1]; i += 2      # e.g. 2 = the USB 3 hub on a Pi 4B
         elif a == "--reps":
