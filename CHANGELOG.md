@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## Tools: bench - 2026-10-25 (no component version bumped)
+
+- DEV-105 - `software/bench_dev65.py` reported a false FAIL ("installed versions unchanged") on a brain with a USB module: the check after the run compared all modules, and the USB module only appears in the second report. It now compares only the modules from the first report and names any that went missing or changed version. Bench only, nothing ships to a brain. Breaking: no.
+
 ## Tools: tests - 2026-10-23 (no component version bumped)
 
 - DEV-151 - new host test `tools/test_maxi_toggle.py`: runs the real Smart Lamp Maxi script (poc repo) against a fake LED Button + LEDs 16x and a fake clock, and checks what quick on/off toggles send to the LEDs. Breaking: no.

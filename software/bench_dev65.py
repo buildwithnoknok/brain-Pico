@@ -109,10 +109,16 @@ try:
               len(res) == len(mods) and not any(r["updated"] for r in res))
 
         # 4. versions unchanged by all of the above (read back from the hardware)
+        # Only the modules of the step-1 report count (DEV-105): firmware_report() after
+        # update_all() also lists USB modules (update_all enumerates USB), which were
+        # never in `before` - a USB module there is not a change. A module from
+        # `before` that is missing or reports another version afterwards IS one.
         before = {r["uid"]: r["installed"] for r in rep}
         c.enumerate(total_timeout_sec=6)
         after = {r["uid"]: r["installed"] for r in c.firmware_report({})}
-        check("installed versions unchanged after the run", before == after)
+        changed = {u: (v, after.get(u, "MISSING")) for u, v in before.items() if after.get(u) != v}
+        check("installed versions unchanged after the run", not changed,
+              "  ".join("%s %s -> %s" % (u, a, b) for u, (a, b) in changed.items()))
         try:
             c.deinit()
         except Exception:
