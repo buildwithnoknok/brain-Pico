@@ -31,7 +31,12 @@
 # does not do that for you.
 #
 # GET_VERSION is also the fleet discriminator: the legacy monolithic bootloader
-# does not implement 0xB1, so "no answer" means old world / not self-updatable.
+# does not implement 0xB1 - but it does NOT stay silent either: it ACKs every
+# byte and answers any read with its 2-byte status [state, last_error], padded
+# with 0x00. So after 0xB1 a fresh legacy bootloader reads (0, 0, 0, 0, 0).
+# get_version() therefore only accepts a reply that starts with the bootloader
+# protocol byte and a stage-1 major >= 1, and returns None (legacy / old world /
+# not self-updatable) for anything else (DEV-155).
 #
 # CRC32 = zlib (poly 0xEDB88320, init/final 0xFFFFFFFF) to match the bootloader.
 
@@ -46,6 +51,16 @@ CMD_VERIFY         = 0x04
 CMD_BOOT           = 0x05
 CMD_VERIFY_STAGE1  = 0x06   # DEV-31
 CMD_GET_VERSION    = 0xB1   # DEV-31 (same shape as the app's GET_VERSION)
+BL_PROTOCOL        = 0x01   # byte 0 of every stage-1 0xB1 reply (stage-1 1.0.0 onwards)
+
+
+def is_stage1_reply(v):
+    """True if `v` (an 0xB1 reply read at 0x7E) comes from a stage-0/stage-1
+    bootloader: protocol byte 0x01 and a stage-1 major >= 1. The legacy
+    monolithic bootloader answers its status [state, err] + zero padding, which
+    is (0, 0, 0, 0, 0) on a fresh entry - never a valid stage-1 version (DEV-155)."""
+    return (v is not None and len(v) >= 4
+            and v[0] == BL_PROTOCOL and v[1] >= 1)
 CMD_GET_UID        = 0xB3   # DEV-31 hardening D: 8-byte chip UID
 
 ST_IDLE, ST_BUSY, ST_READY, ST_ERROR = 0, 1, 2, 3
@@ -194,9 +209,9 @@ class ModuleFlasher:
     # ── DEV-31: bootloader self-update ───────────────────────────────────────
     def get_version(self):
         """Bootloader version: write 0xB1, read [proto, major, minor, patch, layout].
-        Returns the 5-tuple, or None if the bootloader doesn't answer — which is
-        how you tell a legacy monolithic bootloader (not self-updatable) from a
-        stage-0/stage-1 one.
+        Returns the 5-tuple, or None for the legacy monolithic bootloader (not
+        self-updatable): it either does not answer, or answers its status bytes
+        padded with zeros, which is_stage1_reply() rejects (DEV-155).
 
         Byte 4 is the flash layout the bootloader installs apps for (stage-1
         v1.2.0+). A stage-1 older than that returns 0 there — "did not say" —
@@ -209,11 +224,12 @@ class ModuleFlasher:
             pass
         try:
             self.i2c.readfrom_into(BL_ADDR, buf)
-            return tuple(buf)
         except OSError:
             return None
         finally:
             self.i2c.unlock()
+        v = tuple(buf)
+        return v if is_stage1_reply(v) else None
 
     def get_uid(self):
         """Chip UID of the module in the bootloader: write 0xB3, read 8 bytes.

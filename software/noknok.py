@@ -118,6 +118,14 @@
 #             identity-checked, INTERIM (ADR-005): a remembered address is only
 #             trusted if its 0xB1 reply starts with PROTOCOL_VERSION (3 tries);
 #             _restore_identity() is the one place DEV-21 swaps for 0xB4 GET_ID.
+# v1.22 (Sam): DEV-155 — a module with the LEGACY monolithic bootloader (e.g. a
+#             Knob with app 2.1.0) answers the bootloader's 0xB1 with its status
+#             bytes padded with zeros, (0,0,0,0,0), not with silence. That was
+#             taken for "stage-1 without a layout byte" (layout None: app updates
+#             refused, a daily "stage-1 refused" alert). Any reply that is not a
+#             real stage-1 version (protocol byte 0x01, major >= 1) now means
+#             legacy (None, layout 0), also for a value already remembered in the
+#             Store. Needs module_flasher.py from the same commit.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -138,7 +146,7 @@ import json
 import os
 import struct
 
-__version__ = "1.21"
+__version__ = "1.22"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -1847,8 +1855,20 @@ class Conductor:
             except Exception:
                 pass
         self.enumerate()
+        v = self._bl_norm(v)          # DEV-155: zero-padded legacy reply -> None
         self._remember_bl(entry.get("uid"), v)
         return v
+
+    @staticmethod
+    def _bl_norm(v):
+        """A bootloader 0xB1 reply as the Conductor keeps it: the tuple for a
+        real stage-1 (protocol byte 0x01, major >= 1), else None = legacy
+        monolithic bootloader. The legacy one answers its status padded with
+        zeros, (0,0,0,0,0) - and older brains remembered exactly that in the
+        Store, so values read back from the state go through here too (DEV-155)."""
+        if not v or len(v) < 4 or v[0] != 0x01 or v[1] < 1:
+            return None
+        return tuple(v)
 
     def _remember_bl(self, uid, v):
         """Keep a module's bootloader version. Reading costs a bootloader round
@@ -1859,6 +1879,7 @@ class Conductor:
         too, with the version read back after the install (DEV-106)."""
         if not uid:
             return
+        v = self._bl_norm(v)
         seen = getattr(self, "_bl_seen", None)
         if seen is None:
             seen = self._bl_seen = {}
@@ -1877,8 +1898,10 @@ class Conductor:
         host-side infers it. Returns 0 for the legacy monolithic bootloader
         (no 0xB1 at all), and None when the stage-1 predates the layout byte
         (it answers 0 there) — refuse rather than guess; that module needs a
-        stage-1 update first."""
-        if bl_version is None:
+        stage-1 update first. A reply that is not a stage-1 version at all (the
+        legacy bootloader's zero-padded status, (0,0,0,0,0)) is legacy too, so
+        it gives 0 (DEV-155)."""
+        if Conductor._bl_norm(bl_version) is None:
             return 0
         if len(bl_version) < 5 or bl_version[4] == 0:
             return None
@@ -2460,8 +2483,7 @@ class Conductor:
             if module is not None:
                 module.protocol_version, module.firmware_version = version
                 if "bl" in info:
-                    bl = info["bl"]
-                    module.bootloader = tuple(bl) if bl else None
+                    module.bootloader = self._bl_norm(info["bl"])   # DEV-155
                 self._registry[uid_hex] = module
                 restored += 1
 
