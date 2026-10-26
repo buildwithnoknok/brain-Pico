@@ -187,8 +187,10 @@ Test: `tools/test_two_bus.py` (host, tier S).
 ⚠ `NOKNOK_WATCHDOG` is a diagnostic for unattended bench runs, never for a shipped brain or
 for a brain you also drive with `tools/pico.py`: Ctrl-C into the REPL stops the pump, the
 watchdog resets the board ~8 s later, and a reset landing mid-write corrupts the filesystem
-(it cost `/data` on the bench, 18 Sep 2026). After a watchdog reset the radio does not
-re-join either — that board needs a real power cycle. `NOKNOK_MDNS` is on by default since
+(it cost `/data` on the bench, 18 Sep 2026). After a watchdog reset the brain does come back
+on the home WiFi by itself on CircuitPython 10.3.1 (3 of 3 in 29-52 s, 26 Oct 2026,
+`tools/bench/bench_dev93_wdt_rejoin.sh`; the 18 Sep "radio does not re-join" no longer
+reproduces). Shipped brains do not arm it: ADR-006 (Confluence 129990657, DEV-93). `NOKNOK_MDNS` is on by default since
 code.py 0.36: the one idle hang seen while advertising (17 Sep 2026) never came back in three
 full bench nights with it on ([DEV-70](https://noknokdev.atlassian.net/browse/DEV-70)). The app
 still finds a brain by scanning the subnet; `0` switches the name off.

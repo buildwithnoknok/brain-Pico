@@ -12,6 +12,10 @@ Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
 - DEV-155 - a module with the old (legacy) bootloader, such as a Knob with app 2.1.0, was taken for a module whose newer bootloader just could not state its flash layout: when asked for its version, the legacy bootloader does not stay silent as assumed, it answers its status bytes padded with zeros (0,0,0,0,0). The brain then refused that module's app updates with the wrong reason and raised a daily "stage-1 refused" alert. Now only a real stage-1 reply (protocol byte 0x01, major 1 or higher) counts; anything else means legacy (needs a one-time SWD reflash), also for a value an older brain already remembered. `module_flasher.py` changes in the same commit (`get_version()` returns None for such a reply). New host test `tools/test_legacy_bl.py` (21 checks) and bench probe `tools/bench/dev155_legacy_bl.py`. Breaking: no.
 
+## Docs + tools: watchdog decision - 2026-10-26 (no component version bumped)
+
+- DEV-93 - shipped brains keep the hardware watchdog switched off (ADR-006, proposed): in about 40 hours of unattended bench running and 58 power cuts the brain never froze in a way a watchdog would fix. New bench script `tools/bench/bench_dev93_wdt_rejoin.sh`: after a watchdog reset the brain came back on the home WiFi by itself 3 of 3 times (29-52 s); the README no longer says it would not. Breaking: no.
+
 ## code.py 0.36 + noknok_rpc.py comment - 2026-10-26
 
 - DEV-70 - the brain now announces itself on the home network as `noknok-XXXX.local` (mDNS) by default. It had been switched off since one unexplained freeze on 17 Sep; three full nights on the bench with it on (12 h, 8 h and 12 h, 22-26 Oct) showed no freeze and no restart. `NOKNOK_MDNS = 0` in settings.toml switches it off; the repo settings.toml now says `NOKNOK_MDNS = 1`. The app still finds brains by scanning the network (using the name is a separate app change). Host test `tools/test_mdns_default.py`. Breaking: no.
