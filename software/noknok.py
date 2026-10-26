@@ -126,6 +126,10 @@
 #             real stage-1 version (protocol byte 0x01, major >= 1) now means
 #             legacy (None, layout 0), also for a value already remembered in the
 #             Store. Needs module_flasher.py from the same commit.
+# v1.23 (Sue): DEV-109 — settings.set from the app (apply_remote) only accepts keys
+#             the product declared with s.defaults(); any other key is rejected
+#             ("unknown setting"), never stored, never handed to the product. The
+#             product's own s.set() is unchanged.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -146,7 +150,7 @@ import json
 import os
 import struct
 
-__version__ = "1.22"
+__version__ = "1.23"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -1058,10 +1062,16 @@ class Settings:
     def apply_remote(self, values):
         """Merge values sent by the app. Returns (changed, rejected) — rejected
         maps key -> reason, so the app can show why. Rejected values never
-        reach the product."""
+        reach the product. Only keys the product declared (defaults()) are
+        accepted (DEV-109): a LAN client cannot fill the Store with junk keys."""
         changed, rejected = {}, {}
         for k, v in values.items():
-            why = "read-only" if k in self._info else _check_value(k, v, self._defs.get(k))
+            if k in self._info:
+                why = "read-only"
+            elif not isinstance(k, str) or k not in self._defs:
+                why = "unknown setting"
+            else:
+                why = _check_value(k, v, self._defs.get(k))
             if why is None and k not in self._vals and len(self._vals) >= SETTINGS_MAX_KEYS:
                 why = "too many keys"
             if why is not None:

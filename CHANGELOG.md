@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## noknok.py 1.23 - 2026-10-26
+
+- DEV-109 - the app (or anything else on the home network) could store settings the product never declared, e.g. `"turbo": true`: they were saved and passed to the product. `settings.set` now only accepts the settings the product declares; anything else comes back as `rejected: {"turbo": "unknown setting"}` and is not stored. Host test `tools/test_settings_unknown.py`. Breaking: no (the app only sends declared settings).
+
 ## tools/soak - 2026-10-25
 
 - DEV-67 - soak rig brought up to date with the current brain (bench tooling only, no brain or module firmware change): the probe also reads the MOD-0011 PicoHub (GET_STATUS, read-only) and enumerates LEDs 16x, records the Pico's uptime, and the run fails an iteration whose power cut did not restart the Pico's clock; `--hub` picks the hub to switch (2 = Pi 4B USB 3 hub); the report follows the real bus names A/B. Breaking: no.
