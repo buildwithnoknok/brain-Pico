@@ -22,7 +22,7 @@
 #     $SOAK_SUDO_PW or ~/.soak_sudo (chmod 600, outside the repo).
 #   * Raw output is kept only for failing iterations, in failures/.
 #
-# Usage:  ./soak_run.py [--hours 12] [--gap 15] [--dir <outdir>] [--usb] [--hub 2] [--serial 5EEF5E2750C3EE0E]
+# Usage:  ./soak_run.py [--hours 12] [--gap 15] [--dir <outdir>] [--usb] [--hub 2] [--serial 5EEF5E2750C3EE0E] [--pattern cold,short]
 #         touch <outdir>/STOP   to end the run cleanly.
 
 import json
@@ -242,6 +242,9 @@ def main(argv):
             do_usb = 1; i += 1
         elif a == "--serial":
             SERIAL = argv[i + 1]; os.environ["PICO_SERIAL"] = SERIAL; i += 2
+        elif a == "--pattern":
+            # e.g. cold,short,cold,short - overrides the scenario mix (keys of SCENARIOS)
+            PATTERN[:] = [k for k in argv[i + 1].split(",") if k in SCENARIOS]; i += 2
         elif a == "--hub":
             hub = argv[i + 1]; i += 2      # e.g. 2 = the USB 3 hub on a Pi 4B
         elif a == "--reps":
