@@ -182,15 +182,43 @@ Test: `tools/test_two_bus.py` (host, tier S).
 | `NOKNOK_USB_DRIVE` | `0` = hidden (shipped) · `1` = visible (maker/bench) | `boot.py` |
 | `NOKNOK_MDNS` | `1` = advertise `noknok-XXXX.local` (default) · `0` = off | `code.py` app channel |
 | `NOKNOK_FRAM` | `1` = probe the I2C FRAM at 0x50 and use it as the Store if a chip answers. Unset or anything else = nvm only, the bus is not touched (default since 1.14) | `noknok.store()` |
-| `NOKNOK_WATCHDOG` | `0` = off (default) · `1` = **bench only**, 8 s hardware watchdog fed by the app-channel pump, plus the `bench.wifi_drop` op | `code.py` |
+| `NOKNOK_WATCHDOG` | `0` = off (default, shipped brains) · `1` = advanced/bench: 8 s hardware watchdog while the product runs, plus the `bench.wifi_drop` op - read the watchdog section below first | `code.py` |
 
-⚠ `NOKNOK_WATCHDOG` is a diagnostic for unattended bench runs, never for a shipped brain or
-for a brain you also drive with `tools/pico.py`: Ctrl-C into the REPL stops the pump, the
-watchdog resets the board ~8 s later, and a reset landing mid-write corrupts the filesystem
-(it cost `/data` on the bench, 18 Sep 2026). After a watchdog reset the brain does come back
-on the home WiFi by itself on CircuitPython 10.3.1 (3 of 3 in 29-52 s, 26 Oct 2026,
-`tools/bench/bench_dev93_wdt_rejoin.sh`; the 18 Sep "radio does not re-join" no longer
-reproduces). Shipped brains do not arm it: ADR-006 (Confluence 129990657, DEV-93). `NOKNOK_MDNS` is on by default since
+### The watchdog setting (`NOKNOK_WATCHDOG`) - advanced, not supported on shipped brains
+
+**What it is.** The Pico's chip has a hardware watchdog: a timer the program must "feed" every
+few seconds. If the program stops feeding it (because it froze), the chip restarts itself, as
+if the cable had been pulled. It is off until a program switches it on.
+
+**Shipped brains leave it off** (ADR-006, accepted 26 Oct 2026, Confluence 129990657, DEV-93):
+in about 40 hours of unattended bench running and 58 power cuts the brain never froze in a way a
+restart would fix; every failure seen has its own remedy (WiFi rejoin, the 3-strike crash
+recovery, the app retrying). The setting stays available for bench runs and for makers who know
+what it does.
+
+**Switching it on.** `NOKNOK_WATCHDOG = 1` in `settings.toml` (on a shipped brain the drive is
+hidden: switch to maker mode first, `NOKNOK_USB_DRIVE = 1`, power-cycle, edit, set it back). The
+watchdog is armed when the product starts (after setup and the update pass, so it never fires
+during their file writes), with an 8 s timeout. It is fed by every module read or write of the
+noknok library and by `c.sleep()`. **Once armed it stays armed until the next restart.**
+
+**Know before you switch it on:**
+
+- **A product must talk to its modules or call `c.sleep()` at least every 8 s.** A plain
+  `time.sleep(30)`, or any long loop without module calls, restarts the brain - and it restarts
+  again every time: there is no "give up after 3 restarts" guard yet (that is ADR-006 option B).
+- **Never use the USB console (`tools/pico.py`, Ctrl-C) while it is armed.** Ctrl-C stops the
+  feeding; ~8 s later the chip restarts, and a restart in the middle of a file write corrupts the
+  filesystem (this cost `/data` on the bench, 18 Sep 2026).
+- **It also enables a test command:** the app-channel op `bench.wifi_drop` (switches the WiFi off
+  for a few seconds, to test the rejoin). `/rpc` has no authorisation yet (DEV-35), so anyone on
+  the same network could send it while the setting is on.
+- **Recovery works:** after a watchdog restart the brain comes back on the home WiFi by itself on
+  CircuitPython 10.3.1 (3 of 3 in 29-52 s, 26 Oct 2026, `tools/bench/bench_dev93_wdt_rejoin.sh`),
+  and the restart is recorded as a `[WDT]` event in the history the app reads (`status`).
+  `time.monotonic()` alone is no proof of a restart.
+
+`NOKNOK_MDNS` is on by default since
 code.py 0.36: the one idle hang seen while advertising (17 Sep 2026) never came back in three
 full bench nights with it on ([DEV-70](https://noknokdev.atlassian.net/browse/DEV-70)). The app
 still finds a brain by scanning the subnet; `0` switches the name off.
