@@ -22,7 +22,7 @@
 #     $SOAK_SUDO_PW or ~/.soak_sudo (chmod 600, outside the repo).
 #   * Raw output is kept only for failing iterations, in failures/.
 #
-# Usage:  ./soak_run.py [--hours 12] [--gap 15] [--dir <outdir>] [--usb] [--hub 2] [--serial 5EEF5E2750C3EE0E] [--pattern cold,short]
+# Usage:  ./soak_run.py [--hours 12] [--gap 15] [--dir <outdir>] [--usb] [--hub 2] [--serial 5EEF5E2750C3EE0E] [--pattern cold,short] [--until 09:00]
 #         touch <outdir>/STOP   to end the run cleanly.
 
 import json
@@ -229,6 +229,7 @@ def main(argv):
     global PW, SERIAL
     hours, gap, outdir, do_usb, reps = 12.0, 15.0, os.path.join(HERE, "runs"), 0, 10
     hub = None
+    until = None
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -242,6 +243,8 @@ def main(argv):
             do_usb = 1; i += 1
         elif a == "--serial":
             SERIAL = argv[i + 1]; os.environ["PICO_SERIAL"] = SERIAL; i += 2
+        elif a == "--until":
+            until = argv[i + 1]; i += 2      # "09:00" = stop by itself at the next 09:00
         elif a == "--pattern":
             # e.g. cold,short,cold,short - overrides the scenario mix (keys of SCENARIOS)
             PATTERN[:] = [k for k in argv[i + 1].split(",") if k in SCENARIOS]; i += 2
@@ -286,6 +289,14 @@ def main(argv):
             log("baseline.json unreadable (%s) - will recapture" % e)
 
     deadline = time.time() + hours * 3600
+    if until:
+        hh, mm = until.split(":")
+        t = time.localtime()
+        end = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, int(hh), int(mm), 0, 0, 0, -1))
+        if end <= time.time():
+            end += 24 * 3600                 # that time has passed today: tomorrow
+        deadline = end
+        log("ends by itself at %s" % time.strftime("%Y-%m-%d %H:%M", time.localtime(end)))
     n = 0
     n_pass = n_fail = 0
 
