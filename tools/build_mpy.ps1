@@ -37,7 +37,9 @@ foreach ($lib in $libs) {
     $in  = Join-Path $src $lib
     $out = Join-Path $OutDir ([IO.Path]::ChangeExtension($lib, ".mpy"))
     # -O1 strips assert statements only; docstrings are never kept in .mpy anyway.
-    & $MpyCross -O1 -o $out $in
+    # -s <file name>: no host path inside the .mpy, so this build is byte-identical to
+    # tools/image/build_brain_uf2.py's (DEV-38) and tracebacks say "noknok.py".
+    & $MpyCross -O1 -s $lib -o $out $in
     if ($LASTEXITCODE -ne 0) { throw "mpy-cross failed on $lib" }
     $kbIn  = [math]::Round((Get-Item $in).Length / 1KB)
     $kbOut = [math]::Round((Get-Item $out).Length / 1KB)
