@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## code.py 0.37 + safemode.py (new) - 2026-10-26
+
+- DEV-154 - if CircuitPython itself crashed (seen once after a power dip), the brain came back in "safe mode": the lamp program did not run until someone replugged it. The new `safemode.py` restarts the brain by itself, at most twice in a row, then stays in safe mode so it can still be recovered over USB (no endless restarting). The count goes back to zero when the brain is replugged or after 10 minutes of normal running, and each restart shows up as a `[SAFE]` event in the app's device history. `restore_brain.sh`, `verify_brain.py` and the brain image (DEV-38) include the new file. Also: a watchdog restart is no longer logged twice. Host test `tools/test_safemode.py`, bench script `tools/bench/bench_dev154_safemode.sh`. Breaking: no.
+
 ## noknok_rpc.py 0.4 - 2026-10-26
 
 - DEV-110 - a request from the phone could arrive without its body ("short body: 0 of 39 bytes" -> "bad json"; seen twice on 10 Oct, not since). When the body was still on its way, the brain stopped waiting at the first "not there yet" from the network instead of using its full 1 s grace. It now keeps waiting for the whole second and only stops early when the connection is closed; the log line says how long it waited and why it stopped. Host test `tools/test_rpc_body.py`. Breaking: no.

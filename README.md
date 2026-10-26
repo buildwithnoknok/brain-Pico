@@ -257,6 +257,14 @@ setup-time writes into `/data`, `settings.toml` for pins and drive visibility; s
   lives in `microcontroller.nvm` and clears on a real power-on. After three, a clean boot parks
   in a safe idle that still answers the knob-hold factory reset and, if online, fetches a fresh
   `product.py` once — acting on it only if it differs. (It used to end at "Code done running".)
+- **Safe-mode restart (`safemode.py`, DEV-154).** If CircuitPython itself crashes (hard fault,
+  brownout, ...) it starts in *safe mode*, where `code.py` never runs and the lamp stays dark.
+  `safemode.py` then restarts the brain, at most **2 times in a row**; a third safe mode in a row
+  stays in safe mode on purpose (USB console + drive reachable, recover with the brain image,
+  DEV-38) - no reboot loop. The count (`nvm[6]`, reason in `nvm[7:23]`) goes back to 0 on a real
+  power-on or after 10 min of the product running; each restart is a `[SAFE]` event in the
+  history (`status`). Entering safe mode on purpose (buttons at boot) is never restarted -
+  CircuitPython does not run `safemode.py` then. Bench proof: `tools/bench/bench_dev154_safemode.sh`.
 - **No flash writes while a product runs.** `log.txt` is written only on a bench brain with the
   marker `/debug_log` present (and then also gets a "RING FLUSH" of the last ~80 lines on a
   crash); otherwise logging is serial + a RAM ring. Module state and the event history
