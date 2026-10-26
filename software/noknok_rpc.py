@@ -45,7 +45,7 @@
 import json
 import time
 
-__version__ = "0.3"
+__version__ = "0.4"
 
 SERVICE_INTERVAL = 0.05     # s between carrier polls from the implicit hook
 SOCKET_TIMEOUT   = 1.0      # s a stalled client may hold poll(). 0.2 s dropped the
@@ -198,18 +198,38 @@ class HttpCarrier:
         if conn is None:
             return body
         buf = bytearray(256)
-        end = time.monotonic() + self.BODY_GRACE
-        try:
-            conn.settimeout(self.BODY_GRACE)
-            while len(body) < need and time.monotonic() < end:
+        t0 = time.monotonic()
+        end = t0 + self.BODY_GRACE
+        why = "time up"
+        # DEV-110: "not there yet" (EAGAIN 11) and "timed out" (110/116) mean the
+        # rest is still in flight - keep waiting until BODY_GRACE is used up. The
+        # old loop gave up at the first such error, so a body a few ms late could
+        # come out as "0 of 39 bytes". Only a closed connection or another error
+        # ends it early.
+        while len(body) < need:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            try:
+                conn.settimeout(max(0.05, left))
                 n = conn.recv_into(buf)
-                if not n:
-                    break
-                body += bytes(buf[:n])
-        except Exception:
-            pass
+            except OSError as e:
+                code = e.args[0] if e.args else None
+                if code in (11, 110, 116):
+                    time.sleep(0.01)
+                    continue
+                why = "error %r" % (e,)
+                break
+            except Exception as e:
+                why = "error %r" % (e,)
+                break
+            if not n:
+                why = "connection closed"
+                break
+            body += bytes(buf[:n])
         if len(body) < need:
-            self.log("[rpc] short body: %d of %d bytes" % (len(body), need))
+            self.log("[rpc] short body: %d of %d bytes after %.2f s (%s)"
+                     % (len(body), need, time.monotonic() - t0, why))
         return body
 
     def poll(self):

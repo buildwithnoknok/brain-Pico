@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## noknok_rpc.py 0.4 - 2026-10-26
+
+- DEV-110 - a request from the phone could arrive without its body ("short body: 0 of 39 bytes" -> "bad json"; seen twice on 10 Oct, not since). When the body was still on its way, the brain stopped waiting at the first "not there yet" from the network instead of using its full 1 s grace. It now keeps waiting for the whole second and only stops early when the connection is closed; the log line says how long it waited and why it stopped. Host test `tools/test_rpc_body.py`. Breaking: no.
+
 ## noknok.py 1.23 - 2026-10-26
 
 - DEV-109 - the app (or anything else on the home network) could store settings the product never declared, e.g. `"turbo": true`: they were saved and passed to the product. `settings.set` now only accepts the settings the product declares; anything else comes back as `rejected: {"turbo": "unknown setting"}` and is not stored. Host test `tools/test_settings_unknown.py`. Breaking: no (the app only sends declared settings).
