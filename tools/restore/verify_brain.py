@@ -48,7 +48,7 @@ for name in ("noknok", "noknok_rpc", "noknok_usb", "module_flasher"):
     except Exception as e:
         bad += 1
         print("  import %-15s FAILED %r" % (name, e))
-for name in ("code.py", "boot.py", "settings.toml"):
+for name in ("code.py", "safemode.py", "boot.py", "settings.toml"):
     if not exists("/" + name):
         bad += 1
         print("  missing /" + name)

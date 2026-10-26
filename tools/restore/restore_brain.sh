@@ -75,7 +75,7 @@ while [ $# -gt 0 ]; do
 done
 
 # ── Resolve the plan (nothing is touched yet) ───────────────────────────────────
-for f in code.py settings.toml boot.py $(for l in $LIBS; do echo $l.py; done); do
+for f in code.py safemode.py settings.toml boot.py $(for l in $LIBS; do echo $l.py; done); do
   [ -f "$SW/$f" ] || { echo "missing $SW/$f - nothing erased"; exit 1; }
 done
 [ -d "$SW/lib" ] || { echo "missing $SW/lib - nothing erased"; exit 1; }
@@ -167,6 +167,7 @@ echo "  drive $DEV mounted at $MP"
 
 rm -f "$MP/code.py" "$MP/settings.toml"                       # CircuitPython's samples
 cp "$SW/code.py" "$MP/code.py" || exit 1
+cp "$SW/safemode.py" "$MP/safemode.py" || exit 1   # DEV-154: restart out of safe mode
 cp "$SETTINGS_SRC" "$MP/settings.toml" || exit 1
 for l in $LIBS; do                                            # .mpy OR .py, never both
   if [ "$LIBMODE" = mpy ]; then cp "$LIBDIR/$l.mpy" "$MP/$l.mpy" || exit 1

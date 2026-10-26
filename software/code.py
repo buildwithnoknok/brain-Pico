@@ -1,5 +1,14 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.36 (mDNS on by default — DEV-70)
+# Version: 0.37 (safe mode no longer leaves the lamp dark — DEV-154)
+#
+# v0.37 changes (Sue): DEV-154 — new safemode.py: when CircuitPython starts in
+#   safe mode after a core crash (hard fault, brownout, ...), code.py never runs
+#   and the lamp stayed dark until a replug. safemode.py now restarts the brain,
+#   at most 2 times in a row (count in nvm[6], reason in nvm[7:23]); then it stays
+#   in safe mode (USB recovery possible, no reboot loop). code.py records each such
+#   restart as a [SAFE] event and resets the count after a real power-on or 10 min
+#   of the product running. Also: the [WDT] event is no longer logged a second time
+#   on the reload after an update pass (ADR-006 note).
 #
 # v0.36 changes (Sue): DEV-70 — mDNS (noknok-XXXX.local) is ON by default: a
 #   missing NOKNOK_MDNS key now means on, NOKNOK_MDNS = 0 switches it off. The
@@ -439,7 +448,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.36"
+CODE_VERSION = "0.37"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -2397,6 +2406,58 @@ def _set_crash_count(n):
     except Exception:
         pass
 
+# ── Safe-mode restarts (DEV-154) ───────────────────────────────────────────────
+# safemode.py (see that file) restarts a brain that CircuitPython put into safe
+# mode, at most SM_MAX times in a row, counting in nvm[6] and leaving the reason in
+# nvm[7:23]. code.py turns the reason into a [SAFE] event (once) and sets the count
+# back to 0 after a real power-on (someone replugged it) or after SM_STABLE_S of the
+# product running - so rare faults months apart never add up to a dark lamp.
+SM_NVM_INDEX  = 6
+SM_MAGIC      = 0xA0
+SM_MAX        = 2
+SM_REASON_LEN = 16
+SM_STABLE_S   = 600
+_sm_clear_at  = None            # monotonic time to clear the count while the product runs
+
+def _sm_count():
+    try:
+        b = microcontroller.nvm[SM_NVM_INDEX]
+        return (b & 0x0F) if (b & 0xF0) == SM_MAGIC else 0
+    except Exception:
+        return 0
+
+def _sm_clear():
+    """Count back to 0 (one nvm write, only when it is not 0 already)."""
+    try:
+        if microcontroller.nvm[SM_NVM_INDEX] != SM_MAGIC:
+            microcontroller.nvm[SM_NVM_INDEX] = SM_MAGIC
+    except Exception:
+        pass
+
+def _sm_report():
+    """[SAFE] event for a restart safemode.py made, then forget the reason."""
+    try:
+        lo = SM_NVM_INDEX + 1
+        raw = bytes(microcontroller.nvm[lo:lo + SM_REASON_LEN])
+        if raw == bytes(SM_REASON_LEN) or raw == b"\xff" * SM_REASON_LEN:
+            return
+        reason = raw.rstrip(b"\x00").decode("ascii", "replace")
+        microcontroller.nvm[lo:lo + SM_REASON_LEN] = bytes(SM_REASON_LEN)
+        event("[SAFE] CircuitPython safe mode (%s) - restarted by safemode.py, %d of %d in a row"
+              % (reason, _sm_count(), SM_MAX))
+    except Exception as e:
+        log(f"[safe] report skipped ({e!r})")
+
+def _service():
+    """The drivers' servicing slot (noknok.set_service_hook): the app channel, and
+    once SM_STABLE_S after the product started, the safe-mode count back to 0."""
+    global _sm_clear_at
+    rpc.service()
+    if _sm_clear_at is not None and time.monotonic() >= _sm_clear_at:
+        _sm_clear_at = None
+        _sm_clear()
+        log("[safe] product ran %d s - safe-mode restart count back to 0" % SM_STABLE_S)
+
 def _is_fresh_start():
     """True on a power-on / hard reset, False after supervisor.reload().
     supervisor.runtime.run_reason is the right signal: microcontroller.cpu.
@@ -2735,7 +2796,10 @@ def _boot_hold_reset_check():
 def run_product(connected):
     """Run product.py with three-strikes crash recovery (see the crash-recovery
     block above). Never returns on the happy path — a product loops forever."""
+    global _sm_clear_at
     strikes = _crash_count()
+    if _sm_count():
+        _sm_clear_at = time.monotonic() + SM_STABLE_S    # DEV-154: stable run clears it
     log(f"[boot] product.py present — running {product_script_path()}"
         + (f" (strike {strikes}/{CRASH_MAX})" if strikes else ""))
     try:
@@ -2816,7 +2880,7 @@ def start_app_channel():
         if str(nk.env("NOKNOK_WATCHDOG", "0")) == "1":
             rpc.arm_watchdog(8, log)
             rpc.dispatcher().register("bench.wifi_drop", _h_bench_wifi_drop)
-        nk.set_service_hook(rpc.service)
+        nk.set_service_hook(_service)    # rpc.service + the DEV-154 stable-run check
         if not wifi.radio.connected:
             log("[rpc] offline — app channel will come up if the network appears")
             return
@@ -2893,6 +2957,11 @@ def main():
     # compile (precompiled .mpy / frozen modules, DEV-38) — then drop this.
     if _is_fresh_start():
         _set_crash_count(0)              # a power cycle always grants three fresh tries
+        try:                             # DEV-154: a real replug grants fresh safe-mode restarts
+            if microcontroller.cpu.reset_reason == microcontroller.ResetReason.POWER_ON:
+                _sm_clear()
+        except Exception:
+            pass
         _boot_hold_reset_check()         # v0.18: button held from power-on? wipe + AP
         print("[boot] power-on — reloading once (cold-boot WiFi workaround, see main())")
         supervisor.reload()
@@ -2901,10 +2970,13 @@ def main():
     global _skip_ota_once
     _skip_ota_once = _take_post_ota_marker()     # DEV-132: read + clear every run
     try:
-        if microcontroller.cpu.reset_reason == microcontroller.ResetReason.WATCHDOG:
+        # reset_reason survives a reload: not again on the reload after an update pass
+        if (microcontroller.cpu.reset_reason == microcontroller.ResetReason.WATCHDOG
+                and not _skip_ota_once):
             event("[WDT] watchdog reset — the previous run hung (bench watchdog)")
     except Exception:
         pass
+    _sm_report()                         # DEV-154: a restart made by safemode.py
     # DEV-18: say which filesystem mode boot.py chose, and sweep any .tmp left
     # by a write that a power cut interrupted (the real file is untouched).
     log("[fs] CIRCUITPY drive %s — filesystem %s — runtime store: %s" % (

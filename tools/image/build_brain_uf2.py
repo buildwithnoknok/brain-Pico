@@ -66,7 +66,7 @@ FS_SIZE = FLASH_SIZE - FS_OFFSET                      # 2 617 344 bytes
 SECTOR = 512                                          # CircuitPython FILESYSTEM_BLOCK_SIZE
 
 # What a brain consists of: tools/restore/restore_brain.sh (DEV-84), the reference.
-CODE_FILES = ("code.py", "boot.py")
+CODE_FILES = ("code.py", "boot.py", "safemode.py")   # safemode.py: DEV-154
 LIBS = ("noknok", "noknok_rpc", "noknok_usb", "module_flasher")   # imported by code.py -> .mpy
 
 UF2_MAGIC0, UF2_MAGIC1, UF2_MAGIC_END = 0x0A324655, 0x9E5D5157, 0x0AB16F30
