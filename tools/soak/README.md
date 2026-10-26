@@ -30,6 +30,13 @@ on USB, records the Pico's uptime at every probe and FAILS an iteration whose cu
 not restart the Pico's clock (uptime > 120 s). Bus names in the log are `A`/`B`
 (settings.toml), not `i2c0`/`i2c1`.
 
+**Captures (DEV-165/166).** When a module from the baseline is missing, or answers with a
+version other than its baseline one, the probe records what the bus looks like: raw scan,
+what waits at 0x7F (hand-out) and 0x7E (bootloader), the raw bytes at the module's address,
+then enumerates again after 20 s (slow boot = it comes back, stuck = it does not).
+`soak_report.py` prints them under "captures". Dry run without hardware:
+`python -I tools/test_soak_probe.py`.
+
 **Not covered yet:** OTA flashing and interrupted-flash (brick) tests. Those
 need a sacrificial module — CH32V003 flash is rated ~10 k erase cycles and a
 soak would burn through that. Do not point these at production modules.

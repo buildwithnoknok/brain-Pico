@@ -142,19 +142,36 @@ def power_cycle(loc, port, off_s, extra_cycles=0):
     power(loc, port, "on")
 
 
-def build_probe(hold_sec, do_usb, reps, tmp_path):
+def expect_from(baseline):
+    """The baseline fingerprint as the probe wants it: {bus: {uid: [type, addr, fw]}}.
+    With it the probe knows what is MISSING / has an odd version and captures the bus."""
+    out = {}
+    for bus, items in (baseline or {}).items():
+        if bus == "usb":
+            continue
+        for s in items:
+            try:
+                typ, uid, addr, fw = s.split("/")
+                out.setdefault(bus, {})[uid] = [typ, int(addr, 16), fw]
+            except ValueError:
+                pass
+    return out
+
+
+def build_probe(hold_sec, do_usb, reps, tmp_path, expect=None):
     """Prepend the knobs to soak_probe.py and write the file we actually run."""
     with open(PROBE) as f:
         src = f.read()
-    prelude = "HOLD_SEC = %d\nDO_USB = %d\nREPS = %d\n" % (hold_sec, do_usb, reps)
+    prelude = "HOLD_SEC = %d\nDO_USB = %d\nREPS = %d\nEXPECT = %r\n" % (
+        hold_sec, do_usb, reps, expect or {})
     with open(tmp_path, "w") as f:
         f.write(prelude + src)
 
 
-def run_probe(hold_sec, do_usb, reps, outdir):
+def run_probe(hold_sec, do_usb, reps, outdir, expect=None):
     tmp = os.path.join(outdir, "_probe_gen.py")
-    build_probe(hold_sec, do_usb, reps, tmp)
-    budget = 90 + hold_sec
+    build_probe(hold_sec, do_usb, reps, tmp, expect)
+    budget = 90 + hold_sec + (2 * 30 if expect else 0)    # a capture waits 20 s per bus
     try:
         p = subprocess.run([sys.executable, PICO_PY, "run", tmp, str(budget)],
                            capture_output=True, timeout=budget + 60)
@@ -289,7 +306,7 @@ def main(argv):
                     rec["reason"] = "Pico never re-enumerated after power-on"
                     raise RuntimeError(rec["reason"])
 
-            report, raw = run_probe(hold_sec, do_usb, reps, outdir)
+            report, raw = run_probe(hold_sec, do_usb, reps, outdir, expect_from(baseline))
             if report is None:
                 rec["reason"] = "no probe result"
                 rec["raw"] = str(raw)[-2000:]
@@ -311,6 +328,9 @@ def main(argv):
                 problems.append("%d I2C op error(s)" % errs)
             if hold_err:
                 problems.append("%d hold error(s)" % hold_err)
+            hold_missing = (report.get("hold") or {}).get("missing_loops", 0)
+            if hold_missing:
+                problems.append("module vanished in %d hold loop(s)" % hold_missing)
             for b in report.get("buses", {}).values():
                 if b.get("fatal"):
                     problems.append("bus fatal: %s" % b["fatal"])

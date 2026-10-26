@@ -16,6 +16,10 @@ Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
 - DEV-109 - the app (or anything else on the home network) could store settings the product never declared, e.g. `"turbo": true`: they were saved and passed to the product. `settings.set` now only accepts the settings the product declares; anything else comes back as `rejected: {"turbo": "unknown setting"}` and is not stored. Host test `tools/test_settings_unknown.py`. Breaking: no (the app only sends declared settings).
 
+## tools/soak - 2026-10-26
+
+- DEV-165 / DEV-166 - the soak probe now captures what the bus looks like when a baselined module is missing or reports a version other than its baseline: raw scan, the 0x7F hand-out and 0x7E bootloader addresses, the raw bytes at the module's own address, then a second enumeration 20 s later (and the PicoHub reset cause once it answers); a module vanishing during an idle_hold is counted. The orchestrator passes the baseline to the probe, the report prints the captures. Host dry run: `tools/test_soak_probe.py`. Bench tooling only. Breaking: no.
+
 ## tools/soak - 2026-10-25
 
 - DEV-67 - soak rig brought up to date with the current brain (bench tooling only, no brain or module firmware change): the probe also reads the MOD-0011 PicoHub (GET_STATUS, read-only) and enumerates LEDs 16x, records the Pico's uptime, and the run fails an iteration whose power cut did not restart the Pico's clock; `--hub` picks the hub to switch (2 = Pi 4B USB 3 hub); the report follows the real bus names A/B. Breaking: no.

@@ -112,6 +112,32 @@ def main(argv):
               % (first.get("n"), first.get("ts")))
         print(json.dumps(first, indent=2)[:3000])
 
+    # ── captures (what the bus looked like when a module was missing) ────────
+    caps = [(r, b, b["capture"]) for r in recs
+            for b in ((r.get("report") or {}).get("buses") or {}).values() if b.get("capture")]
+    if caps:
+        print("--- captures: the bus when a module was missing / odd (%d) ---" % len(caps))
+        for r, b, c in caps:
+            print("iter %s %s %s  (probe uptime %s s)" % (r["n"], r["ts"][11:], r.get("scenario"),
+                                                        c.get("uptime")))
+            print("   missing : %s" % (", ".join(c.get("missing")) or "-"))
+            print("   odd fw  : %s" % (", ".join(c.get("wrong")) or "-"))
+            print("   scan    : %s   staging 0x7F: %s" % (c.get("scan"), c.get("staging")))
+            print("   boot 0x7E: status=%s version=%s" % (c.get("boot_status"), c.get("boot_ver")))
+            for k, v in sorted((c.get("raw") or {}).items()):
+                print("   raw %-18s %s" % (k, v))
+            sec = c.get("second")
+            if isinstance(sec, dict):
+                mods = ", ".join("%s/%s" % (m["type"], m["fw"]) for m in sec.get("modules", []))
+                print("   +%ss    : n=%s  %s  staging=%s" % (sec.get("after_s"), sec.get("n"), mods,
+                                                          sec.get("staging")))
+                if sec.get("hub"):
+                    print("             hub: %s" % (sec["hub"],))
+            else:
+                print("   second  : %s" % (sec,))
+            if c.get("error"):
+                print("   ERROR   : %s" % c["error"])
+
     # ── health trends ────────────────────────────────────────────────────────
     print("\n--- trends ---")
     print("boot time (s)      : %s" % trend([r.get("boot_sec") for r in recs]))
