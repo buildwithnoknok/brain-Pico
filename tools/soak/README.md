@@ -50,6 +50,7 @@ printf 'yourpassword' > ~/.soak_sudo && chmod 600 ~/.soak_sudo
 cd ~/dev/pico/soak
 ./start_soak.sh 12 --usb --hub 2   # 12 hours, detached; extra args go to soak_run.py
                               # --hub 2 = the Pi 4B's USB 3 hub, the one that cuts VBUS
+                              # --pattern cold,short,cold,long = your own scenario mix (keys: cold short long storm hold)
                               # --serial <id> when more than one Pico is plugged in (also PICO_SERIAL=<id> for pico.py/powertest.sh)
 ```
 
@@ -118,3 +119,12 @@ The 7 failures were all "a module not answering as its app right after a power-o
 the PicoHub power manager absent (4x, DEV-165) and Knob absent + LED Button reading
 2.0.0 (3x, DEV-166). Both are open bugs; the probe does not yet capture what the bus
 looks like when a module is missing.
+
+## Capture rerun, 26 Oct 2026 (DEV-165 / DEV-166)
+
+Same rig and wiring as the first night, in daytime, probe with the capture on, mix
+`cold,short,cold,short,cold,short,cold,long`, gap 3 s: 10:41-14:42, 384 iterations
+(184 cold_boot, 138 short_off, 47 long_off, 15 idle_hold), 384 PASS, 0 captures,
+105924 I2C operations with 0 errors. A clean run does not prove the two bugs fixed:
+at the first night's rate (7 in 952) 0 failures in 384 iterations has a chance of
+about 6 %. The probe stays armed: the next failure on any rig records its capture.
