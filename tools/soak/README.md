@@ -99,3 +99,15 @@ LED Button + buzzer + knob on I²C1 (GP18/19), USB LEDs on DUSB5.
 - Idle-hold: 8 loops, 728 ops, 0 errors in 45 s
 - Orchestrator: 9/9 then 5/5 iterations pass across all power scenarios
 - Fault detection proven with a seeded phantom module → `i2c1 MISSING …`
+
+## First full night, 25-26 Oct 2026 (DEV-67)
+
+Pi4RFID, Pico on a MOD-0011 fed from a Pi USB-A port (so the ganged cut removes the
+modules' power too), bus A: Display, Knob (legacy bootloader), LED Button, PicoHub
+power manager; bus B and USB empty. 14 h, 952 iterations, `uhubctl -l 2` (cut proven:
+Pico uptime 9.6 s at every probe), 945 PASS / 7 FAIL, 265909 I2C operations with 0
+errors, free memory flat (253632 B), crash counter 0xC0 throughout.
+The 7 failures were all "a module not answering as its app right after a power-on":
+the PicoHub power manager absent (4x, DEV-165) and Knob absent + LED Button reading
+2.0.0 (3x, DEV-166). Both are open bugs; the probe does not yet capture what the bus
+looks like when a module is missing.
