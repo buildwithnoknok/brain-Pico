@@ -180,7 +180,7 @@ Test: `tools/test_two_bus.py` (host, tier S).
 | `NOKNOK_I2C_FREQ` | `100000` (both buses) | `noknok.Conductor()` |
 | `NOKNOK_USB_DP` / `NOKNOK_USB_DM` | none — optional USB host port (PicoHub: `"GP0"` / `"GP1"`; D+ = lower GPIO of a consecutive pair) | `noknok_usb` host port |
 | `NOKNOK_USB_DRIVE` | `0` = hidden (shipped) · `1` = visible (maker/bench) | `boot.py` |
-| `NOKNOK_MDNS` | `0` = off (default) · `1` = advertise `noknok-XXXX.local` | `code.py` app channel |
+| `NOKNOK_MDNS` | `1` = advertise `noknok-XXXX.local` (default) · `0` = off | `code.py` app channel |
 | `NOKNOK_FRAM` | `1` = probe the I2C FRAM at 0x50 and use it as the Store if a chip answers. Unset or anything else = nvm only, the bus is not touched (default since 1.14) | `noknok.store()` |
 | `NOKNOK_WATCHDOG` | `0` = off (default) · `1` = **bench only**, 8 s hardware watchdog fed by the app-channel pump, plus the `bench.wifi_drop` op | `code.py` |
 
@@ -188,10 +188,10 @@ Test: `tools/test_two_bus.py` (host, tier S).
 for a brain you also drive with `tools/pico.py`: Ctrl-C into the REPL stops the pump, the
 watchdog resets the board ~8 s later, and a reset landing mid-write corrupts the filesystem
 (it cost `/data` on the bench, 18 Sep 2026). After a watchdog reset the radio does not
-re-join either — that board needs a real power cycle. `NOKNOK_MDNS` is off by default
-because the app finds a brain by scanning the subnet; one unexplained idle hang while
-advertising has not been re-tested (see
-[DEV-70](https://noknokdev.atlassian.net/browse/DEV-70)).
+re-join either — that board needs a real power cycle. `NOKNOK_MDNS` is on by default since
+code.py 0.36: the one idle hang seen while advertising (17 Sep 2026) never came back in three
+full bench nights with it on ([DEV-70](https://noknokdev.atlassian.net/browse/DEV-70)). The app
+still finds a brain by scanning the subnet; `0` switches the name off.
 
 A missing key falls back to the default in code, so a brain without the file behaves like a
 factory unit — except drive visibility, which fails open to *visible*. More knobs (debug log,

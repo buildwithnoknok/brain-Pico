@@ -19,9 +19,9 @@
 #
 # The Dispatcher knows ops, not transports. A carrier turns bytes on some
 # medium into dispatch() calls: the HttpCarrier (POST /rpc over the setup AP
-# and over home WiFi). mDNS (noknok-XXXX.local) is opt-in only
-# (settings.toml NOKNOK_MDNS = 1, code.py start_app_channel()); the app finds
-# brains by scanning its /24 with `hello`. BLE is not planned (skipped by
+# and over home WiFi). mDNS (noknok-XXXX.local) is on by default since code.py
+# 0.36 (DEV-70; settings.toml NOKNOK_MDNS = 0 switches it off); the app still
+# finds brains by scanning its /24 with `hello`. BLE is not planned (skipped by
 # ADR-001); another carrier would feed the same dispatcher unchanged.
 #
 # Staying reachable while a product runs (spec §5): CircuitPython runs one

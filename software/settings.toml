@@ -30,6 +30,11 @@ NOKNOK_I2C_FREQ = 100000
 NOKNOK_USB_DP = "GP0"
 NOKNOK_USB_DM = "GP1"
 
+# ── Network name (DEV-70) ────────────────────────────────────────────────────
+# 1 = the brain announces itself as noknok-XXXX.local on the home WiFi (default).
+# 0 = off: the app finds the brain by scanning the network instead.
+NOKNOK_MDNS = 1
+
 # ── CIRCUITPY drive visibility (DEV-18) ──────────────────────────────────────
 # 0 = hidden from PCs; the program may save settings (shipped default).
 # 1 = visible; a PC may edit files, the program cannot write (maker/bench).

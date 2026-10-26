@@ -1,5 +1,10 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.35 (a missed WiFi scan no longer blocks setup — DEV-150)
+# Version: 0.36 (mDNS on by default — DEV-70)
+#
+# v0.36 changes (Sue): DEV-70 — mDNS (noknok-XXXX.local) is ON by default: a
+#   missing NOKNOK_MDNS key now means on, NOKNOK_MDNS = 0 switches it off. The
+#   one idle hang seen with mDNS on (17 Sep 2026) never came back in three full
+#   bench nights with it on (12 h + 8 h + 12 h, 22-26 Oct, no hang, no reset).
 #
 # v0.35 changes (Sue): DEV-150 — setup refused the home WiFi ("not visible")
 #   on every try when the one scan before the hotspot had missed it, until a
@@ -434,7 +439,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.35"
+CODE_VERSION = "0.36"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -2786,8 +2791,12 @@ def _after_join():
         sync_time_ntp(socketpool.SocketPool(wifi.radio), timeout=2)
     except Exception as e:
         log(f"[ntp] after join skipped ({e!r})")
-    if str(nk.env("NOKNOK_MDNS", "0")) == "1" and getattr(rpc, "_mdns", None) is None:
+    if _mdns_wanted() and getattr(rpc, "_mdns", None) is None:
         rpc.start_mdns(80, log)
+
+def _mdns_wanted():
+    """DEV-70: mDNS is on unless settings.toml says NOKNOK_MDNS = 0."""
+    return str(nk.env("NOKNOK_MDNS", "1")).strip() != "0"
 
 def start_app_channel():
     """Home-WiFi /rpc + mDNS for the product's lifetime (DEV-34). After this,
@@ -2812,14 +2821,13 @@ def start_app_channel():
             log("[rpc] offline — app channel will come up if the network appears")
             return
         rpc.start_http(socketpool.SocketPool(wifi.radio), port=80, logfn=log)
-        # mDNS is opt-in until proven over hours: the first long run with it on
-        # (17 Sep 2026) ended in a hard hang after ~30 min idle — no serial, no
-        # network, unrecoverable without a power cycle. settings.toml:
-        # NOKNOK_MDNS = 1 to advertise noknok-XXXX.local.
-        if str(nk.env("NOKNOK_MDNS", "0")) == "1":
+        # mDNS advertises noknok-XXXX.local, on by default since DEV-70 (three
+        # clean bench nights; the 17 Sep idle hang never came back).
+        # settings.toml NOKNOK_MDNS = 0 switches it off.
+        if _mdns_wanted():
             rpc.start_mdns(80, log)
         else:
-            log("[mdns] off (NOKNOK_MDNS != 1) — reach the brain by IP")
+            log("[mdns] off (NOKNOK_MDNS = 0) — reach the brain by IP")
         log("[rpc] app channel up — http://%s/rpc  (%s)"
             % (wifi.radio.ipv4_address, rpc.device_name()))
     except Exception as e:
