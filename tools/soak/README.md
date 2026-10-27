@@ -128,3 +128,10 @@ Same rig and wiring as the first night, in daytime, probe with the capture on, m
 105924 I2C operations with 0 errors. A clean run does not prove the two bugs fixed:
 at the first night's rate (7 in 952) 0 failures in 384 iterations has a chance of
 about 6 %. The probe stays armed: the next failure on any rig records its capture.
+
+Full capture run, 26-27 Oct 2026 (15:35-09:00, ends by itself with `--until 09:00`):
+1613 iterations (645 cold_boot, 646 short_off, 129 long_off, 129 storm, 64 idle_hold),
+1613 PASS, 0 captures, 449631 I2C operations with 0 errors, PicoHub reset cause
+power_on every time. With the daytime run that is about 2000 clean iterations after
+the 7 failures of the first night, so the first night's failures are NOT reproducible
+on this rig. The capture stays armed.
