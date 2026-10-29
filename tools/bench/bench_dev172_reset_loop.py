@@ -160,6 +160,7 @@ def dmesg_tail(n=30):
 
 
 def after_boot(rec):
+    time.sleep(15)          # /rpc is up before the product's own USB enumeration is done
     st = try_rpc("status", 6) or {}
     p = st.get("power") or {}
     rec["picohub"] = {k: p.get(k) for k in ("reset_cause", "pd_state", "contract_v", "vin",
