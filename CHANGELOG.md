@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## noknok_rpc.py 0.5.1 - 2026-10-29
+
+- DEV-168 - after a long WiFi outage the brain waited up to 5 minutes between reconnect attempts, so it could stay offline up to 5 minutes after the WiFi was back. Now it tries every 30 s, then every 60 s at most. Each attempt pauses the product for half a second (once a minute while the WiFi is away). Bench 29 Oct (network renamed for 3.5 min on a weak link): reconnected 23 s after the bench Pi. Breaking: no.
+
 ## noknok_rpc.py 0.5 - 2026-10-29
 
 - DEV-170 - one network connection to the brain that sent only part of a request and then closed (or sent nothing at all) froze the whole product for good: buttons, LEDs and the WiFi reconnect stopped, only a replug helped. The web server library the brain uses waited for the rest of the request forever. The brain now uses its own version of the two waiting steps: it stops as soon as the other side has closed, and gives one request at most 1 second for its headers and body, then drops it. Covers the home network and the setup hotspot (same server). Host test `tools/test_http_freeze.py`. Breaking: no.
