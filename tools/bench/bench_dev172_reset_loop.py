@@ -19,7 +19,10 @@
 # human replug and carries on - so one hang does not end the run.
 #
 # Only this program may read the console while it runs (no pico.py, no other listener):
-# reserve the rig first (~/BENCH_IN_USE). Output in OUTDIR (default ~/dev172):
+# reserve the rig first (~/BENCH_IN_USE).
+# Environment: DEV172_HOW=rpc|repl|both (default both); DEV172_CUT=1 recovers a hang by itself
+# with a real power cut (sudo uhubctl -l 2 off/on - only on a rig where the Pi powers the
+# brain, not with a PD charger on the PicoHub) instead of waiting for a human replug. Output in OUTDIR (default ~/dev172):
 #   console.log  every console byte, each line stamped with the Pi's clock
 #   cycles.jsonl one JSON line per cycle (the result)
 #   run.log      human-readable progress
@@ -31,6 +34,16 @@ N = int(sys.argv[2]) if len(sys.argv) > 2 else 50
 OUT = os.path.expanduser(sys.argv[3] if len(sys.argv) > 3 else "~/dev172")
 PORT = "/dev/serial/by-id/usb-Raspberry_Pi_Pico*-if00"
 RECOVER_S = 180
+HOW = os.environ.get("DEV172_HOW", "both")
+CUT = os.environ.get("DEV172_CUT") == "1"
+
+
+def power_cut():
+    for a in ("off", "on"):
+        subprocess.run("echo raspberry | sudo -S -p '' /usr/sbin/uhubctl -l 2 -a " + a,
+                       shell=True, capture_output=True, timeout=30)
+        if a == "off":
+            time.sleep(4)
 os.makedirs(OUT, exist_ok=True)
 
 
@@ -185,7 +198,7 @@ def main():
     for i in range(1, N + 1):
         settle = random.randint(20, 40)
         time.sleep(settle)
-        how = "repl" if i % 2 else "rpc"
+        how = HOW if HOW in ("rpc", "repl") else ("repl" if i % 2 else "rpc")
         h = try_rpc("hello", 3) or {}
         rec = {"cycle": i, "how": how, "at": now(), "settled_s": settle,
                "uptime_before": h.get("uptime")}
@@ -222,9 +235,13 @@ def main():
             time.sleep(3)
             rec["ctrl_c_answer_bytes"] = con.bytes - n0
             rec["ctrl_c_tail"] = con.tail[-300:] if con.bytes > n0 else ""
-            say("cycle %d: HANG (port %s, Ctrl-C answer %d bytes) - waiting for a replug"
-                % (i, "present" if rec["port_present"] else "absent", rec["ctrl_c_answer_bytes"]))
-            con.mark("HANG - waiting for a replug")
+            say("cycle %d: HANG (port %s, Ctrl-C answer %d bytes) - %s"
+                % (i, "present" if rec["port_present"] else "absent", rec["ctrl_c_answer_bytes"],
+                   "power cut" if CUT else "waiting for a replug"))
+            con.mark("HANG - " + ("power cut" if CUT else "waiting for a replug"))
+            if CUT:
+                power_cut()
+                rec["power_cut"] = True
             t_back, h = wait_hello(8 * 3600)
             rec["recovered_after_s"] = rel(t_back)
             if t_back:
