@@ -37,7 +37,8 @@
 # spun on 0-byte reads forever and froze the product. DEV-169 (v0.6): a slow
 # client still held the loop for its slowness. _SafeServer below now never waits
 # for a client at all: one non-blocking read per open connection and pass, a
-# request answered when its last byte is in. service() keeps poll_max_ms /
+# request answered when its last byte is in, the reply sent a piece per pass
+# (a 3 KB status draining over weak WiFi held the loop 20 s). service() keeps poll_max_ms /
 # slow_polls (status.link) as the on-device proof. Re-entrancy: a handler that talks to a
 # module re-enters service() → it returns at once (_busy). Work that must run
 # OUTSIDE a module transaction (on_change callbacks, reboot) is queued with
@@ -62,8 +63,10 @@ REQUEST_DEADLINE = 2.0      # s for the headers + the body of ONE request (DEV-1
                             # client that is slower, or closes half-way, is dropped.
                             # Since DEV-169 the wait costs the loop nothing (non-
                             # blocking), so it can be generous for a trailing body
-MAX_PENDING      = 3        # connections collected at once; more wait in the backlog
-SEND_TIMEOUT     = 0.5      # s a reply may block (a reply is < 2 KB: normally 0)
+MAX_PENDING      = 4        # connections open at once (reading or replying); more
+                            # wait in the listener's backlog
+SEND_DEADLINE    = 5.0      # s a client may take to receive its reply (non-blocking:
+                            # costs the loop nothing), then it is dropped
 SLOW_POLL_MS     = 50       # a poll longer than this counts in slow_polls
 LINK_CHECK_S     = 30       # how often service() looks at the WiFi link
 LINK_JOIN_S      = 5        # blocking budget for a FULL rejoin attempt
@@ -93,14 +96,20 @@ def _safe_server_class():
                 headers) held the loop for exactly its slowness: the LED Button
                 lagged and queued presses while the app was open.
 
+      DEV-169 bench (29 Oct, weak WiFi) - the reply too: the library sends it in
+                one blocking go and retries on EAGAIN, so a reply that drained
+                slowly (a status with its event list) held the loop for 20 s.
+
     This poll() keeps up to MAX_PENDING open connections and, per call, does ONE
-    non-blocking read on each: it collects what has arrived and moves on. A
-    request is answered in the pass in which its last byte arrives; a connection
-    that closes, or is not complete after REQUEST_DEADLINE, is closed and dropped.
-    So one pass costs an accept + a few reads (~1 ms) plus, when a request is
-    complete, its handler and the reply - never the client's slowness. At most one
-    request is answered per pass. Built lazily: adafruit_httpserver is only
-    imported when a server starts."""
+    non-blocking read on each: it collects what has arrived and moves on. When a
+    request is complete its handler runs and the reply is written into memory
+    (_Collect); the reply then goes out the same way, one non-blocking send per
+    connection and pass, and the connection is closed when it is all out. A
+    connection that closes, is not complete after REQUEST_DEADLINE, or has not
+    taken its reply after SEND_DEADLINE, is closed and dropped. So one pass costs
+    an accept + a few reads and sends (~1 ms) plus, when a request is complete,
+    its handler - never the client's slowness. At most one request is handled per
+    pass. Built lazily: adafruit_httpserver is only imported when a server starts."""
     global _SafeServer
     if _SafeServer is not None:
         return _SafeServer
@@ -127,24 +136,60 @@ def _safe_server_class():
             return end + 4                   # answer now: the route says "body too large"
         return end + 4 + max(cl, 0)
 
-    class SafeServer(Server):
-        _noknok_pending = None           # [[conn, addr, bytes, deadline], ...]
+    class _Collect:
+        """Stands in for the client socket while the library writes the reply."""
+        def __init__(self):
+            self.data = bytearray()
 
-        def _drop(self, p):
-            self._noknok_pending.remove(p)
+        def send(self, b):
+            self.data += b
+            return len(b)
+
+        def recv_into(self, buf, n=0):
+            return 0                         # the request is complete already
+
+        def settimeout(self, t):
+            pass
+
+        def close(self):
+            pass
+
+    class SafeServer(Server):
+        _noknok_pending = None           # [[conn, addr, bytes, deadline], ...] reading
+        _noknok_out = None               # [[conn, memoryview, offset, deadline], ...]
+
+        @staticmethod
+        def _drop(lst, p):
+            lst.remove(p)
             try:
                 p[0].close()
             except Exception:
                 pass
 
+        def _push(self, now):
+            """One non-blocking send per reply still going out."""
+            for o in list(self._noknok_out):
+                try:
+                    n = o[0].send(o[1][o[2]:])
+                except OSError as e:
+                    if (e.args[0] if e.args else None) not in (11, 110, 116):
+                        self._drop(self._noknok_out, o)    # reset, broken pipe
+                        continue
+                    n = 0                                   # send buffer full
+                o[2] += n or 0
+                if o[2] >= len(o[1]) or now > o[3]:
+                    self._drop(self._noknok_out, o)        # all out (or too slow)
+
         def poll(self):
             if self.stopped:
                 raise ServerStoppedError
             if self._noknok_pending is None:
-                self._noknok_pending = []
+                self._noknok_pending, self._noknok_out = [], []
             pend = self._noknok_pending
             now = time.monotonic()
-            if len(pend) < MAX_PENDING:
+            if self._noknok_out:
+                self._push(now)
+            if len(pend) + len(self._noknok_out) < MAX_PENDING:
                 try:
                     conn, addr = self._sock.accept()
                 except OSError as e:
@@ -160,11 +205,11 @@ def _safe_server_class():
                     n = conn.recv_into(self._buffer, len(self._buffer))
                 except OSError as e:
                     if (e.args[0] if e.args else None) not in (11, 110, 116):
-                        self._drop(p)                # reset etc.
+                        self._drop(pend, p)          # reset etc.
                         continue
                     n = None                         # nothing new yet
                 if n == 0:
-                    self._drop(p)                    # the client closed: no request
+                    self._drop(pend, p)              # the client closed: no request
                     result = CONNECTION_TIMED_OUT
                     continue
                 if n:
@@ -172,24 +217,28 @@ def _safe_server_class():
                 need = _need(p[2])
                 if need is not None and len(p[2]) >= need:
                     pend.remove(p)
-                    return self._answer(conn, p[1], p[2])
+                    return self._answer(conn, p[1], p[2], now)
                 if now > p[3] or len(p[2]) > MAX_BODY + 2048:
-                    self._drop(p)                    # too slow, or headers too long
+                    self._drop(pend, p)              # too slow, or headers too long
                     result = CONNECTION_TIMED_OUT
             return result
 
-        def _answer(self, conn, addr, raw):
-            """Handler + reply, as the library's poll() does after its reads."""
+        def _answer(self, conn, addr, raw, now):
+            """Handler + reply, as the library's poll() does after its reads, except
+            that the reply is written into memory and sent by _push()."""
             try:
-                request = Request(self, conn, addr, raw)
+                out = _Collect()
+                request = Request(self, out, addr, raw)
                 handler = self._find_handler(request.method, request.path)
                 response = self._handle_request(request, handler)
                 if response is None:
                     conn.close()
                     return REQUEST_HANDLED_NO_RESPONSE
                 self._set_default_server_headers(response)
-                conn.settimeout(SEND_TIMEOUT)        # bounded, not non-blocking:
-                response._send()                     # the library's send spins on EAGAIN
+                response._send()                     # into `out`, never blocks
+                self._noknok_out.append([conn, memoryview(bytes(out.data)), 0,
+                                         now + SEND_DEADLINE])
+                self._push(now)                      # most replies go out at once
                 return REQUEST_HANDLED_RESPONSE_SENT
             except Exception:
                 try:
