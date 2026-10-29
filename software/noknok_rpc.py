@@ -1,4 +1,4 @@
-# noknok_rpc.py  v0.3 — Device Protocol v1: message dispatcher + carriers (DEV-34)
+# noknok_rpc.py  v0.6 — Device Protocol v1: message dispatcher + carriers (DEV-34)
 #
 # v0.2 (Sue): DEV-79 — an offline brain rejoins WiFi without stalling the
 #   product: most rejoin attempts only START the join (LINK_KICK_S, 0.5 s) and
@@ -34,8 +34,11 @@
 # answered, ≤ 240 ms when a phone stalls mid-request (bounded by
 # socket_timeout, never a hang). DEV-170 (27 Oct 2026): that bound did NOT hold
 # for a client that closes after a partial request - the library's read loops
-# spun on 0-byte reads forever and froze the product. _SafeServer below bounds
-# every request to REQUEST_DEADLINE (+ BODY_GRACE) and drops it on a close. Re-entrancy: a handler that talks to a
+# spun on 0-byte reads forever and froze the product. DEV-169 (v0.6): a slow
+# client still held the loop for its slowness. _SafeServer below now never waits
+# for a client at all: one non-blocking read per open connection and pass, a
+# request answered when its last byte is in. service() keeps poll_max_ms /
+# slow_polls (status.link) as the on-device proof. Re-entrancy: a handler that talks to a
 # module re-enters service() → it returns at once (_busy). Work that must run
 # OUTSIDE a module transaction (on_change callbacks, reboot) is queued with
 # defer() and runs after the carrier's poll returns.
@@ -48,15 +51,20 @@
 import json
 import time
 
-__version__ = "0.5"
+__version__ = "0.6"
 
 SERVICE_INTERVAL = 0.05     # s between carrier polls from the implicit hook
 SOCKET_TIMEOUT   = 1.0      # s a stalled client may hold poll(). 0.2 s dropped the
                             # bodies of phone requests (18 Sep): a phone's body
                             # packet can trail its headers by hundreds of ms.
 MAX_BODY         = 4096     # bytes; a settings.set is ~100, a provision ~600
-REQUEST_DEADLINE = 1.0      # s for the headers + the body of ONE request (DEV-170): a
-                            # client that is slower, or closes half-way, is dropped
+REQUEST_DEADLINE = 2.0      # s for the headers + the body of ONE request (DEV-170): a
+                            # client that is slower, or closes half-way, is dropped.
+                            # Since DEV-169 the wait costs the loop nothing (non-
+                            # blocking), so it can be generous for a trailing body
+MAX_PENDING      = 3        # connections collected at once; more wait in the backlog
+SEND_TIMEOUT     = 0.5      # s a reply may block (a reply is < 2 KB: normally 0)
+SLOW_POLL_MS     = 50       # a poll longer than this counts in slow_polls
 LINK_CHECK_S     = 30       # how often service() looks at the WiFi link
 LINK_JOIN_S      = 5        # blocking budget for a FULL rejoin attempt
 LINK_KICK_S      = 0.5      # budget of a kick: start the join, finish in the background
@@ -73,58 +81,122 @@ class BodyTooLarge(Exception):
 _SafeServer = None
 
 def _safe_server_class():
-    """adafruit_httpserver's Server with the two receive loops bounded (DEV-170).
+    """adafruit_httpserver's Server with a poll() that never waits for a client
+    (DEV-170, DEV-169).
 
-    The library (4.8.2, also upstream main) reads headers until the blank line and
-    the body until Content-Length, and stops only on a timeout or an error. A client
-    that closes half-way makes recv_into() return 0 bytes at once, forever: the loop
-    spins and, because /rpc is served from inside the product loop, the whole
-    product freezes (buttons, LEDs, WiFi rejoin). And its timeout is per read, so a
-    client sending a byte now and then could hold the loop as long as it liked.
+    The library's poll() accepts a connection and then reads it until the request
+    is complete: headers until the blank line, the body until Content-Length. Two
+    problems, both because /rpc is served from inside the product loop:
+      DEV-170 - a client that closes half-way makes recv_into() return 0 bytes at
+                once, forever: the loop spun and the whole product froze.
+      DEV-169 - a slow client (weak WiFi, a phone's body packet trailing its
+                headers) held the loop for exactly its slowness: the LED Button
+                lagged and queued presses while the app was open.
 
-    Here both loops stop on a 0-byte read (peer closed) and on one total deadline
-    per request, REQUEST_DEADLINE, each read waiting only for the time left.
-    Incomplete headers return b"" - the library then answers nothing and closes
-    the socket itself ("connection timed out"), so no socket is leaked. Built
-    lazily: adafruit_httpserver is only imported when a server starts."""
+    This poll() keeps up to MAX_PENDING open connections and, per call, does ONE
+    non-blocking read on each: it collects what has arrived and moves on. A
+    request is answered in the pass in which its last byte arrives; a connection
+    that closes, or is not complete after REQUEST_DEADLINE, is closed and dropped.
+    So one pass costs an accept + a few reads (~1 ms) plus, when a request is
+    complete, its handler and the reply - never the client's slowness. At most one
+    request is answered per pass. Built lazily: adafruit_httpserver is only
+    imported when a server starts."""
     global _SafeServer
     if _SafeServer is not None:
         return _SafeServer
-    from adafruit_httpserver import Server
+    from adafruit_httpserver import (Server, Request, ServerStoppedError, NO_REQUEST,
+                                     CONNECTION_TIMED_OUT, REQUEST_HANDLED_NO_RESPONSE,
+                                     REQUEST_HANDLED_RESPONSE_SENT)
+
+    def _need(got):
+        """None while the headers are incomplete, else the request's total length
+        (headers + Content-Length; for a body over MAX_BODY just the headers, so the
+        route answers "body too large" instead of the body being read)."""
+        end = got.find(b"\r\n\r\n")
+        if end < 0:
+            return None
+        cl = 0
+        for line in got[:end].split(b"\r\n")[1:]:
+            k, _, v = line.partition(b":")
+            if k.strip().lower() == b"content-length":
+                try:
+                    cl = int(v.strip())
+                except ValueError:
+                    cl = 0
+        if cl > MAX_BODY:
+            return end + 4                   # answer now: the route says "body too large"
+        return end + 4 + max(cl, 0)
 
     class SafeServer(Server):
-        def _recv_bounded(self, sock):
-            """Bytes read into self._buffer, or None: peer closed / time up."""
-            left = self._noknok_deadline - time.monotonic()
-            if left <= 0:
-                return None
+        _noknok_pending = None           # [[conn, addr, bytes, deadline], ...]
+
+        def _drop(self, p):
+            self._noknok_pending.remove(p)
             try:
-                sock.settimeout(max(0.05, left))
-                n = sock.recv_into(self._buffer, len(self._buffer))
-            except OSError as e:
-                if (e.args[0] if e.args else None) in (11, 110, 116):
-                    return None              # nothing more within the deadline
-                raise                        # reset etc.: the library handles it
-            return n or None                 # 0 = the client closed the connection
+                p[0].close()
+            except Exception:
+                pass
 
-        def _receive_header_bytes(self, sock):
-            self._noknok_deadline = time.monotonic() + REQUEST_DEADLINE
-            got = b""
-            while b"\r\n\r\n" not in got:
-                n = self._recv_bounded(sock)
-                if n is None:
-                    return b""               # incomplete: no request, socket closed
-                got += bytes(self._buffer[:n])
-            return got
+        def poll(self):
+            if self.stopped:
+                raise ServerStoppedError
+            if self._noknok_pending is None:
+                self._noknok_pending = []
+            pend = self._noknok_pending
+            now = time.monotonic()
+            if len(pend) < MAX_PENDING:
+                try:
+                    conn, addr = self._sock.accept()
+                except OSError as e:
+                    if (e.args[0] if e.args else None) not in (11, 104, 110, 116):
+                        raise
+                else:
+                    conn.settimeout(0)               # every read below is non-blocking
+                    pend.append([conn, addr, b"", now + REQUEST_DEADLINE])
+            result = NO_REQUEST
+            for p in list(pend):
+                conn = p[0]
+                try:
+                    n = conn.recv_into(self._buffer, len(self._buffer))
+                except OSError as e:
+                    if (e.args[0] if e.args else None) not in (11, 110, 116):
+                        self._drop(p)                # reset etc.
+                        continue
+                    n = None                         # nothing new yet
+                if n == 0:
+                    self._drop(p)                    # the client closed: no request
+                    result = CONNECTION_TIMED_OUT
+                    continue
+                if n:
+                    p[2] += bytes(self._buffer[:n])
+                need = _need(p[2])
+                if need is not None and len(p[2]) >= need:
+                    pend.remove(p)
+                    return self._answer(conn, p[1], p[2])
+                if now > p[3] or len(p[2]) > MAX_BODY + 2048:
+                    self._drop(p)                    # too slow, or headers too long
+                    result = CONNECTION_TIMED_OUT
+            return result
 
-        def _receive_body_bytes(self, sock, received_body_bytes, content_length):
-            got = bytes(received_body_bytes or b"")
-            while len(got) < content_length:
-                n = self._recv_bounded(sock)
-                if n is None:
-                    break                    # short body: _full_body() logs it
-                got += bytes(self._buffer[:n])
-            return got[:content_length]
+        def _answer(self, conn, addr, raw):
+            """Handler + reply, as the library's poll() does after its reads."""
+            try:
+                request = Request(self, conn, addr, raw)
+                handler = self._find_handler(request.method, request.path)
+                response = self._handle_request(request, handler)
+                if response is None:
+                    conn.close()
+                    return REQUEST_HANDLED_NO_RESPONSE
+                self._set_default_server_headers(response)
+                conn.settimeout(SEND_TIMEOUT)        # bounded, not non-blocking:
+                response._send()                     # the library's send spins on EAGAIN
+                return REQUEST_HANDLED_RESPONSE_SENT
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise
 
     _SafeServer = SafeServer
     return SafeServer
@@ -423,9 +495,17 @@ def _restart_http():
     except Exception as e:
         _logfn("[rpc] carrier restart failed: %r" % (e,))
 
+_poll_stats = {"max_ms": 0, "slow": 0, "n": 0}
+
 def link_stats():
-    return {"drops": _link["drops"], "rejoins": _link["rejoins"],
-            "backoff": _link.get("backoff")}
+    """WiFi link counters + how long the app channel held the product loop:
+    poll_max_ms = the longest single poll since the previous call (then reset),
+    slow_polls = polls over SLOW_POLL_MS since boot, polls = polls since boot."""
+    st = {"drops": _link["drops"], "rejoins": _link["rejoins"],
+          "backoff": _link.get("backoff"), "poll_max_ms": _poll_stats["max_ms"],
+          "slow_polls": _poll_stats["slow"], "polls": _poll_stats["n"]}
+    _poll_stats["max_ms"] = 0
+    return st
 
 def no_power_save(logfn=print):
     """Keep the radio awake. In power-save mode the CYW43 only listens every
@@ -480,12 +560,19 @@ def service(force=False):
     try:
         _watch_link(now)
         if _carrier is not None:
+            t0 = time.monotonic_ns()      # ns: the float clock loses ms after days
             try:
                 _carrier.poll()
             except Exception as e:
                 if now >= _err_next:         # one line per 10 s, not one per poll
                     _err_next = now + 10
                     _logfn("[rpc] poll error: %r" % (e,))
+            ms = (time.monotonic_ns() - t0) // 1000000
+            _poll_stats["n"] += 1
+            if ms > _poll_stats["max_ms"]:
+                _poll_stats["max_ms"] = ms
+            if ms > SLOW_POLL_MS:
+                _poll_stats["slow"] += 1
     finally:
         _busy = False
     while _deferred:

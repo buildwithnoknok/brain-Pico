@@ -1,30 +1,29 @@
 # SPDX-FileCopyrightText: 2026 noknok (Christopher Houben)
 # SPDX-License-Identifier: MIT
 #
-# test_http_freeze.py - DEV-170, tier S (host Python, no hardware).
+# test_http_freeze.py - DEV-170 + DEV-169, tier S (host Python, no hardware).
 #
-# Runs the REAL adafruit_httpserver 4.8.2 Server.poll() (source copy in
-# tools/fixtures/adafruit_httpserver, the version the brain ships as .mpy) against
-# fake client sockets, once with the library's own receive loops and once with
-# noknok_rpc's _SafeServer. Proves:
+# Runs the REAL adafruit_httpserver 4.8.2 (source copy in tools/fixtures/adafruit_httpserver,
+# the version the brain ships as .mpy) against fake client sockets that deliver their bytes
+# on a wall-clock schedule, once with the library's own poll() and once with noknok_rpc's
+# _SafeServer. poll() is called every 10 ms like service() does; the number that matters
+# is the LONGEST SINGLE poll() call - that is how long the product loop (button, LEDs) is held.
 #   bug     - the library spins forever on a client that closes after a partial request
-#             (a fake socket stops it after 2000 reads and reports "spun")
-#   fix     - _SafeServer: peer closed (nothing / partial headers / headers + partial body)
-#             -> poll() returns at once, the socket is closed, nothing is handled
-#   deadline- a client trickling one byte every 0.3 s is dropped after REQUEST_DEADLINE,
-#             not held for as long as it keeps trickling
-#   normal  - a complete request (one piece, or headers and body apart) is still answered
+#             (DEV-170) and holds one poll() for as long as a late body takes (DEV-169)
+#   fix     - _SafeServer: no poll() longer than a few ms in any case; closed / too slow
+#             connections are dropped and closed; complete requests are answered, also
+#             when the body trails the headers by 1.5 s, also two clients at once
+#   stats   - service() records poll_max_ms / slow_polls for status.link
 #
 # Run from the repo root:   python -I tools/test_http_freeze.py
-
 import os
 import sys
 import time
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "fixtures"))       # adafruit_httpserver 4.8.2
 sys.path.insert(0, os.path.join(HERE, "..", "software"))
-import types   # noqa: E402
 for name in ("microcontroller", "wifi", "socketpool", "mdns"):
     sys.modules.setdefault(name, types.ModuleType(name))
 
@@ -36,7 +35,7 @@ fails = 0
 
 def check(name, cond, extra=""):
     global fails
-    print("  %-64s %s %s" % (name, "PASS" if cond else "FAIL", extra if not cond else ""))
+    print("  %-66s %s %s" % (name, "PASS" if cond else "FAIL", extra if not cond else ""))
     if not cond:
         fails += 1
 
@@ -46,58 +45,73 @@ class Spun(Exception):
 
 
 class Client:
-    """A connected client socket as the server sees it. `script`: bytes to deliver,
-    a float (that many seconds of silence -> the server's read times out or waits), or
-    "CLOSE" (recv_into returns 0 from then on, like a real closed connection)."""
+    """A connected client socket as the server sees it. `script`: (seconds after accept,
+    bytes or "CLOSE"). Non-blocking reads (timeout 0) get EAGAIN until the next piece is
+    due; blocking reads wait for it up to the timeout, then ETIMEDOUT (116) - like
+    CircuitPython. After "CLOSE" every read returns 0, like a real closed connection."""
     def __init__(self, script):
         self.script = list(script)
+        self.t0 = None
         self.reads = 0
         self.closed = False
+        self.closed_at = None
         self.sent = b""
         self.timeout = None
+        self.timeout_at_send = "never sent"
 
     def settimeout(self, t):
         self.timeout = t
 
+    def setblocking(self, flag):
+        self.timeout = None if flag else 0
+
     def recv_into(self, buf, n=0):
         self.reads += 1
-        if self.reads > 2000:
+        if self.reads > 20000:
             raise Spun()
         if not self.script:
-            return 0
-        step = self.script[0]
+            if self.timeout == 0:
+                raise OSError(11)
+            time.sleep(self.timeout or 0)
+            raise OSError(116)
+        due, step = self.script[0]
+        wait = self.t0 + due - time.monotonic()
+        if wait > 0:
+            if self.timeout == 0:
+                raise OSError(11)                       # EAGAIN: nothing yet
+            if self.timeout is not None and wait > self.timeout:
+                time.sleep(self.timeout)
+                raise OSError(116)                      # ETIMEDOUT on CircuitPython
+            time.sleep(wait)
         if step == "CLOSE":
             return 0
-        if isinstance(step, float):
-            limit = self.timeout if self.timeout is not None else step
-            if step <= limit:                        # data arrives within this read's wait
-                time.sleep(step)
-                self.script.pop(0)
-                return self.recv_into(buf, n)
-            time.sleep(limit)                        # the read times out first
-            self.script[0] = step - limit
-            raise OSError(116)                       # ETIMEDOUT on CircuitPython
         self.script.pop(0)
         buf[:len(step)] = step
         return len(step)
 
     def send(self, data):
+        if self.timeout_at_send == "never sent":
+            self.timeout_at_send = self.timeout
         self.sent += bytes(data)
         return len(data)
 
-    def sendall(self, data):
-        self.send(data)
-
     def close(self):
-        self.closed = True
+        if not self.closed:
+            self.closed, self.closed_at = True, time.monotonic()
 
 
 class Listener:
-    def __init__(self, client):
-        self.client = client
+    """The listening socket: hands out each client when its arrival time has come."""
+    def __init__(self, clients):
+        self.queue = list(clients)                      # (arrival s, Client)
+        self.t0 = time.monotonic()
 
     def accept(self):
-        return self.client, ("192.168.1.50", 40000)
+        if self.queue and time.monotonic() >= self.t0 + self.queue[0][0]:
+            at, c = self.queue.pop(0)
+            c.t0 = time.monotonic()
+            return c, ("192.168.1.50", 40000)
+        raise OSError(11)
 
 
 def make(cls):
@@ -108,65 +122,134 @@ def make(cls):
 
     @srv.route("/rpc", POST)
     def _rpc(request):
-        handled.append(request.body)
+        handled.append(bytes(request.body))
         return Response(request, '{"ok": true}', content_type="application/json")
     return srv, handled
 
 
-def run(cls, script):
+def run(cls, clients, limit=4.0):
+    """Poll every 10 ms until every client is closed (or `limit` s). Returns the longest
+    single poll() in ms (or "SPUN"), the clients, what was handled, and when."""
     srv, handled = make(cls)
-    c = Client(script)
-    srv._sock = Listener(c)
-    t0 = time.monotonic()
-    try:
-        res = srv.poll()
-    except Spun:
-        res = "SPUN"
-    except Exception as e:
-        res = "raised %r" % (e,)
-    return res, time.monotonic() - t0, c, handled
+    lst = Listener(clients)
+    srv._sock = lst
+    t_start = time.monotonic()
+    longest = 0.0
+    when = []
+    cs = [c for _, c in clients]
+    while time.monotonic() - t_start < limit and not all(c.closed for c in cs):
+        t0 = time.monotonic()
+        try:
+            srv.poll()
+        except Spun:
+            return "SPUN", cs, handled, when
+        except OSError:
+            pass                                        # HttpCarrier.poll() swallows 110/116
+        dt = (time.monotonic() - t0) * 1000
+        longest = max(longest, dt)
+        while len(when) < len(handled):
+            when.append(time.monotonic() - t_start)
+        time.sleep(0.01)
+    return round(longest), cs, handled, when
 
 
 BODY = b'{"id": 1, "op": "hello", "args": {}}'
 HEAD = (b"POST /rpc HTTP/1.1\r\nHost: brain\r\nContent-Type: application/json\r\n"
         b"Content-Length: %d\r\n\r\n" % len(BODY))
 Safe = noknok_rpc._safe_server_class()
+DL = noknok_rpc.REQUEST_DEADLINE
+FAST = 20                                               # ms: "the loop is not held"
 
-print("DEV-170: the library's own loops (the bug)")
-res, dt, c, h = run(Server, [HEAD[:20], "CLOSE"])
-check("partial headers + close -> library spins (frozen)", res == "SPUN", res)
-res, dt, c, h = run(Server, [HEAD, BODY[:5], "CLOSE"])
-check("headers + partial body + close -> library spins (frozen)", res == "SPUN", res)
 
-print("\nnoknok_rpc._SafeServer")
-for name, script in (("connect, send nothing, close", ["CLOSE"]),
-                     ("partial headers, close", [HEAD[:20], "CLOSE"]),
-                     ("headers in two pieces, then close", [HEAD[:30], HEAD[30:60], "CLOSE"])):
-    res, dt, c, h = run(Safe, script)
-    check("%s -> returns at once, socket closed, nothing handled" % name,
-          res != "SPUN" and dt < 0.2 and c.closed and not h, (res, round(dt, 2), c.closed, h))
-res, dt, c, h = run(Safe, [HEAD, BODY[:5], "CLOSE"])
-check("headers + partial body + close -> no spin, returns at once",
-      res != "SPUN" and dt < 1.6 and c.reads < 50, (res, round(dt, 2), c.reads))
-trickle = []
-for i in range(40):
-    trickle += [HEAD[i:i + 1], 0.3]
-res, dt, c, h = run(Safe, trickle)
+def one(script, cls=Safe, limit=4.0):
+    longest, cs, h, when = run(cls, [(0, Client(script))], limit)
+    return longest, cs[0], h, when
+
+
+print("DEV-170 / DEV-169: the library's own poll() (the bugs)")
+longest, c, h, w = one([(0, HEAD[:20]), (0.1, "CLOSE")], Server)
+check("partial headers + close -> library spins (frozen)", longest == "SPUN", longest)
+longest, c, h, w = one([(0, HEAD), (0, BODY[:5]), (0.1, "CLOSE")], Server)
+check("headers + partial body + close -> library spins (frozen)", longest == "SPUN", longest)
+longest, c, h, w = one([(0, HEAD), (0.6, BODY)], Server)
+check("body 0.6 s after the headers -> one poll() holds the loop >= 0.5 s",
+      longest != "SPUN" and longest >= 500, longest)
+
+print("\nnoknok_rpc._SafeServer: broken clients")
+for name, script in (("connect, send nothing, close", [(0.1, "CLOSE")]),
+                     ("partial headers, close", [(0, HEAD[:20]), (0.3, "CLOSE")]),
+                     ("headers in two pieces, then close", [(0, HEAD[:30]), (0.1, HEAD[30:60]),
+                                                            (0.3, "CLOSE")]),
+                     ("headers + partial body, close", [(0, HEAD), (0, BODY[:5]), (0.3, "CLOSE")])):
+    longest, c, h, w = one(script)
+    check("%s -> closed, nothing handled, loop held <= %d ms" % (name, FAST),
+          longest != "SPUN" and longest <= FAST and c.closed and not h, (longest, c.closed, h))
+trickle = [(0.3 * i, HEAD[i:i + 1]) for i in range(40)]
+t0 = time.monotonic()
+longest, c, h, w = one(trickle)
 check("client trickling 1 byte / 0.3 s -> dropped after REQUEST_DEADLINE",
-      res != "SPUN" and dt <= noknok_rpc.REQUEST_DEADLINE + 0.4 and c.closed and not h,
-      (res, round(dt, 2), c.closed))
-res, dt, c, h = run(Safe, [3.0])
-check("silent client (sends nothing, stays open) -> dropped within the deadline",
-      dt <= noknok_rpc.REQUEST_DEADLINE + 0.4 and c.closed and not h, (res, round(dt, 2)))
+      longest != "SPUN" and longest <= FAST and c.closed and not h
+      and DL - 0.1 <= c.closed_at - t0 <= DL + 0.3, (longest, round(c.closed_at - t0, 2)))
+t0 = time.monotonic()
+longest, c, h, w = one([(9.0, HEAD)])
+check("silent client (stays open) -> dropped after REQUEST_DEADLINE",
+      longest <= FAST and c.closed and not h and c.closed_at - t0 <= DL + 0.3,
+      (longest, round(c.closed_at - t0, 2)))
 
-print("\nnormal requests still answered")
-res, dt, c, h = run(Safe, [HEAD + BODY])
-check("complete request in one piece -> handled, answered", h == [BODY] and b'"ok": true' in c.sent,
-      (res, h))
-res, dt, c, h = run(Safe, [HEAD, 0.2, BODY])
-check("headers, 0.2 s pause, body -> handled", h == [BODY], (res, h))
-res, dt, c, h = run(Safe, [HEAD[:40], HEAD[40:], BODY[:10], BODY[10:]])
-check("request in four pieces -> handled", h == [BODY], (res, h))
+print("\nnoknok_rpc._SafeServer: normal and slow requests are answered")
+longest, c, h, w = one([(0, HEAD + BODY)])
+check("complete request in one piece -> answered, loop held <= %d ms" % FAST,
+      h == [BODY] and b'"ok": true' in c.sent and longest <= FAST, (longest, h))
+check("the reply is sent with SEND_TIMEOUT (bounded), not non-blocking",
+      c.timeout_at_send == noknok_rpc.SEND_TIMEOUT, c.timeout_at_send)
+for gap in (0.2, 0.6, 1.5):
+    longest, c, h, w = one([(0, HEAD), (gap, BODY)])
+    check("body %.1f s after the headers -> answered, loop held <= %d ms" % (gap, FAST),
+          h == [BODY] and longest <= FAST and c.closed, (longest, h))
+longest, c, h, w = one([(0, HEAD[:40]), (0.05, HEAD[40:]), (0.1, BODY[:10]), (0.15, BODY[10:])])
+check("request in four pieces -> answered", h == [BODY] and longest <= FAST, (longest, h))
+big = (b"POST /rpc HTTP/1.1\r\nHost: brain\r\nContent-Length: 10000\r\n\r\n" + b"x" * 300)
+longest, c, h, w = one([(0, big)])
+check("Content-Length over MAX_BODY -> handed to the route at once (no wait)",
+      len(h) == 1 and longest <= FAST and c.closed, (longest, len(h)))
+
+print("\nnoknok_rpc._SafeServer: two clients at once (the DEV-169 case)")
+slow = Client([(0, HEAD), (1.0, BODY)])
+fast = Client([(0, HEAD + BODY)])
+longest, cs, h, when = run(Safe, [(0, slow), (0.1, fast)])
+check("a fast client behind a slow body is answered first, within 0.1 s",
+      len(h) == 2 and when[0] < 0.25 and fast.sent and longest <= FAST,
+      (longest, [round(x, 2) for x in when]))
+check("... and the slow one is still answered when its body arrives",
+      slow.sent and 1.0 <= when[1] <= 1.3, [round(x, 2) for x in when])
+silent = [Client([(9.0, HEAD)]) for _ in range(5)]
+srv, _ = make(Safe)
+lst = Listener([(0, c) for c in silent])
+srv._sock = lst
+for _ in range(10):
+    srv.poll()
+check("at most MAX_PENDING connections are collected; the rest wait in the backlog",
+      len(srv._noknok_pending) == noknok_rpc.MAX_PENDING
+      and len(lst.queue) == 5 - noknok_rpc.MAX_PENDING, (len(srv._noknok_pending), len(lst.queue)))
+
+print("\nservice() measures how long the app channel held the loop")
+
+
+class SlowCarrier:
+    def poll(self):
+        time.sleep(0.07)
+
+
+noknok_rpc._carrier = SlowCarrier()
+noknok_rpc._watch_link = lambda now: None
+noknok_rpc.service(force=True)
+noknok_rpc.service(force=True)
+st = noknok_rpc.link_stats()
+check("link_stats(): poll_max_ms, slow_polls, polls after two 70 ms polls",
+      st["poll_max_ms"] >= 70 and st["slow_polls"] == 2 and st["polls"] == 2, st)
+check("poll_max_ms resets on read, the counters do not",
+      noknok_rpc.link_stats()["poll_max_ms"] == 0 and noknok_rpc.link_stats()["slow_polls"] == 2)
+noknok_rpc._carrier = None
 
 print("\nthe carrier uses it")
 src = open(os.path.join(HERE, "..", "software", "noknok_rpc.py"), encoding="utf-8").read()
