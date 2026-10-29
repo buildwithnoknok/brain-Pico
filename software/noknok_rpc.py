@@ -53,7 +53,7 @@ import gc
 import json
 import time
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 SERVICE_INTERVAL = 0.05     # s between carrier polls from the implicit hook
 SOCKET_TIMEOUT   = 1.0      # s a stalled client may hold poll(). 0.2 s dropped the
@@ -82,7 +82,9 @@ LINK_KICK_S      = 0.5      # budget of a kick: start the join, finish in the ba
 LINK_FULL_EVERY  = 0        # 0 = kicks only (bench-proven 23 Oct: kicks finish in the
                             # background); N = every Nth attempt is a full LINK_JOIN_S one
 LINK_POLL_S      = 1.0      # while the link is down: how often to look (cheap)
-LINK_MAX_S       = 300      # longest pause between attempts (DEV-79: join <= 15 min)
+LINK_MAX_S       = 60       # longest pause between attempts. DEV-168: was 300 s, so a
+                            # brain stayed offline up to 5 min after the WiFi was back;
+                            # each attempt costs the product a LINK_KICK_S pause
 
 
 class BodyTooLarge(Exception):
@@ -523,7 +525,7 @@ def _watch_link(now):
 
     Up: look again in LINK_CHECK_S. Down: look every LINK_POLL_S (a kicked join
     may complete in the background), and start a new attempt when its backoff
-    (30 -> 60 -> 120 -> 240 -> 300 s) is over. A kick blocks the product for at
+    (30 -> 60 s, then every 60 s) is over. A kick blocks the product for at
     most LINK_KICK_S; every LINK_FULL_EVERY-th attempt blocks up to LINK_JOIN_S
     so the brain still joins if a kick cannot finish on its own."""
     if not _link["ssid"] or now < _link["next"]:
