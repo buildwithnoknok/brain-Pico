@@ -65,6 +65,7 @@ REQUEST_DEADLINE = 2.0      # s for the headers + the body of ONE request (DEV-1
                             # blocking), so it can be generous for a trailing body
 MAX_PENDING      = 4        # connections open at once (reading or replying); more
                             # wait in the listener's backlog
+FIRST_WAIT       = 0.05     # s the first read of a new connection may wait (one per pass)
 SEND_DEADLINE    = 5.0      # s a client may take to receive its reply (non-blocking:
                             # costs the loop nothing), then it is dropped
 SLOW_POLL_MS     = 50       # a poll longer than this counts in slow_polls
@@ -155,7 +156,7 @@ def _safe_server_class():
             pass
 
     class SafeServer(Server):
-        _noknok_pending = None           # [[conn, addr, bytes, deadline], ...] reading
+        _noknok_pending = None           # [[conn, addr, bytes, deadline, fresh], ...] reading
         _noknok_out = None               # [[conn, memoryview, offset, deadline], ...]
 
         @staticmethod
@@ -196,8 +197,12 @@ def _safe_server_class():
                     if (e.args[0] if e.args else None) not in (11, 104, 110, 116):
                         raise
                 else:
-                    conn.settimeout(0)               # every read below is non-blocking
-                    pend.append([conn, addr, b"", now + REQUEST_DEADLINE])
+                    # The first read may wait FIRST_WAIT: the request's data trails the
+                    # connect by a few ms, and the product loop may not come back here
+                    # for a second (bench, 29 Oct: 1.15 s per request without this).
+                    # Every later read is non-blocking.
+                    conn.settimeout(FIRST_WAIT)
+                    pend.append([conn, addr, b"", now + REQUEST_DEADLINE, True])
             result = NO_REQUEST
             for p in list(pend):
                 conn = p[0]
@@ -208,6 +213,9 @@ def _safe_server_class():
                         self._drop(pend, p)          # reset etc.
                         continue
                     n = None                         # nothing new yet
+                if p[4]:
+                    p[4] = False
+                    conn.settimeout(0)               # from now on: non-blocking
                 if n == 0:
                     self._drop(pend, p)              # the client closed: no request
                     result = CONNECTION_TIMED_OUT

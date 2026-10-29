@@ -140,7 +140,7 @@ def make(cls):
     return srv, handled
 
 
-def run(cls, clients, limit=4.0):
+def run(cls, clients, limit=4.0, every=0.01):
     """Poll every 10 ms until every client is closed (or `limit` s). Returns the longest
     single poll() in ms (or "SPUN"), the clients, what was handled, and when."""
     srv, handled = make(cls)
@@ -162,7 +162,7 @@ def run(cls, clients, limit=4.0):
         longest = max(longest, dt)
         while len(when) < len(handled):
             when.append(time.monotonic() - t_start)
-        time.sleep(0.01)
+        time.sleep(every)
     return round(longest), cs, handled, when
 
 
@@ -171,7 +171,7 @@ HEAD = (b"POST /rpc HTTP/1.1\r\nHost: brain\r\nContent-Type: application/json\r\
         b"Content-Length: %d\r\n\r\n" % len(BODY))
 Safe = noknok_rpc._safe_server_class()
 DL = noknok_rpc.REQUEST_DEADLINE
-FAST = 20                                               # ms: "the loop is not held"
+FAST = int(noknok_rpc.FIRST_WAIT * 1000) + 20          # ms: one pass may wait FIRST_WAIT
 
 
 def one(script, cls=Safe, limit=4.0):
@@ -224,6 +224,12 @@ big = (b"POST /rpc HTTP/1.1\r\nHost: brain\r\nContent-Length: 10000\r\n\r\n" + b
 longest, c, h, w = one([(0, big)])
 check("Content-Length over MAX_BODY -> handed to the route at once (no wait)",
       len(h) == 1 and longest <= FAST and c.closed, (longest, len(h)))
+
+print("\nnoknok_rpc._SafeServer: a busy product loop (polls only every 0.3 s)")
+longest, cs, h, when = run(Safe, [(0, Client([(0.02, HEAD + BODY)]))], every=0.3)
+check("data 20 ms after the connect -> answered in the same pass (< 0.1 s)",
+      h == [BODY] and when and when[0] < 0.1 and longest <= FAST,
+      (longest, [round(x, 2) for x in when]))
 
 print("\nnoknok_rpc._SafeServer: slow reply receivers (the 29 Oct bench case)")
 
