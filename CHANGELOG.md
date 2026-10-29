@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## code.py 0.38 + noknok.py 1.24 - 2026-10-29
+
+- DEV-172 - after a restart the brain sometimes did not start at all (no light, no app, only unplugging helped): on the bench 3 of 26 restarts made while the WiFi was busy, 0 of 25 made with the WiFi already off. Every restart the brain makes on purpose (app "restart", product switch, end of setup, the restart before the product) now switches the WiFi radio off first. Under test on the bench; the root cause inside CircuitPython is still being traced with a debug probe. Breaking: no.
+
 ## noknok_rpc.py 0.5 - 2026-10-29
 
 - DEV-170 - one network connection to the brain that sent only part of a request and then closed (or sent nothing at all) froze the whole product for good: buttons, LEDs and the WiFi reconnect stopped, only a replug helped. The web server library the brain uses waited for the rest of the request forever. The brain now uses its own version of the two waiting steps: it stops as soon as the other side has closed, and gives one request at most 1 second for its headers and body, then drops it. Covers the home network and the setup hotspot (same server). Host test `tools/test_http_freeze.py`. Breaking: no.

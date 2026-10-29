@@ -1,6 +1,10 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.37 (safe mode no longer leaves the lamp dark — DEV-154)
+# Version: 0.38 (deliberate resets switch the WiFi radio off first — DEV-172)
 #
+# v0.38 changes (Sue): DEV-172 — the app's reboot, a product switch, the end of
+#   setup and the hard reset before the product all go through nk.hard_reset():
+#   WiFi radio off, then microcontroller.reset(). Bench 29 Oct: resets with the
+#   radio busy hung the next boot (USB back, console silent) in 3 of 26 cases.
 # v0.37 changes (Sue): DEV-154 — new safemode.py: when CircuitPython starts in
 #   safe mode after a core crash (hard fault, brownout, ...), code.py never runs
 #   and the lamp stayed dark until a replug. safemode.py now restarts the brain,
@@ -448,7 +452,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.37"
+CODE_VERSION = "0.38"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -832,7 +836,7 @@ def _hard_reset_if_needed():
     _release_conductor()
     event(f"[BOOT] hard reset before the product: {_hard_reset_why}")
     time.sleep(0.5)
-    microcontroller.reset()
+    nk.hard_reset()                      # radio off first (DEV-172)
 
 def _rescue_from_cache(why):
     """Parked-module rescue with the on-device cache as the only image source.
@@ -1293,7 +1297,7 @@ def _h_reboot(args, msg):
     def _reboot():
         nk.flush_settings()              # the last few seconds of changes
         time.sleep(0.5)                  # let the reply leave the radio first
-        microcontroller.reset()
+        nk.hard_reset()                  # radio off first (DEV-172)
     rpc.defer(_reboot)
     return {"rebooting": True}
 
@@ -1567,7 +1571,7 @@ def _do_provision(ssid, password, script_url, module_firmware, product_id,
         nk.flush_settings()
         time.sleep(0.5)                  # let the reply leave the radio first
         _set_crash_count(0)
-        microcontroller.reset()
+        nk.hard_reset()                  # radio off first (DEV-172)
     rpc.defer(_switch)
     return {"accepted": True, "mode": "switch", "rebooting": True}
 
@@ -1854,7 +1858,7 @@ def run_ap_provisioning():
                 _install_settings(pending["config_defaults"])
                 log("[boot] Credentials saved — hardware reset into WiFi mode")
                 time.sleep(2)  # let the success page flush to the browser
-                microcontroller.reset()
+                nk.hard_reset()               # radio off first (DEV-172)
                 return
             # Filesystem read-only (drive visible to a PC): the app already saw
             # the success page, so say it loudly here and offer setup again

@@ -130,6 +130,9 @@
 #             the product declared with s.defaults(); any other key is rejected
 #             ("unknown setting"), never stored, never handed to the product. The
 #             product's own s.set() is unchanged.
+# v1.24 (Sue): DEV-172 — hard_reset(): every deliberate reset switches the WiFi
+#             radio off first (a reset with the radio busy hung the next boot on
+#             the bench). factory_reset() uses it.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -150,7 +153,7 @@ import json
 import os
 import struct
 
-__version__ = "1.23"
+__version__ = "1.24"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -2985,7 +2988,25 @@ def factory_reset(delay=0.0):
     if delay:
         time.sleep(delay)
     print("[reset] rebooting...")
+    hard_reset()
+
+
+def hard_reset():
+    """microcontroller.reset() with the WiFi radio switched off first (DEV-172).
+
+    Bench, 29 Oct 2026: a reset while the radio was connected and busy left the
+    brain hung on the next boot (USB back, then silent, Ctrl-C ignored; only a
+    power cycle helped) in 3 of 26 cases; a reset with the radio already off
+    (console reset of a stopped product) in 0 of 25. The RP2350's reset does not
+    power-cycle the CYW43, so it is put down in an orderly way first. Every
+    reset noknok code makes on purpose goes through here."""
     import microcontroller
+    try:
+        import wifi
+        wifi.radio.enabled = False
+        time.sleep(0.2)
+    except Exception:
+        pass
     microcontroller.reset()
 
 
