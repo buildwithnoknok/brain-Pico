@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 noknok (Christopher Houben)
 # SPDX-License-Identifier: MIT
 #
-# bench_dev169_latency.py IP [SECONDS] [LABEL] - DEV-169: how long does the app channel hold
+# bench_dev169_latency.py IP [SECONDS] [LABEL] [PATTERNS] - DEV-169: how long does the app channel hold
 # the brain's product loop (the loop that reads the LED Button), measured, per traffic pattern.
 #
 # Runs on the bench host (the Pi) against a RUNNING product. The brain serves /rpc from inside
@@ -19,6 +19,8 @@
 #   later_body   - the same with 1.5 s
 #   half_open    - every 3 s a client connects, waits 0.5 s, closes (app scan, flaky WiFi)
 #   trickle      - every 3 s a client sends its headers one byte every 50 ms
+# PATTERNS: comma list (default all). On noknok_rpc 0.3/0.4 leave out half_open and trickle:
+# they trigger the DEV-170 freeze there (the brain then needs a reset).
 # Output: one line per pattern (probe p50 / p95 / max ms, probes over 100 / 200 ms, failed
 # probes, the brain's poll_max_ms and slow_polls) and a JSON line per pattern in OUT
 # (~/dev169/latency.jsonl). A failed probe (no answer within 3 s) counts as 3000 ms.
@@ -124,9 +126,15 @@ def run(kind):
              rec["over200"], rec["failed"], rec["poll_max_ms"], rec["slow_polls"]), flush=True)
 
 
-dt, h = call("hello", timeout=5)
+for _ in range(12):                      # a brain just reset: wait up to a minute
+    dt, h = call("hello", timeout=5)
+    if dt is not None:
+        break
+    time.sleep(5)
 if dt is None:
     sys.exit("brain %s does not answer" % IP)
 print("%s: rpc %s, uptime %s s" % (IP, (h or {}).get("rpc"), (h or {}).get("uptime")), flush=True)
-for k in ("app", "late_body", "later_body", "half_open", "trickle"):
+PATTERNS = (sys.argv[4].split(",") if len(sys.argv) > 4
+            else ["app", "late_body", "later_body", "half_open", "trickle"])
+for k in PATTERNS:
     run(k)
