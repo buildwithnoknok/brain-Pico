@@ -32,7 +32,10 @@
 # directly. It is non-blocking and throttled (SERVICE_INTERVAL); the risk-#1
 # soak of 17 Sep 2026 measured it at ~1 ms idle, 10–100 ms when a request is
 # answered, ≤ 240 ms when a phone stalls mid-request (bounded by
-# socket_timeout, never a hang). Re-entrancy: a handler that talks to a
+# socket_timeout, never a hang). DEV-170 (27 Oct 2026): that bound did NOT hold
+# for a client that closes after a partial request - the library's read loops
+# spun on 0-byte reads forever and froze the product. _SafeServer below bounds
+# every request to REQUEST_DEADLINE (+ BODY_GRACE) and drops it on a close. Re-entrancy: a handler that talks to a
 # module re-enters service() → it returns at once (_busy). Work that must run
 # OUTSIDE a module transaction (on_change callbacks, reboot) is queued with
 # defer() and runs after the carrier's poll returns.
@@ -45,13 +48,15 @@
 import json
 import time
 
-__version__ = "0.4"
+__version__ = "0.5"
 
 SERVICE_INTERVAL = 0.05     # s between carrier polls from the implicit hook
 SOCKET_TIMEOUT   = 1.0      # s a stalled client may hold poll(). 0.2 s dropped the
                             # bodies of phone requests (18 Sep): a phone's body
                             # packet can trail its headers by hundreds of ms.
 MAX_BODY         = 4096     # bytes; a settings.set is ~100, a provision ~600
+REQUEST_DEADLINE = 1.0      # s for the headers + the body of ONE request (DEV-170): a
+                            # client that is slower, or closes half-way, is dropped
 LINK_CHECK_S     = 30       # how often service() looks at the WiFi link
 LINK_JOIN_S      = 5        # blocking budget for a FULL rejoin attempt
 LINK_KICK_S      = 0.5      # budget of a kick: start the join, finish in the background
@@ -63,6 +68,66 @@ LINK_MAX_S       = 300      # longest pause between attempts (DEV-79: join <= 15
 
 class BodyTooLarge(Exception):
     pass
+
+
+_SafeServer = None
+
+def _safe_server_class():
+    """adafruit_httpserver's Server with the two receive loops bounded (DEV-170).
+
+    The library (4.8.2, also upstream main) reads headers until the blank line and
+    the body until Content-Length, and stops only on a timeout or an error. A client
+    that closes half-way makes recv_into() return 0 bytes at once, forever: the loop
+    spins and, because /rpc is served from inside the product loop, the whole
+    product freezes (buttons, LEDs, WiFi rejoin). And its timeout is per read, so a
+    client sending a byte now and then could hold the loop as long as it liked.
+
+    Here both loops stop on a 0-byte read (peer closed) and on one total deadline
+    per request, REQUEST_DEADLINE, each read waiting only for the time left.
+    Incomplete headers return b"" - the library then answers nothing and closes
+    the socket itself ("connection timed out"), so no socket is leaked. Built
+    lazily: adafruit_httpserver is only imported when a server starts."""
+    global _SafeServer
+    if _SafeServer is not None:
+        return _SafeServer
+    from adafruit_httpserver import Server
+
+    class SafeServer(Server):
+        def _recv_bounded(self, sock):
+            """Bytes read into self._buffer, or None: peer closed / time up."""
+            left = self._noknok_deadline - time.monotonic()
+            if left <= 0:
+                return None
+            try:
+                sock.settimeout(max(0.05, left))
+                n = sock.recv_into(self._buffer, len(self._buffer))
+            except OSError as e:
+                if (e.args[0] if e.args else None) in (11, 110, 116):
+                    return None              # nothing more within the deadline
+                raise                        # reset etc.: the library handles it
+            return n or None                 # 0 = the client closed the connection
+
+        def _receive_header_bytes(self, sock):
+            self._noknok_deadline = time.monotonic() + REQUEST_DEADLINE
+            got = b""
+            while b"\r\n\r\n" not in got:
+                n = self._recv_bounded(sock)
+                if n is None:
+                    return b""               # incomplete: no request, socket closed
+                got += bytes(self._buffer[:n])
+            return got
+
+        def _receive_body_bytes(self, sock, received_body_bytes, content_length):
+            got = bytes(received_body_bytes or b"")
+            while len(got) < content_length:
+                n = self._recv_bounded(sock)
+                if n is None:
+                    break                    # short body: _full_body() logs it
+                got += bytes(self._buffer[:n])
+            return got[:content_length]
+
+    _SafeServer = SafeServer
+    return SafeServer
 
 
 class RpcError(Exception):
@@ -143,8 +208,8 @@ class HttpCarrier:
         self.log = logfn
 
     def start(self, pool, port=80, debug=False):
-        from adafruit_httpserver import Server, Request, Response, POST
-        srv = Server(pool, debug=debug)
+        from adafruit_httpserver import Request, Response, POST
+        srv = _safe_server_class()(pool, debug=debug)       # DEV-170: bounded reads
         d = self.dispatcher
 
         @srv.route("/rpc", POST)
