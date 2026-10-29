@@ -30,6 +30,10 @@ IP = sys.argv[1]
 SECS = float(sys.argv[2]) if len(sys.argv) > 2 else 60
 LABEL = sys.argv[3] if len(sys.argv) > 3 else ""
 OUT = os.path.expanduser("~/dev169")
+PROBE_S = float(os.environ.get("PROBE_S", "0.2"))   # probe period; 1.0 = app-like. At 0.2 s
+# (5 connections/s) the brain's network stack runs out of connection slots and drops SYNs:
+# answers then come at 1 s / 3 s (the client's SYN retries) - that measures connection
+# capacity, not the product loop. The brain's own poll_max_ms is the loop number.
 os.makedirs(OUT, exist_ok=True)
 
 
@@ -107,10 +111,15 @@ def run(kind):
         t = time.monotonic()
         dt, r = call("hello")
         lat.append(dt if dt is not None else 3.0)
-        time.sleep(max(0, 0.2 - (time.monotonic() - t)))
+        time.sleep(max(0, PROBE_S - (time.monotonic() - t)))
     stop.set()
     time.sleep(2)
-    _, st = call("status", timeout=5)
+    st = None
+    for _ in range(4):                       # a dropped SYN is retried by the client anyway
+        _, st = call("status", timeout=5)
+        if st:
+            break
+        time.sleep(1)
     link = (st or {}).get("link") or {}
     ms = sorted(x * 1000 for x in lat)
     rec = {"label": LABEL, "pattern": kind, "at": time.strftime("%F %T"), "n": len(ms),

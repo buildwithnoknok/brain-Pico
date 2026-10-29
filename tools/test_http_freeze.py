@@ -13,8 +13,7 @@
 #   fix     - _SafeServer: no poll() longer than a few ms in any case; closed / too slow
 #             connections are dropped and closed; complete requests are answered, also
 #             when the body trails the headers by 1.5 s, also two clients at once
-#   reply   - a client that takes its reply slowly (weak WiFi) gets it in pieces without
-#             holding the loop; one that never reads is dropped after SEND_DEADLINE
+#   reply   - sent the library's way, each send() bounded by SEND_TIMEOUT
 #   stats   - service() records poll_max_ms / slow_polls for status.link
 #
 # Run from the repo root:   python -I tools/test_http_freeze.py
@@ -99,10 +98,15 @@ class Client:
             self.timeout_at_send = self.timeout
         n = len(data)
         if self.take is not None:
-            if self.take == 0 or time.monotonic() - self.last_take < self.every:
-                if self.timeout != 0:
-                    time.sleep(self.timeout or 1.0)       # blocking: wait, then EAGAIN
-                raise OSError(11)
+            wait = self.last_take + self.every - time.monotonic()
+            if self.take == 0 or wait > 0:
+                if self.timeout == 0:
+                    raise OSError(11)                     # non-blocking: not now
+                limit = self.timeout or 1.0
+                if self.take == 0 or wait > limit:
+                    time.sleep(limit)                     # blocking: nothing in time
+                    raise OSError(116)
+                time.sleep(wait)                          # blocking: room frees up
             self.last_take = time.monotonic()
             n = min(n, self.take)
         self.sent += bytes(data[:n])
@@ -213,7 +217,8 @@ print("\nnoknok_rpc._SafeServer: normal and slow requests are answered")
 longest, c, h, w = one([(0, HEAD + BODY)])
 check("complete request in one piece -> answered, loop held <= %d ms" % FAST,
       h == [BODY] and b'"ok": true' in c.sent and longest <= FAST, (longest, h))
-check("the reply is sent non-blocking", c.timeout_at_send == 0, c.timeout_at_send)
+check("the reply is sent with timeout SEND_TIMEOUT", c.timeout_at_send == noknok_rpc.SEND_TIMEOUT,
+      c.timeout_at_send)
 for gap in (0.2, 0.6, 1.5):
     longest, c, h, w = one([(0, HEAD), (gap, BODY)])
     check("body %.1f s after the headers -> answered, loop held <= %d ms" % (gap, FAST),
@@ -230,48 +235,6 @@ longest, cs, h, when = run(Safe, [(0, Client([(0.02, HEAD + BODY)]))], every=0.3
 check("data 20 ms after the connect -> answered in the same pass (< 0.1 s)",
       h == [BODY] and when and when[0] < 0.1 and longest <= FAST,
       (longest, [round(x, 2) for x in when]))
-
-print("\nnoknok_rpc._SafeServer: slow reply receivers (the 29 Oct bench case)")
-
-
-def _big(request):
-    return Response(request, '{"ok": true, "events": "%s"}' % ("x" * 3000),
-                    content_type="application/json")
-
-
-def run_big(clients, limit=8.0):
-    srv, handled = make(Safe)
-    srv._routes = []
-    srv.route("/rpc", POST)(_big)
-    srv._sock = Listener(clients)
-    t_start = time.monotonic()
-    longest = 0.0
-    cs = [c for _, c in clients]
-    while time.monotonic() - t_start < limit and not all(c.closed for c in cs):
-        t0 = time.monotonic()
-        srv.poll()
-        longest = max(longest, (time.monotonic() - t0) * 1000)
-        time.sleep(0.01)
-    return round(longest), cs
-
-
-longest, (c,) = run_big([(0, Client([(0, HEAD + BODY)], take=300, every=0.1))])
-check("3 KB reply to a reader taking 300 B / 0.1 s -> all of it, loop held <= %d ms" % FAST,
-      c.closed and len(c.sent) > 3000 and c.sent.endswith(b'"}') and longest <= FAST,
-      (longest, len(c.sent), c.closed))
-t0 = time.monotonic()
-longest, (c,) = run_big([(0, Client([(0, HEAD + BODY)], take=0))])
-check("client that never reads its reply -> dropped after SEND_DEADLINE, loop not held",
-      c.closed and longest <= FAST
-      and noknok_rpc.SEND_DEADLINE - 0.1 <= c.closed_at - t0 <= noknok_rpc.SEND_DEADLINE + 0.5,
-      (longest, round(c.closed_at - t0, 2) if c.closed_at else None))
-longest, (d, f) = run_big([(0, Client([(0, HEAD + BODY)], take=0)),
-                           (0.2, Client([(0, HEAD + BODY)]))])
-check("a fast client next to one that never reads is answered at once",
-      f.sent.endswith(b'"}') and longest <= FAST, (longest, len(f.sent)))
-longest, cs, h, w = run(Server, [(0, Client([(0, HEAD + BODY)], take=300, every=0.3))])
-check("(the library itself: same slow reader holds one poll() >= 0.5 s)",
-      longest == "SPUN" or longest >= 500, longest)
 
 print("\nnoknok_rpc._SafeServer: two clients at once (the DEV-169 case)")
 slow = Client([(0, HEAD), (1.0, BODY)])
