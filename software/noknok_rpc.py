@@ -615,7 +615,13 @@ def service(force=False):
             except Exception as e:
                 if now >= _err_next:         # one line per 10 s, not one per poll
                     _err_next = now + 10
-                    _logfn("[rpc] poll error: %r" % (e,))
+                    try:                     # an allocation failure shows up as
+                        import gc            # "Unparseable raw_request" (29 Oct)
+                        free = gc.mem_free()
+                    except Exception:
+                        free = -1
+                    _logfn("[rpc] poll error: %r (cause %r, mem_free %d)"
+                           % (e, getattr(e, "__cause__", None), free))
             ms = (time.monotonic_ns() - t0) // 1000000
             _poll_stats["n"] += 1
             if ms > _poll_stats["max_ms"]:
