@@ -5,7 +5,7 @@
 # dev169_catch_stall.py IP [BACKGROUND] - DEV-169: find WHERE the product loop is held. Sends a
 # hello every second while a background client runs every 3 s (settings | late_body:
 # headers, body 0.6 s later); the moment one hello has waited 1.5 s it presses Ctrl-C on the
-# brain's console and prints the traceback - the line the loop was stuck in. Stops the
+# brain's console and prints the traceback (BACKGROUND trickle: headers one byte / 50 ms) - the line the loop was stuck in. Stops the
 # product (reset the brain afterwards). Needs the console (no other listener).
 import glob, json, socket, sys, threading, time
 import serial
@@ -39,10 +39,24 @@ def call(op, late=0.0):
         pass
 
 
+def trickle():
+    head, body = req("hello")
+    try:
+        c = socket.create_connection((IP, 80), timeout=10)
+        for i in range(len(head)):
+            c.send(head[i:i + 1])
+            time.sleep(0.05)
+        c.close()
+    except Exception:
+        pass
+
+
 def background():
     while True:
         if BG == "late_body":
             threading.Thread(target=call, args=("hello", 0.6), daemon=True).start()
+        elif BG == "trickle":
+            threading.Thread(target=trickle, daemon=True).start()
         else:
             threading.Thread(target=call, args=("settings.get",), daemon=True).start()
         time.sleep(3)

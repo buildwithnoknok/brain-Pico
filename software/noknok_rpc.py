@@ -70,6 +70,7 @@ READ_POLL        = 0.001    # s every later read may wait. Not 0: a socket switc
 FIRST_WAIT       = 0.05     # s the first read of a new connection may wait (one per pass)
 SEND_TIMEOUT     = 1.0      # s one send() of the reply may wait (as noknok_rpc 0.5:
                             # normally ~0, the reply fits the send buffer)
+SEND_BUDGET      = 0.5      # s for the whole reply; then it is cut off (status.link "cut")
 SLOW_POLL_MS     = 50       # a poll longer than this counts in slow_polls
 LINK_CHECK_S     = 30       # how often service() looks at the WiFi link
 LINK_JOIN_S      = 5        # blocking budget for a FULL rejoin attempt
@@ -144,6 +145,45 @@ def _safe_server_class():
             return end + 4                   # answer now: the route says "body too large"
         return end + 4 + max(cl, 0)
 
+    try:
+        from errno import ECONNRESET as _ECONNRESET   # the library compares with this
+    except ImportError:
+        _ECONNRESET = 104
+
+    class _Bounded:
+        """The client socket as the library's reply code sees it, with one total
+        budget (SEND_BUDGET) for the whole reply. The library's send loop retries
+        "try again" (EAGAIN) without limit - on the bench (29 Oct) that held the
+        product loop 14-22 s while CircuitPython's network stack was short of
+        memory. Once the budget is used up, send() reports a reset connection: the
+        library then stops sending (silently) and closes the socket."""
+        def __init__(self, conn):
+            self.conn = conn
+            self.end = time.monotonic() + SEND_BUDGET
+            self.cut = False
+
+        def send(self, data):
+            left = self.end - time.monotonic()
+            if left <= 0:
+                self.cut = True
+                raise OSError(_ECONNRESET, "reply budget used up")   # the library gives up
+            self.conn.settimeout(max(0.01, min(SEND_TIMEOUT, left)))
+            try:
+                return self.conn.send(data)
+            except OSError as e:
+                if (e.args[0] if e.args else None) == 11:
+                    time.sleep(0.005)            # not now: the library will retry
+                raise
+
+        def recv_into(self, buf, n=0):
+            return self.conn.recv_into(buf, n) if n else self.conn.recv_into(buf)
+
+        def settimeout(self, t):
+            self.conn.settimeout(t)
+
+        def close(self):
+            self.conn.close()
+
     class SafeServer(Server):
         _noknok_pending = None           # [[conn, addr, bytes, deadline, fresh], ...] reading
 
@@ -206,15 +246,18 @@ def _safe_server_class():
         def _answer(self, conn, addr, raw):
             """Handler + reply, as the library's poll() does after its reads."""
             try:
-                request = Request(self, conn, addr, raw)
+                link = _Bounded(conn)
+                request = Request(self, link, addr, raw)
                 handler = self._find_handler(request.method, request.path)
                 response = self._handle_request(request, handler)
                 if response is None:
                     conn.close()
                     return REQUEST_HANDLED_NO_RESPONSE
                 self._set_default_server_headers(response)
-                conn.settimeout(SEND_TIMEOUT)        # blocking with a timeout, as the
-                response._send()                     # library does (it closes conn)
+                link.end = time.monotonic() + SEND_BUDGET   # the budget is for sending
+                response._send()                     # the library's way; it closes conn
+                if link.cut:
+                    _poll_stats["cut"] += 1
                 return REQUEST_HANDLED_RESPONSE_SENT
             except Exception:
                 try:
@@ -520,7 +563,7 @@ def _restart_http():
     except Exception as e:
         _logfn("[rpc] carrier restart failed: %r" % (e,))
 
-_poll_stats = {"max_ms": 0, "slow": 0, "n": 0}
+_poll_stats = {"max_ms": 0, "slow": 0, "n": 0, "cut": 0}
 
 def link_stats():
     """WiFi link counters + how long the app channel held the product loop:
@@ -528,7 +571,8 @@ def link_stats():
     slow_polls = polls over SLOW_POLL_MS since boot, polls = polls since boot."""
     st = {"drops": _link["drops"], "rejoins": _link["rejoins"],
           "backoff": _link.get("backoff"), "poll_max_ms": _poll_stats["max_ms"],
-          "slow_polls": _poll_stats["slow"], "polls": _poll_stats["n"]}
+          "slow_polls": _poll_stats["slow"], "polls": _poll_stats["n"],
+          "cut_replies": _poll_stats["cut"]}
     _poll_stats["max_ms"] = 0
     return st
 

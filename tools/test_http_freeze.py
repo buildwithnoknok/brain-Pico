@@ -128,7 +128,7 @@ class Listener:
             at, c = self.queue.pop(0)
             c.t0 = time.monotonic()
             return c, ("192.168.1.50", 40000)
-        raise OSError(11)
+        raise OSError(11, "try again")
 
 
 def make(cls):
@@ -217,7 +217,8 @@ print("\nnoknok_rpc._SafeServer: normal and slow requests are answered")
 longest, c, h, w = one([(0, HEAD + BODY)])
 check("complete request in one piece -> answered, loop held <= %d ms" % FAST,
       h == [BODY] and b'"ok": true' in c.sent and longest <= FAST, (longest, h))
-check("the reply is sent with timeout SEND_TIMEOUT", c.timeout_at_send == noknok_rpc.SEND_TIMEOUT,
+check("the reply is sent with a timeout <= SEND_TIMEOUT",
+      c.timeout_at_send is not None and 0 < c.timeout_at_send <= noknok_rpc.SEND_TIMEOUT,
       c.timeout_at_send)
 for gap in (0.2, 0.6, 1.5):
     longest, c, h, w = one([(0, HEAD), (gap, BODY)])
@@ -235,6 +236,36 @@ longest, cs, h, when = run(Safe, [(0, Client([(0.02, HEAD + BODY)]))], every=0.3
 check("data 20 ms after the connect -> answered in the same pass (< 0.1 s)",
       h == [BODY] and when and when[0] < 0.1 and longest <= FAST,
       (longest, [round(x, 2) for x in when]))
+
+print("\nnoknok_rpc._SafeServer: the reply has a total budget (the 30 Oct case)")
+
+
+class Spinner(Client):
+    """send() always says 'try again' at once - what CircuitPython did on the bench."""
+    def send(self, data):
+        raise OSError(11, "try again")
+
+
+def _big(request):
+    return Response(request, '{"ok": true, "x": "%s"}' % ("y" * 3000),
+                    content_type="application/json")
+
+
+srv, _ = make(Safe)
+srv._routes = []
+srv.route("/rpc", POST)(_big)
+sp = Spinner([(0, HEAD + BODY)])
+srv._sock = Listener([(0, sp)])
+t0 = time.monotonic()
+longest = 0
+while time.monotonic() - t0 < 3 and not sp.closed:
+    t1 = time.monotonic()
+    srv.poll()
+    longest = max(longest, (time.monotonic() - t1) * 1000)
+    time.sleep(0.01)
+check("a reply that never goes out ('try again' forever) -> cut after SEND_BUDGET, closed",
+      sp.closed and longest <= noknok_rpc.SEND_BUDGET * 1000 + FAST, (round(longest), sp.closed))
+check("... and counted in link_stats() cut_replies", noknok_rpc.link_stats()["cut_replies"] >= 1)
 
 print("\nnoknok_rpc._SafeServer: two clients at once (the DEV-169 case)")
 slow = Client([(0, HEAD), (1.0, BODY)])
