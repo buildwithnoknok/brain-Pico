@@ -20,9 +20,10 @@
 #
 # Only this program may read the console while it runs (no pico.py, no other listener):
 # reserve the rig first (~/BENCH_IN_USE).
-# Environment: DEV172_HOW=rpc|repl|both (default both); DEV172_CUT=1 recovers a hang by itself
+# Environment: DEV172_HOW=rpc|repl|both (default both); DEV172_RADIO=off|on|alt (see below); DEV172_CUT=1 recovers a hang by itself
 # with a real power cut (sudo uhubctl -l 2 off/on - only on a rig where the Pi powers the
-# brain, not with a PD charger on the PicoHub) instead of waiting for a human replug. Output in OUTDIR (default ~/dev172):
+# brain, not with a PD charger on the PicoHub) instead of waiting for a human replug;
+# sudo needs BENCH_SUDO_PW in the environment or passwordless sudo. Output in OUTDIR (default ~/dev172):
 #   console.log  every console byte, each line stamped with the Pi's clock
 #   cycles.jsonl one JSON line per cycle (the result)
 #   run.log      human-readable progress
@@ -35,13 +36,20 @@ OUT = os.path.expanduser(sys.argv[3] if len(sys.argv) > 3 else "~/dev172")
 PORT = "/dev/serial/by-id/usb-Raspberry_Pi_Pico*-if00"
 RECOVER_S = 180
 HOW = os.environ.get("DEV172_HOW", "both")
+# DEV-179 A/B: DEV172_RADIO=off (default: radio off before the reset, as shipped) | on (plain
+# reset, radio still up) | alt (alternate per cycle). Applies to app reboots (rpc) only;
+# needs code.py 0.38+ with the reboot op's radio_off arg.
+RADIO = os.environ.get("DEV172_RADIO", "off")
 CUT = os.environ.get("DEV172_CUT") == "1"
 
 
 def power_cut():
+    # sudo password from BENCH_SUDO_PW (never in a file), else passwordless sudo
+    pw = os.environ.get("BENCH_SUDO_PW")
     for a in ("off", "on"):
-        subprocess.run("echo raspberry | sudo -S -p '' /usr/sbin/uhubctl -l 2 -a " + a,
-                       shell=True, capture_output=True, timeout=30)
+        subprocess.run(["sudo", "-S", "-p", "", "/usr/sbin/uhubctl", "-l", "2", "-a", a],
+                       input=(pw + chr(10)) if pw else "", text=True,
+                       capture_output=True, timeout=30)
         if a == "off":
             time.sleep(4)
 os.makedirs(OUT, exist_ok=True)
@@ -213,7 +221,9 @@ def main():
             rec["repl_prompt"] = ">>>" in con.tail[-400:]
             con.send(b"import microcontroller; microcontroller.reset()\r\n")
         else:
-            rec["rpc_reply"] = try_rpc("reboot", 4)
+            radio_off = RADIO == "off" or (RADIO == "alt" and i % 2 == 0)
+            rec["radio_off"] = radio_off
+            rec["rpc_reply"] = try_rpc("reboot", 4, radio_off=radio_off)
         t_ok, h = wait_hello(RECOVER_S)
         rel = lambda x: round(x - t0, 2) if x else None
         rec.update(port_gone_s=rel(con.gone_at), port_back_s=rel(con.back_at),

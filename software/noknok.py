@@ -2991,8 +2991,10 @@ def factory_reset(delay=0.0):
     hard_reset()
 
 
-def hard_reset():
+def hard_reset(radio_off=True):
     """microcontroller.reset() with the WiFi radio switched off first (DEV-172).
+    radio_off=False is the plain reset, for the bench A/B only (DEV-179: the
+    app's `reboot` op with {"radio_off": false}); products never pass it.
 
     Bench, 29 Oct 2026: a reset while the radio was connected and busy left the
     brain hung on the next boot (USB back, then silent, Ctrl-C ignored; only a
@@ -3001,12 +3003,13 @@ def hard_reset():
     power-cycle the CYW43, so it is put down in an orderly way first. Every
     reset noknok code makes on purpose goes through here."""
     import microcontroller
-    try:
-        import wifi
-        wifi.radio.enabled = False
-        time.sleep(0.2)
-    except Exception:
-        pass
+    if radio_off:
+        try:
+            import wifi
+            wifi.radio.enabled = False
+            time.sleep(0.2)
+        except Exception:
+            pass
     microcontroller.reset()
 
 

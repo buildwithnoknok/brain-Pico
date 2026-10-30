@@ -1292,14 +1292,17 @@ def _h_status(args, msg):
     }
 
 def _h_reboot(args, msg):
-    """Reply first, reset after the response has gone out (deferred)."""
-    log("[rpc] reboot requested by the app")
+    """Reply first, reset after the response has gone out (deferred).
+    args.radio_off (bool, default true): false = plain reset with the radio
+    still up - only for the DEV-179 bench A/B, the app never sends it."""
+    radio_off = args.get("radio_off", True) is not False
+    log("[rpc] reboot requested by the app" + ("" if radio_off else " (radio left on)"))
     def _reboot():
         nk.flush_settings()              # the last few seconds of changes
         time.sleep(0.5)                  # let the reply leave the radio first
-        nk.hard_reset()                  # radio off first (DEV-172)
+        nk.hard_reset(radio_off)         # radio off first (DEV-172)
     rpc.defer(_reboot)
-    return {"rebooting": True}
+    return {"rebooting": True, "radio_off": radio_off}
 
 def _h_factory_reset(args, msg):
     """Same wipe as the knob-hold gesture (noknok.factory_reset), deferred so

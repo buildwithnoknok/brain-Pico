@@ -6,6 +6,7 @@ Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
 ## code.py 0.38 + noknok.py 1.24 - 2026-10-29
 
+- DEV-179 - bench switch for the radio-off A/B: the app's `reboot` op takes `radio_off` (default true; `false` = plain reset with the radio still up, never sent by the app) and replies with the value used; `nk.hard_reset(radio_off=True)`. `tools/bench/bench_dev172_reset_loop.py` gets `DEV172_RADIO=off|on|alt` (alternates per cycle) and reads the sudo password from `BENCH_SUDO_PW` instead of the file. Breaking: no.
 - DEV-172 - after a restart the brain sometimes did not start at all (no light, no app, only unplugging helped): on the bench 3 of 26 restarts made while the WiFi was busy, 0 of 25 made with the WiFi already off. Every restart the brain makes on purpose (app "restart", product switch, end of setup, the restart before the product) now switches the WiFi radio off first. Under test on the bench; the root cause inside CircuitPython is still being traced with a debug probe. Breaking: no.
 
 ## noknok_rpc.py 0.5 - 2026-10-29
