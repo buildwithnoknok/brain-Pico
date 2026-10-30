@@ -1,5 +1,12 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.37 (safe mode no longer leaves the lamp dark — DEV-154)
+# Version: 0.39 (status sends at most 10 events per reply — DEV-169)
+#
+# v0.39 changes (Sue): DEV-169 — `status` returns at most STATUS_EVENTS (10) events
+#   per reply: the newest 10 without `since`, ev[since:since+10] with it; the app
+#   pages with `since` and `events_total`. The full history made the reply ~3.7 KB,
+#   and with code.py loaded CircuitPython could not send that: the reply stopped
+#   after its header and the brain's network stopped for ~6 s (no ping), and under
+#   noknok_rpc 0.6 it stayed broken (bench, Pi4RFID, 30 Oct). (0.38 = DEV-172.)
 #
 # v0.37 changes (Sue): DEV-154 — new safemode.py: when CircuitPython starts in
 #   safe mode after a core crash (hard fault, brownout, ...), code.py never runs
@@ -448,7 +455,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.37"
+CODE_VERSION = "0.39"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -1248,13 +1255,20 @@ def _h_hello(args, msg):
         "ops": rpc.dispatcher().ops(),
     }
 
+STATUS_EVENTS = 10      # events per `status` reply (keeps it under rpc.MAX_REPLY)
+
 def _h_status(args, msg):
     """Phase-1 subset of `status` (DEV-36 adds per-module firmware state):
-    event history, crash strikes, storage mode, memory. `since` (int) skips
-    the first N events so the app can page."""
+    event history, crash strikes, storage mode, memory. At most STATUS_EVENTS
+    events per reply (DEV-169: a bigger reply did not get out): without `since`
+    the newest ones, with `since` (int) ev[since:since+STATUS_EVENTS] so the app
+    can page; `events_total` says how many there are."""
     import gc
     ev = events()
-    since = int(args.get("since") or 0)
+    if args.get("since") is None:
+        since = max(0, len(ev) - STATUS_EVENTS)
+    else:
+        since = max(0, int(args.get("since") or 0))
     c = nk.conductor()
     modules = []
     power = None
@@ -1283,7 +1297,8 @@ def _h_status(args, msg):
         "last_bad_request": rpc._last_bad,
         "modules": modules,
         "power": power,                  # PicoHub power status or null (DEV-123)
-        "events": ev[since:],
+        "events": ev[since:since + STATUS_EVENTS],
+        "events_since": since,
         "events_total": len(ev),
     }
 

@@ -49,10 +49,11 @@
 # reserved; Dispatcher.authorize is the hook pairing / authorisation (DEV-35)
 # plugs into.
 
+import gc
 import json
 import time
 
-__version__ = "0.6"
+__version__ = "0.6.1"
 
 SERVICE_INTERVAL = 0.05     # s between carrier polls from the implicit hook
 SOCKET_TIMEOUT   = 1.0      # s a stalled client may hold poll(). 0.2 s dropped the
@@ -71,6 +72,9 @@ FIRST_WAIT       = 0.05     # s the first read of a new connection may wait (one
 SEND_TIMEOUT     = 1.0      # s one send() of the reply may wait (as noknok_rpc 0.5:
                             # normally ~0, the reply fits the send buffer)
 SEND_BUDGET      = 0.5      # s for the whole reply; then it is cut off (status.link "cut")
+MAX_REPLY        = 3000     # bytes: keep replies under this. Bench 30 Oct (Pi4RFID, code.py
+                            # loaded): 3165 B went out in 0.15 s, a 3663 B reply stalled
+                            # ~6 s with the network stack stopped (no ping) - see DEV-169
 SLOW_POLL_MS     = 50       # a poll longer than this counts in slow_polls
 LINK_CHECK_S     = 30       # how often service() looks at the WiFi link
 LINK_JOIN_S      = 5        # blocking budget for a FULL rejoin attempt
@@ -246,6 +250,14 @@ def _safe_server_class():
         def _answer(self, conn, addr, raw):
             """Handler + reply, as the library's poll() does after its reads."""
             try:
+                # Free Python memory BEFORE the handler and the reply allocate theirs.
+                # CircuitPython 10 grows the Python heap on demand, and on the bench
+                # the network died the moment the heap ran short (30 Oct). With
+                # code.py loaded, one oversized `status` reply (~3.7 KB) left the
+                # network broken for good under 0.6 (no ping, every reply cut after
+                # its header); with this collect it recovered after each call. The
+                # size itself is capped in code.py (MAX_REPLY below, DEV-169).
+                gc.collect()
                 link = _Bounded(conn)
                 request = Request(self, link, addr, raw)
                 handler = self._find_handler(request.method, request.path)
@@ -354,6 +366,7 @@ class HttpCarrier:
 
         @srv.route("/rpc", POST)
         def _rpc(request: Request):
+            body = None                  # the except below reads it (was a NameError)
             try:
                 body = self._full_body(request)
                 if isinstance(body, (bytes, bytearray, memoryview)):
