@@ -3,8 +3,8 @@
 #
 # dev169_server_trace.py - DEV-169, runs ON the brain (pico.py run, product stopped): starts
 # the /rpc carrier alone (hello only) and polls it every 10 ms for 40 s, printing one line
-# whenever the server's state changes: open connections reading / replying, bytes received,
-# reply bytes sent, poll result, poll duration. Send requests from the Pi meanwhile
+# whenever the server's state changes: open connections reading (bytes received so far), poll
+# result, poll duration. Send requests from the Pi meanwhile
 # (bench_dev169_quick.py) and read where the time goes. Prints no credentials.
 import json, time
 import wifi, socketpool
@@ -29,11 +29,10 @@ while time.monotonic() - t_start < 40:
         r = "EXC %r" % (e,)
     dt = (time.monotonic_ns() - t0) // 1000
     pend = srv._noknok_pending or []
-    out = srv._noknok_out or []
-    st = ([len(p[2]) for p in pend], [(o[2], len(o[1])) for o in out], r)
+    st = ([len(p[2]) for p in pend], r)
     if st != last or dt > 20000:
-        print("%8.3f poll %5d us  reading %s  replying %s  -> %s"
-              % (time.monotonic() - t_start, dt, st[0], st[1], r))
+        print("%8.3f poll %5d us  reading %s  -> %s"
+              % (time.monotonic() - t_start, dt, st[0], r))
         last = st
     time.sleep(0.01)
 print("done")
