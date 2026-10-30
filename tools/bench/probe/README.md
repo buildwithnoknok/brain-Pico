@@ -30,6 +30,7 @@ the scripts. Never write the password into a file in this repo.
 | `usbmon_dev.py FILE DEV...` | Per USB device number: console bulk-IN completions, whether data ever arrived, control requests. |
 | `usbmon_tl.py FILE DEV [N]` | Compact timeline of one device from a usbmon text trace. |
 | `dev173_probe_loop.py IP N [OUT]` | Ctrl-C into the running product N times, with the port re-opened before each Ctrl-C (pico.py style). On a silent console: dump + SWD reset. |
+| `cdc_timeout_test.py [HOLD_S]` | Workaround-B check (stops the product): the host keeps the console open but stops reading; a `usb_cdc.console` write with a 0.2 s timeout must give up, while `print()` blocks until the host reads again. |
 | `cp_build.sh` (WSL) | Builds CircuitPython 10.3.1 for `raspberry_pi_pico2_w` with Arm GCC 15.2.Rel1 (Adafruit CI's compiler) to get `firmware.elf`, and compares it with the official .uf2. |
 | `cp_a2l.sh ADDR...` (WSL) | Turns addresses into function names from that build. |
 
