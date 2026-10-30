@@ -94,8 +94,10 @@ def traffic(seconds, with_settings):
 
 def cut():
     for a in ("off", "on"):
-        subprocess.run("echo raspberry | sudo -S -p '' /usr/sbin/uhubctl -l 2 -a " + a,
-                       shell=True, capture_output=True, timeout=30)
+        pw = os.environ.get("BENCH_SUDO_PW")      # never in a file; else passwordless sudo
+        subprocess.run(["sudo", "-S", "-p", "", "/usr/sbin/uhubctl", "-l", "2", "-a", a],
+                       input=(pw + chr(10)) if pw else "", text=True,
+                       capture_output=True, timeout=30)
         if a == "off":
             time.sleep(4)
 
