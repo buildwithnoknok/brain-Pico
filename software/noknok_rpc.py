@@ -487,7 +487,7 @@ _logfn    = print
 _err_next = 0.0             # rate limit for poll-error log lines
 _link     = {"ssid": None, "password": None, "next": 0.0, "was_up": True,
              "drops": 0, "rejoins": 0, "port": 80, "backoff": LINK_CHECK_S,
-             "retry_at": 0.0, "on_up": None, "gw_miss": 0, "rssi": None}
+             "retry_at": 0.0, "on_up": None, "gw_miss": 0, "gw_ok": 0}
 
 def set_wifi_credentials(ssid, password, port=80, on_up=None):
     """Let service() re-join the home network after a router reboot, or join it
@@ -512,12 +512,9 @@ def _ping_gateway():
     30-min outage the brain rejoined but stayed unreachable for 13 more minutes -
     it only ever answers, and the network kept a stale path to it. Sending
     something ourselves refreshes that path. Also the cheapest health check:
-    gw_miss counts the router pings that did not come back. Never raises."""
-    try:
-        import wifi
-        _link["rssi"] = wifi.radio.ap_info.rssi if wifi.radio.ap_info else None
-    except Exception:
-        pass
+    gw_ok / gw_miss count the router pings that came back / did not. (No RSSI:
+    wifi.radio.ap_info is not implemented on the Pico 2 W, CP 10.3.1.) Never
+    raises."""
     try:
         import wifi
         gw = wifi.radio.ipv4_gateway
@@ -526,8 +523,7 @@ def _ping_gateway():
         t = wifi.radio.ping(gw, timeout=GW_PING_S)
     except Exception:
         t = None
-    if t is None:
-        _link["gw_miss"] += 1
+    _link["gw_ok" if t is not None else "gw_miss"] += 1
     return t
 
 def _link_up(how):
@@ -543,9 +539,9 @@ def _link_up(how):
         # it off, but the carrier is often reused after a rejoin (DEV-168).
         no_power_save(_logfn)
         t = _ping_gateway()
-        _logfn("[wifi] %s — %s (router %s, rssi %s)" % (
+        _logfn("[wifi] %s — %s (router %s)" % (
             how, wifi.radio.ipv4_address,
-            "%d ms" % (t * 1000) if t is not None else "no answer", _link["rssi"]))
+            "%d ms" % (t * 1000) if t is not None else "no answer"))
     if _carrier is None or _carrier.server is None:
         _restart_http()                     # first time online, or after a drop
     if back and _link["on_up"] is not None:
@@ -622,7 +618,7 @@ def link_stats():
           "backoff": _link.get("backoff"), "poll_max_ms": _poll_stats["max_ms"],
           "slow_polls": _poll_stats["slow"], "polls": _poll_stats["n"],
           "cut_replies": _poll_stats["cut"], "gw_miss": _link["gw_miss"],
-          "rssi": _link["rssi"]}
+          "gw_ok": _link["gw_ok"]}
     _poll_stats["max_ms"] = 0
     return st
 
