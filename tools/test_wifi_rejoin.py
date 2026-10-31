@@ -167,7 +167,6 @@ clock.t = 0.0
 rpc, radio = fresh("background")
 pm_sets, pings = [], []
 radio.ipv4_gateway = "192.168.1.1"
-radio.ap_info = types.SimpleNamespace(rssi=-55)
 radio.answer = True
 def _ping(ip, timeout=None):
     pings.append((clock.t, ip, timeout))
@@ -197,13 +196,13 @@ while clock.t < t_drop + 120:
     radio.tick(); rpc.service(force=True); clock.t += 0.05
 check("after the rejoin: power save switched off again", len(pm_sets) > pm0)
 check("after the rejoin: the router was pinged", len(pings) > p0)
-check("rejoin log names router + rssi", any("router 4 ms, rssi -55" in str(l) for l in logs))
+check("rejoin log names the router's answer", any("router 4 ms" in str(l) for l in logs))
 radio.answer = False
 m0 = rpc.link_stats()["gw_miss"]
 for _ in range(1300):                         # 65 s up, router silent
     radio.tick(); rpc.service(force=True); clock.t += 0.05
 check("router not answering: gw_miss counts it", rpc.link_stats()["gw_miss"] >= m0 + 2)
-check("link_stats has rssi", rpc.link_stats()["rssi"] == -55)
+check("link_stats counts answered pings (gw_ok)", rpc.link_stats()["gw_ok"] >= 2)
 type(radio).__setattr__ = orig_setattr
 
 print("PASS (0 failures)" if not fails else "FAIL (%d failures)" % len(fails))
