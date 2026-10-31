@@ -7,6 +7,7 @@ Convention: Confluence "Development Conventions" (SD space, page 120160257).
 ## noknok_rpc.py 0.6.1 + code.py 0.39 - 2026-10-30
 
 - DEV-169 (Bob's retest on Pi4RFID) - with noknok_rpc 0.6, about a minute after boot every app reply stopped after its header and the brain no longer answered ping. Cause: the bench asked for `status`, whose reply carried the whole event history (~3.7 KB). With code.py loaded, CircuitPython could not get a reply that big out: it stalled ~6 s with the network stopped, and afterwards the network stayed broken. Measured: 3165 bytes go out in 0.15 s, 3663 bytes never did. Fix: `status` returns at most 10 events per reply (newest 10 by default, paging with `since`; new field `events_since`), so it stays around 2.3 KB. noknok_rpc also frees Python memory before every reply, and the brain then recovered between calls even with the big reply. Also fixed: a request whose body could not be read produced a NameError in the log instead of the real cause. Bench after the fix: 221 of 226 calls ok over 5 min with `status` every 5th call (before: 78 of 112, network down). App replies (hello ~0.8 KB, settings.get under 0.5 KB) were never affected. Breaking: `status` no longer returns all events in one reply (the app does not use `status` yet).
+- DEV-181 - `status` also reports `mem_alloc` (bytes in use) next to `mem_free`, so a real leak (in use keeps rising) can be told apart from the heap changing size. Breaking: no.
 
 ## noknok_rpc.py 0.6 - 2026-10-29
 

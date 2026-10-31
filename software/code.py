@@ -1292,6 +1292,7 @@ def _h_status(args, msg):
         "store": nk.store().backend,
         "drive_visible": nk.usb_drive_visible(),
         "mem_free": gc.mem_free(),
+        "mem_alloc": gc.mem_alloc(),     # DEV-181: in use; free + in use = heap size
         "ip": str(wifi.radio.ipv4_address) if wifi.radio.connected else None,
         "link": rpc.link_stats(),
         "last_bad_request": rpc._last_bad,
