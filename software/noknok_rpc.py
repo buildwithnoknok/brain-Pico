@@ -82,6 +82,7 @@ LINK_KICK_S      = 0.5      # budget of a kick: start the join, finish in the ba
 LINK_FULL_EVERY  = 0        # 0 = kicks only (bench-proven 23 Oct: kicks finish in the
                             # background); N = every Nth attempt is a full LINK_JOIN_S one
 LINK_POLL_S      = 1.0      # while the link is down: how often to look (cheap)
+GW_PING_S        = 0.2      # DEV-168: budget of the router ping after a join / per link check
 LINK_MAX_S       = 60       # longest pause between attempts. DEV-168: was 300 s, so a
                             # brain stayed offline up to 5 min after the WiFi was back;
                             # each attempt costs the product a LINK_KICK_S pause
@@ -486,7 +487,7 @@ _logfn    = print
 _err_next = 0.0             # rate limit for poll-error log lines
 _link     = {"ssid": None, "password": None, "next": 0.0, "was_up": True,
              "drops": 0, "rejoins": 0, "port": 80, "backoff": LINK_CHECK_S,
-             "retry_at": 0.0, "on_up": None}
+             "retry_at": 0.0, "on_up": None, "gw_miss": 0, "rssi": None}
 
 def set_wifi_credentials(ssid, password, port=80, on_up=None):
     """Let service() re-join the home network after a router reboot, or join it
@@ -506,6 +507,29 @@ def _radio_up():
     import wifi
     return bool(wifi.radio.connected) and wifi.radio.ipv4_address is not None
 
+def _ping_gateway():
+    """One ping to the router, at most GW_PING_S. DEV-168 (bench 31 Oct): after a
+    30-min outage the brain rejoined but stayed unreachable for 13 more minutes -
+    it only ever answers, and the network kept a stale path to it. Sending
+    something ourselves refreshes that path. Also the cheapest health check:
+    gw_miss counts the router pings that did not come back. Never raises."""
+    try:
+        import wifi
+        _link["rssi"] = wifi.radio.ap_info.rssi if wifi.radio.ap_info else None
+    except Exception:
+        pass
+    try:
+        import wifi
+        gw = wifi.radio.ipv4_gateway
+        if gw is None:
+            return None
+        t = wifi.radio.ping(gw, timeout=GW_PING_S)
+    except Exception:
+        t = None
+    if t is None:
+        _link["gw_miss"] += 1
+    return t
+
 def _link_up(how):
     """The link is (back) up: reset the backoff, rebuild the carrier, run on_up."""
     _link["backoff"] = LINK_CHECK_S
@@ -514,7 +538,14 @@ def _link_up(how):
     _link["was_up"] = True
     if back:
         import wifi
-        _logfn("[wifi] %s — %s" % (how, wifi.radio.ipv4_address))
+        # A join may bring the radio's power save back; with it the brain only
+        # listens now and then (lost pings, empty bodies). start_http() switched
+        # it off, but the carrier is often reused after a rejoin (DEV-168).
+        no_power_save(_logfn)
+        t = _ping_gateway()
+        _logfn("[wifi] %s — %s (router %s, rssi %s)" % (
+            how, wifi.radio.ipv4_address,
+            "%d ms" % (t * 1000) if t is not None else "no answer", _link["rssi"]))
     if _carrier is None or _carrier.server is None:
         _restart_http()                     # first time online, or after a drop
     if back and _link["on_up"] is not None:
@@ -536,8 +567,11 @@ def _watch_link(now):
         return
     if up:
         _link["next"] = now + LINK_CHECK_S
+        back = not _link["was_up"]
         _link_up("link is back" if _link["rejoins"] == 0 else
                  "joined (attempt %d)" % _link["rejoins"])
+        if not back:
+            _ping_gateway()                     # keep the network's path to us fresh
         return
     if _link["was_up"]:
         _link["drops"] += 1
@@ -587,7 +621,8 @@ def link_stats():
     st = {"drops": _link["drops"], "rejoins": _link["rejoins"],
           "backoff": _link.get("backoff"), "poll_max_ms": _poll_stats["max_ms"],
           "slow_polls": _poll_stats["slow"], "polls": _poll_stats["n"],
-          "cut_replies": _poll_stats["cut"]}
+          "cut_replies": _poll_stats["cut"], "gw_miss": _link["gw_miss"],
+          "rssi": _link["rssi"]}
     _poll_stats["max_ms"] = 0
     return st
 

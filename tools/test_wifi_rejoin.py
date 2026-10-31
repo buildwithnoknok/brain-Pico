@@ -161,5 +161,50 @@ check("drop while online: counted once", rpc.link_stats()["drops"] == 1)
 check("drop while online: rejoined", radio.connected and rpc._link["was_up"])
 check("drop while online: on_up ran once (after the rejoin)", len(ups) == 1)
 
+# DEV-168 (bench 31 Oct): after a rejoin the brain switches power save off again and pings
+# the router; while up, every link check pings the router once (counted when it misses)
+clock.t = 0.0
+rpc, radio = fresh("background")
+pm_sets, pings = [], []
+radio.ipv4_gateway = "192.168.1.1"
+radio.ap_info = types.SimpleNamespace(rssi=-55)
+radio.answer = True
+def _ping(ip, timeout=None):
+    pings.append((clock.t, ip, timeout))
+    return 0.004 if radio.answer else None
+radio.ping = _ping
+import wifi as _wifi
+_wifi.PowerManagement = types.SimpleNamespace(NONE="none")
+orig_setattr = type(radio).__setattr__
+def _track(self, k, v):
+    if k == "power_management":
+        pm_sets.append(clock.t)
+    orig_setattr(self, k, v)
+type(radio).__setattr__ = _track
+radio._done()
+rpc.set_wifi_credentials("home", "pw", 80)
+radio.net_at = 0.0
+for _ in range(1000):                         # 50 s up
+    radio.tick(); rpc.service(force=True); clock.t += 0.05
+n_up = len(pings)
+check("while up: router pinged at every link check (%d in 50 s)" % n_up, n_up >= 1)
+check("router ping uses GW_PING_S", all(p[2] == rpc.GW_PING_S for p in pings))
+radio.connected = False; radio.ipv4_address = None; radio.join_started = None
+radio.net_at = clock.t + 20
+pm0, p0 = len(pm_sets), len(pings)
+t_drop = clock.t
+while clock.t < t_drop + 120:
+    radio.tick(); rpc.service(force=True); clock.t += 0.05
+check("after the rejoin: power save switched off again", len(pm_sets) > pm0)
+check("after the rejoin: the router was pinged", len(pings) > p0)
+check("rejoin log names router + rssi", any("router 4 ms, rssi -55" in str(l) for l in logs))
+radio.answer = False
+m0 = rpc.link_stats()["gw_miss"]
+for _ in range(1300):                         # 65 s up, router silent
+    radio.tick(); rpc.service(force=True); clock.t += 0.05
+check("router not answering: gw_miss counts it", rpc.link_stats()["gw_miss"] >= m0 + 2)
+check("link_stats has rssi", rpc.link_stats()["rssi"] == -55)
+type(radio).__setattr__ = orig_setattr
+
 print("PASS (0 failures)" if not fails else "FAIL (%d failures)" % len(fails))
 sys.exit(1 if fails else 0)
