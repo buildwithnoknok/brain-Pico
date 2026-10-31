@@ -1,6 +1,10 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.38 (deliberate resets switch the WiFi radio off first — DEV-172)
+# Version: 0.38 (console output never blocks — DEV-178; radio off before resets — DEV-172)
 #
+# v0.38 changes (Sue): DEV-178 — log(), event() and crash tracebacks go through
+#   nk._print() (usb_cdc console write, never waits) instead of print()/sys.stdout,
+#   and the CircuitPython status bar is off: a console the host does not read, or
+#   that TinyUSB lost (DEV-172), no longer hangs the product.
 # v0.38 changes (Sue): DEV-172 — the app's reboot, a product switch, the end of
 #   setup and the hard reset before the product all go through nk.hard_reset():
 #   WiFi radio off, then microcontroller.reset(). Bench 29 Oct: resets with the
@@ -445,6 +449,13 @@ import sys
 import time
 import supervisor
 import microcontroller
+try:
+    # The status bar (the "Wi-Fi: ... | code.py" title line) is written through the
+    # same blocking path as print(); a jammed console hung the brain there too
+    # (DEV-172/178). Off for the whole run.
+    supervisor.status_bar.console = False
+except Exception:
+    pass
 import wifi
 import socketpool
 import ssl
@@ -512,7 +523,7 @@ def log(msg):
     (see above). Every line is timestamped (uptime, plus wall-clock once NTP
     has synced)."""
     line = _timestamp() + str(msg)
-    sys.stdout.write(line + "\n")          # console output
+    nk._print(line)                        # console output, never blocks (DEV-178)
     _log_ring.append(line)
     if len(_log_ring) > LOG_RING_LINES:
         del _log_ring[0]
@@ -538,7 +549,7 @@ def event(msg):
     assignments [ROLE], factory resets [RESET], ...), so a single module's
     history is easy to find. Best-effort; never raises."""
     line = _timestamp() + str(msg)
-    sys.stdout.write(line + "\n")
+    nk._print(line)                        # never blocks (DEV-178)
     nk.store().append(EVENTS_KEY, line, EVENTS_MAX)   # Store, never the FAT (DEV-18)
 
 def events():
@@ -2752,7 +2763,7 @@ def _boot_hold_reset_check():
             return                  # the normal power-on
 
         # Seen: feedback on everything that can give it, then keep watching.
-        print("[reset] button held at power-on — keep holding %.0f s to factory-reset"
+        nk._print("[reset] button held at power-on — keep holding %.0f s to factory-reset"
               % BOOT_HOLD_S)
         for b in c.ledbutton:
             b.set_color(255, 255, 255)
@@ -2762,7 +2773,7 @@ def _boot_hold_reset_check():
         while time.monotonic() < deadline:
             time.sleep(BOOT_HOLD_POLL_S)
             if not held():
-                print("[reset] released — normal boot")
+                nk._print("[reset] released — normal boot")
                 for b in c.ledbutton:
                     b.led_off()
                 return
@@ -2788,7 +2799,7 @@ def _boot_hold_reset_check():
         event("[RESET] factory reset via boot-hold")
         nk.factory_reset(delay=0.4)
     except Exception as e:
-        print(f"[reset] boot-hold check skipped: {e!r}")
+        nk._print(f"[reset] boot-hold check skipped: {e!r}")
     finally:
         # Free the pins; the reload that follows starts a fresh VM anyway.
         try:
@@ -2822,7 +2833,7 @@ def run_product(connected):
         log(f"[crash] product.py {type(e).__name__}: {e}  (strike {strikes}/{CRASH_MAX})")
         try:
             import traceback
-            traceback.print_exception(e)     # full trace to the serial console
+            traceback.print_exception(e, file=nk.console_file)   # never blocks (DEV-178)
         except Exception:
             pass
         event(f"[CRASH] product.py {type(e).__name__}: {str(e)[:120]}  "
@@ -2970,7 +2981,7 @@ def main():
         except Exception:
             pass
         _boot_hold_reset_check()         # v0.18: button held from power-on? wipe + AP
-        print("[boot] power-on — reloading once (cold-boot WiFi workaround, see main())")
+        nk._print("[boot] power-on — reloading once (cold-boot WiFi workaround, see main())")
         supervisor.reload()
     log_new_boot()
     log("[boot] noknok Pico W — starting")

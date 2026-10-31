@@ -130,7 +130,10 @@
 #             the product declared with s.defaults(); any other key is rejected
 #             ("unknown setting"), never stored, never handed to the product. The
 #             product's own s.set() is unchanged.
-# v1.24 (Sue): DEV-172 — hard_reset(): every deliberate reset switches the WiFi
+# v1.24 (Sue): DEV-178 — all output goes through _print(): usb_cdc.console.write
+#             with write_timeout 0, never print() (which waits forever when the
+#             host does not read). console_file for tracebacks.
+#             DEV-172 — hard_reset(): every deliberate reset switches the WiFi
 #             radio off first (a reset with the radio busy hung the next boot on
 #             the bench). factory_reset() uses it.
 #
@@ -159,6 +162,47 @@ try:
     import storage            # CircuitPython only; absent on a host Python
 except ImportError:
     storage = None
+
+
+# ── Console output that never blocks (DEV-178, DEV-172 workaround B) ─────────
+# CircuitPython 10's print() waits without a timeout until the USB host takes
+# the bytes. When the host has the port open but does not read (a terminal left
+# open, CP issue #10814), or when TinyUSB loses the console's IN transfer
+# (DEV-172), the next print() hangs the whole brain: lamp, buttons, WiFi, app.
+# All noknok output (this library, code.py's log(), crash tracebacks) goes
+# through _print() instead: usb_cdc.console.write() with write_timeout = 0
+# writes what fits right now and never waits (bench, 31 Oct: an unread port
+# gives up at once instead of print()'s 13 s). A jammed console just loses
+# lines; code.py keeps the last ones in its RAM ring. A maker's own print() and
+# the REPL are not changed. On a host Python (tests) it falls back to print().
+try:
+    import usb_cdc
+    _console = usb_cdc.console        # None when boot.py disabled the console
+    if _console is not None:
+        _console.write_timeout = 0
+except (ImportError, AttributeError):
+    _console = False                  # not CircuitPython: plain print()
+
+def _print(*args, sep=" ", end="\n"):
+    """print() for noknok's own output: never blocks (see above)."""
+    if _console is False:
+        print(*args, sep=sep, end=end)
+        return
+    if _console is None:
+        return
+    try:
+        text = sep.join(str(a) for a in args) + end
+        _console.write(text.replace("\n", "\r\n").encode("utf-8"))
+    except Exception:
+        pass                          # output must never break the product
+
+class _ConsoleFile:
+    """File-like wrapper so traceback.print_exception(e, file=...) uses _print."""
+    def write(self, s):
+        _print(s, end="")
+        return len(s)
+
+console_file = _ConsoleFile()
 
 
 # ── App channel servicing hook (DEV-34) ───────────────────────────────────────
@@ -231,7 +275,7 @@ def env_pin(key, default):
     try:
         return getattr(board, str(name).strip())
     except AttributeError:
-        print(f"[settings] {key}={name!r} is not a pin on this board — using default")
+        _print(f"[settings] {key}={name!r} is not a pin on this board — using default")
         return default
 
 
@@ -330,7 +374,7 @@ def _remember_pins(cfg):
         if st.get(PINS_STORE_KEY) != rec:
             st.set(PINS_STORE_KEY, rec)
     except Exception as e:
-        print("[settings] could not keep the last-known-good pins (%r)" % (e,))
+        _print("[settings] could not keep the last-known-good pins (%r)" % (e,))
 
 def _pin_name(pin):
     """'GP10' for board.GP10 (best effort, for messages)."""
@@ -528,7 +572,7 @@ def clean_tmp(*roots):
         return 0
     n = remove(*orphans)
     if n:
-        print(f"[fs] removed {n} orphan .tmp file(s) left by an interrupted write")
+        _print(f"[fs] removed {n} orphan .tmp file(s) left by an interrupted write")
     return n
 
 # Field-written files live in their own directory. Their directory entries then
@@ -704,7 +748,7 @@ class Store:
                     self._seq, self._data, self._fram_slot = found
                     return
             except Exception as e:
-                print("[store] FRAM probe failed (%r) — using nvm" % (e,))
+                _print("[store] FRAM probe failed (%r) — using nvm" % (e,))
         self._backend = "nvm"
         try:
             import microcontroller
@@ -766,7 +810,7 @@ class Store:
             self._flush()
             return True
         except Exception as e:
-            print("[store] write failed: %r" % (e,))
+            _print("[store] write failed: %r" % (e,))
             return False
 
     def append(self, key, item, max_items=40):
@@ -782,7 +826,7 @@ class Store:
             try:
                 self._flush(); return True
             except Exception as e:
-                print("[store] write failed: %r" % (e,)); return False
+                _print("[store] write failed: %r" % (e,)); return False
         return True
 
     def wipe(self):
@@ -924,7 +968,7 @@ class Settings:
             self._defs = dict(rec.get("defaults") or {})
             self._seq  = int(rec.get("seq") or 0)
         elif isinstance(rec, dict):
-            print("[settings] stored values belong to %r, not %r - starting from defaults"
+            _print("[settings] stored values belong to %r, not %r - starting from defaults"
                   % (rec.get("product"), tag))
 
     # ── product API ──────────────────────────────────────────────────────────
@@ -934,7 +978,7 @@ class Settings:
         touched = False
         for k, v in defs.items():
             if _check_value(k, v) is not None:
-                print("[settings] default %r rejected: %s" % (k, _check_value(k, v)))
+                _print("[settings] default %r rejected: %s" % (k, _check_value(k, v)))
                 continue
             if self._defs.get(k) != v or k not in self._defs:
                 self._defs[k] = v
@@ -953,16 +997,16 @@ class Settings:
         """Device-side change (a knob, the product). Persisted later — see
         _tick(). Returns True if the value changed, False if equal or rejected."""
         if key in self._info:
-            print("[settings] set %r rejected: read-only info field" % (key,))
+            _print("[settings] set %r rejected: read-only info field" % (key,))
             return False
         why = _check_value(key, value, self._defs.get(key))
         if why is not None:
-            print("[settings] set %r rejected: %s" % (key, why))
+            _print("[settings] set %r rejected: %s" % (key, why))
             return False
         if key in self._vals and self._vals[key] == value:
             return False
         if key not in self._vals and len(self._vals) >= SETTINGS_MAX_KEYS:
-            print("[settings] set %r rejected: too many keys" % (key,))
+            _print("[settings] set %r rejected: too many keys" % (key,))
             return False
         self._vals[key] = value
         self._mark()
@@ -984,10 +1028,10 @@ class Settings:
         flash, never passed to on_change. Keep it quick (one module read).
         If it raises, the app shows the value as empty."""
         if not isinstance(key, str) or not key or len(key) > SETTINGS_MAX_KEY:
-            print("[settings] info %r rejected: bad key" % (key,))
+            _print("[settings] info %r rejected: bad key" % (key,))
             return self
         if key not in self._info and len(self._info) >= SETTINGS_MAX_KEYS:
-            print("[settings] info %r rejected: too many info fields" % (key,))
+            _print("[settings] info %r rejected: too many info fields" % (key,))
             return self
         self._info[key] = provider
         self._info_failed.discard(key)
@@ -1002,7 +1046,7 @@ class Settings:
             except Exception as e:
                 if k not in self._info_failed:
                     self._info_failed.add(k)
-                    print("[settings] info %r failed: %r" % (k, e))
+                    _print("[settings] info %r failed: %r" % (k, e))
                 v = None
             if not (v is None or isinstance(v, (bool, int, float, str))):
                 v = str(v)
@@ -1121,7 +1165,7 @@ class Settings:
                 try:
                     cb(changed)
                 except Exception as e:
-                    print("[settings] on_change callback failed: %r" % (e,))
+                    _print("[settings] on_change callback failed: %r" % (e,))
         if self._dirty:
             now = time.monotonic()
             if (now - self._last_change >= SETTINGS_IDLE_S
@@ -1222,10 +1266,10 @@ def set_usb_drive(visible):
         text += "\n"
     try:
         write_atomic(SETTINGS_FILE, text)
-        print(f"[settings] {key} = {val} — power-cycle the brain to apply")
+        _print(f"[settings] {key} = {val} — power-cycle the brain to apply")
         return True
     except OSError:
-        print("[settings] cannot write settings.toml (drive visible to a PC?) "
+        _print("[settings] cannot write settings.toml (drive visible to a PC?) "
               "— edit it on the PC instead")
         return False
 
@@ -1291,7 +1335,7 @@ class Conductor:
         self.i2c_b = None      # bus B, None when not configured / not up
         self.bus_problems = []  # why a configured bus did not come up (this boot)
         for p in cfg.get("problems", ()):
-            print("[settings] " + p)
+            _print("[settings] " + p)
         self._init_i2c()   # tolerant: warns + leaves a bus None if no pull-ups / no pins
         store().attach(self.i2c)   # the Store (opt-in FRAM at 0x50 / nvm) shares bus A
         global _last_conductor
@@ -1340,7 +1384,7 @@ class Conductor:
                 msg = ("I2C bus %s (%s/%s) unavailable: %s - its modules are skipped. "
                        "(No pull-ups? Both buses on the same I2C peripheral?)"
                        % (name, _pin_name(sda), _pin_name(scl), e))
-                print(msg)
+                _print(msg)
                 if msg not in self.bus_problems:
                     self.bus_problems.append(msg)
         return self.i2c is not None or self.i2c_b is not None
@@ -2157,7 +2201,7 @@ class Conductor:
         elif self.picohub is None:          # one carrier per brain
             self.picohub = module
         else:
-            print("  a second PicoHub (0x%02X) - c.picohub stays the first one" % address)
+            _print("  a second PicoHub (0x%02X) - c.picohub stays the first one" % address)
         return module, type_name
 
     def enumerate(self, total_timeout_sec=10):
@@ -2170,7 +2214,7 @@ class Conductor:
         moved from one bus to the other keeps its address.
         Returns total number of modules found.
         """
-        print("Enumerating noknok modules...")
+        _print("Enumerating noknok modules...")
         self.buzzer    = []
         self.knob      = []
         self.ledbutton = []
@@ -2181,14 +2225,14 @@ class Conductor:
         self._unknown  = {}      # uid -> {"address", "type", "i2c_bus"} of modules without a driver
 
         if not self._init_i2c():
-            print("  No I2C bus (no pins in settings.toml, no pull-ups, or no I2C "
+            _print("  No I2C bus (no pins in settings.toml, no pull-ups, or no I2C "
                   "modules) - skipping I2C enumeration.")
             return 0
 
         # ── Step 1: Restore already-assigned modules ──────────────────────────
         restored = self._restore_state()
         if restored > 0:
-            print(f"  {restored} module(s) already assigned.")
+            _print(f"  {restored} module(s) already assigned.")
 
         # Stable addresses (DEV-18): a module we have seen before gets the SAME
         # address it had last time, so the saved state does not change from
@@ -2208,7 +2252,7 @@ class Conductor:
             for a in self._scan(bus):
                 if 0x08 <= a <= 0x77 and a not in used:
                     used.add(a)
-                    print("  [enum] device at 0x%02X (bus %s) is not a known noknok "
+                    _print("  [enum] device at 0x%02X (bus %s) is not a known noknok "
                           "module - address skipped" % (a, bus_name))
 
         def pick_address(uid_hex):
@@ -2246,7 +2290,7 @@ class Conductor:
 
                 # Verify CRC
                 if _crc8(buf[:9]) != buf[9]:
-                    print("  CRC mismatch on bus %s — possible collision, retrying..." % bus_name)
+                    _print("  CRC mismatch on bus %s — possible collision, retrying..." % bus_name)
                     time.sleep(0.05)
                     continue
 
@@ -2264,7 +2308,7 @@ class Conductor:
 
                 self._registry[uid_hex] = module
                 new_found += 1
-                print(f"  {type_name} → 0x{addr:02X} (bus {bus_name})  UID: {uid_hex}  [new]")
+                _print(f"  {type_name} → 0x{addr:02X} (bus {bus_name})  UID: {uid_hex}  [new]")
 
             time.sleep(0.02)
 
@@ -2275,11 +2319,11 @@ class Conductor:
         total = sum([len(self.buzzer), len(self.knob), len(self.ledbutton),
                      len(self.display), 1 if self.picohub else 0])
         if new_found == 0 and restored > 0:
-            print(f"No new modules. {restored} module(s) already assigned:")
+            _print(f"No new modules. {restored} module(s) already assigned:")
             for uid, m in self._registry.items():
-                if m: print(f"  {type(m).__name__} at 0x{m.address:02X} (bus {getattr(m, 'i2c_bus', 'A')})  UID: {uid}")
+                if m: _print(f"  {type(m).__name__} at 0x{m.address:02X} (bus {getattr(m, 'i2c_bus', 'A')})  UID: {uid}")
         else:
-            print(f"Done — {total} module(s) ({restored} restored, {new_found} new).")
+            _print(f"Done — {total} module(s) ({restored} restored, {new_found} new).")
         return total
 
     # ── USB module discovery (lazy: noknok_usb only loaded if used) ────────────
@@ -2299,32 +2343,32 @@ class Conductor:
         try:
             import noknok_usb
         except ImportError as e:
-            print("USB stack unavailable (%s) - skipping USB enumeration." % e)
+            _print("USB stack unavailable (%s) - skipping USB enumeration." % e)
             return 0
         if not noknok_usb.available():
-            print("No USB host support on this build - skipping USB enumeration.")
+            _print("No USB host support on this build - skipping USB enumeration.")
             return 0
         if (dp is None or dm is None) and pins("usb") is None:
-            print("No USB host pins in settings.toml (NOKNOK_USB_DP / NOKNOK_USB_DM) "
+            _print("No USB host pins in settings.toml (NOKNOK_USB_DP / NOKNOK_USB_DM) "
                   "- skipping USB enumeration.")
             return 0
 
-        print("Enumerating noknok USB modules...")
+        _print("Enumerating noknok USB modules...")
         self.leds = []
         self.leds16 = []
         self.usb_parked = []
         try:
             found = noknok_usb.discover(dp, dm)
         except Exception as e:
-            print("  USB discovery failed:", e)
+            _print("  USB discovery failed:", e)
             return 0
         self.usb_parked = list(getattr(noknok_usb, "last_bootloaders", None) or [])
         for serial in self.usb_parked:
-            print("  module in its USB bootloader (PID 4E42)  serial: %s" % serial)
+            _print("  module in its USB bootloader (PID 4E42)  serial: %s" % serial)
         try:
             self._remember_usb_types(found)
         except Exception as e:
-            print("  could not remember the USB module types:", e)
+            _print("  could not remember the USB module types:", e)
 
         for serial, type_name, module in found:
             if type_name == "noknokleds":
@@ -2332,9 +2376,9 @@ class Conductor:
             elif type_name == "noknokleds16":
                 self.leds16.append(module)
             self._registry[serial] = module     # serial is already lower-case
-            print("  %s  serial: %s  fw: %s"
+            _print("  %s  serial: %s  fw: %s"
                   % (type_name, serial, module.firmware_version))
-        print("USB: %d module(s)." % len(found))
+        _print("USB: %d module(s)." % len(found))
         return len(found)
 
     def enumerate_all(self, dp=None, dm=None):
@@ -2472,7 +2516,7 @@ class Conductor:
                 # First entry wins; a presence ping cannot tell which UID actually
                 # answered, so this is the best available until modules answer a
                 # runtime GET_UID and restore becomes identity-checked.
-                print("  state: %s also claims 0x%02X — skipped (stale)" % (uid_hex, addr))
+                _print("  state: %s also claims 0x%02X — skipped (stale)" % (uid_hex, addr))
                 continue
             bus_name = info.get("i2c_bus") or "A"   # state written before DEV-74 = bus A
             bus = self._bus(bus_name)
@@ -2486,7 +2530,7 @@ class Conductor:
                 # now sits on the old address (DEV-119). No object for it; the
                 # entry stays (rescue may still need UID -> type) and enumerate()'s
                 # scan keeps the address from being handed out.
-                print("  state: 0x%02X (bus %s) answers but not as a noknok module - "
+                _print("  state: 0x%02X (bus %s) answers but not as a noknok module - "
                       "%s not restored" % (addr, bus_name, uid_hex))
                 continue
             claimed.add(addr)
@@ -2533,10 +2577,10 @@ class Conductor:
         """
         mapping = self._roles_map()
         if not mapping:
-            print("  No roles saved yet. Run c.setup_roles() (or assign roles in the app).")
+            _print("  No roles saved yet. Run c.setup_roles() (or assign roles in the app).")
             return False
 
-        print("Loading roles...")
+        _print("Loading roles...")
         self.role = {}
         missing   = []
 
@@ -2546,16 +2590,16 @@ class Conductor:
             if module is not None:
                 self.role[role_name] = module
                 type_name = type(module).__name__
-                print(f"  '{role_name}' → {type_name} at 0x{module.address:02X}")
+                _print(f"  '{role_name}' → {type_name} at 0x{module.address:02X}")
             else:
                 self.role[role_name] = None
                 missing.append(role_name)
-                print(f"  '{role_name}' → NOT FOUND  (UID: {uid_hex})")
+                _print(f"  '{role_name}' → NOT FOUND  (UID: {uid_hex})")
 
         if missing:
-            print(f"  ⚠ {len(missing)} role(s) not found: {', '.join(missing)}")
+            _print(f"  ⚠ {len(missing)} role(s) not found: {', '.join(missing)}")
         else:
-            print(f"  All {len(self.role)} role(s) loaded.")
+            _print(f"  All {len(self.role)} role(s) loaded.")
 
         return len(missing) == 0
 
@@ -2569,14 +2613,14 @@ class Conductor:
             if module is not None and hasattr(module, "_uid_hex"):
                 data[role_name] = module._uid_hex
             else:
-                print(f"  ⚠ Skipping '{role_name}' — no UID available")
+                _print(f"  ⚠ Skipping '{role_name}' — no UID available")
 
         if not self._write_roles(data):
-            print("  ⚠ Could not save roles — Store write failed and filesystem "
+            _print("  ⚠ Could not save roles — Store write failed and filesystem "
                   "read-only (drive visible to a PC? see settings.toml NOKNOK_USB_DRIVE)")
             return
 
-        print(f"Saved {len(data)} role(s)")
+        _print(f"Saved {len(data)} role(s)")
 
     def setup_roles(self, filename="noknok_roles.json"):
         """
@@ -2604,32 +2648,32 @@ class Conductor:
                 all_modules.append((uid_hex, module))
 
         if not all_modules:
-            print("No modules found. Run enumerate() first.")
+            _print("No modules found. Run enumerate() first.")
             return
 
-        print(f"\nRole setup wizard — {len(all_modules)} module(s) found.")
-        print("For each module: identify it physically, then type a role name.")
-        print("The role name is how you'll refer to it in code: c.role[\"name\"]\n")
+        _print(f"\nRole setup wizard — {len(all_modules)} module(s) found.")
+        _print("For each module: identify it physically, then type a role name.")
+        _print("The role name is how you'll refer to it in code: c.role[\"name\"]\n")
 
         assignment = {}
 
         for i, (uid_hex, module) in enumerate(all_modules):
             type_name = type(module).__name__
-            print(f"Module {i+1}/{len(all_modules)}: {type_name} at 0x{module.address:02X}  (UID: {uid_hex})")
+            _print(f"Module {i+1}/{len(all_modules)}: {type_name} at 0x{module.address:02X}  (UID: {uid_hex})")
 
             if isinstance(module, NoknokBuzzer):
-                print("  → Playing a beep so you can identify it...")
+                _print("  → Playing a beep so you can identify it...")
                 module.tune(module.BEEP_OK)
                 time.sleep(0.5)
             elif isinstance(module, NoknokKnob):
-                print("  → Turn the knob or press it to identify it.")
+                _print("  → Turn the knob or press it to identify it.")
             elif isinstance(module, NoknokLedButton):
-                print("  → Flashing LED white so you can identify it...")
+                _print("  → Flashing LED white so you can identify it...")
                 module.set_color(40, 40, 40)
                 time.sleep(1.0)
                 module.led_off()
             elif isinstance(module, NoknokDisplay):
-                print("  → Lighting up the display so you can identify it...")
+                _print("  → Lighting up the display so you can identify it...")
                 module.role_cue(True)
                 time.sleep(1.5)
                 module.role_cue(False)
@@ -2638,23 +2682,23 @@ class Conductor:
 
             if role:
                 assignment[role] = uid_hex
-                print(f"  → assigned as '{role}'\n")
+                _print(f"  → assigned as '{role}'\n")
             else:
-                print(f"  → skipped\n")
+                _print(f"  → skipped\n")
 
         if assignment:
             if not self._write_roles(assignment):
-                print("⚠ Could not save roles — Store write failed and filesystem read-only "
+                _print("⚠ Could not save roles — Store write failed and filesystem read-only "
                       "(drive visible to a PC? see settings.toml NOKNOK_USB_DRIVE)")
                 return None
-            print(f"Saved {len(assignment)} role(s)")
-            print(f"\nIn your app code:")
-            print(f"  c.enumerate()")
-            print(f"  c.load_roles()")
+            _print(f"Saved {len(assignment)} role(s)")
+            _print(f"\nIn your app code:")
+            _print(f"  c.enumerate()")
+            _print(f"  c.load_roles()")
             for role_name in assignment:
-                print(f"  c.role[\"{role_name}\"]  # always this physical module")
+                _print(f"  c.role[\"{role_name}\"]  # always this physical module")
         else:
-            print("No roles assigned. File not written.")
+            _print("No roles assigned. File not written.")
 
     # ── Lookup ────────────────────────────────────────────────────────────────
 
@@ -2978,16 +3022,16 @@ def factory_reset(delay=0.0):
     """Wipe credentials, roles and settings (Store + files) and hard-reset into
     the provisioning AP. Shared by the knob-hold gesture and the app's
     `factory_reset` op (DEV-34) so both wipe exactly the same things."""
-    print("[reset] Factory reset triggered — wiping credentials and state.")
+    _print("[reset] Factory reset triggered — wiping credentials and state.")
     st = store()
     for key in Conductor._RESET_KEYS:         # Store first: power-safe on FRAM
         st.delete(key)
     # One write window for all of them (DEV-18); absent files are ignored.
     n = remove(*Conductor._RESET_FILES)
-    print(f"[reset] removed {n} file(s)")
+    _print(f"[reset] removed {n} file(s)")
     if delay:
         time.sleep(delay)
-    print("[reset] rebooting...")
+    _print("[reset] rebooting...")
     hard_reset()
 
 
@@ -4635,7 +4679,7 @@ class NoknokDisplay:
         self._info_next = time.monotonic() + self._INFO_RETRY_S
         if not self._info_warned:
             self._info_warned = True
-            print("[display] 0x%02X: no answer to GET_INFO - assuming %dx%d"
+            _print("[display] 0x%02X: no answer to GET_INFO - assuming %dx%d"
                   % (self.address, self._fallback[0], self._fallback[1]))
         return None
 
