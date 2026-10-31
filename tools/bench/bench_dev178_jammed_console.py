@@ -9,6 +9,7 @@
 # buffer fills within a minute or two and the next print() hangs the whole brain: /rpc stops.
 # With DEV-178 /rpc keeps answering for the whole hold. At the end the port is read again and
 # the console must still work (Ctrl-C gives a prompt is NOT tried: the product keeps running).
+# DEV178_BASELINE=1: the same traffic with the console not opened (the normal miss rate).
 # Run on the bench Pi with nothing else on the console (reserve the rig: ~/BENCH_IN_USE).
 import glob, json, socket, sys, time
 import serial
@@ -37,12 +38,17 @@ def rpc(op, args=None, timeout=4):
         return None
 
 
+import os
+BASELINE = os.environ.get("DEV178_BASELINE") == "1"    # same traffic, console NOT opened
 port = glob.glob("/dev/serial/by-id/usb-Raspberry_Pi_Pico*-if00")[0]
-con = serial.Serial(port, 115200, timeout=0.2)      # opens with DTR on: the brain sees a host
-con.reset_input_buffer()
-print("console open, NOT reading for %.0f min; app traffic 1/s" % MIN, flush=True)
+con = None
+if not BASELINE:
+    con = serial.Serial(port, 115200, timeout=0.2)  # opens with DTR on: the brain sees a host
+    con.reset_input_buffer()
+print("%s for %.0f min; app traffic 1/s"
+      % ("BASELINE: console closed" if BASELINE else "console open, NOT reading", MIN), flush=True)
 t_end = time.time() + MIN * 60
-n = bad = 0
+n = bad = run = longest_run = 0
 worst = 0.0
 first_bad = None
 while time.time() < t_end:
@@ -50,6 +56,8 @@ while time.time() < t_end:
     h = rpc("hello")
     n += 1
     for r in (a, h):
+        run = run + 1 if r is None else 0
+        longest_run = max(longest_run, run)
         if r is None:
             bad += 1
             if first_bad is None:
@@ -61,12 +69,16 @@ while time.time() < t_end:
         print("  %3d s: %d rounds, %d failed calls, slowest %.2f s"
               % (n, n, bad, worst), flush=True)
     time.sleep(1)
-got = b""
-t0 = time.time()
-while time.time() - t0 < 5:
-    got += con.read(65536)
-print("host reads again: %d console bytes waiting" % len(got))
+if con is not None:
+    got = b""
+    t0 = time.time()
+    while time.time() - t0 < 5:
+        got += con.read(65536)
+    print("host reads again: %d console bytes waiting" % len(got))
 print("after: hello %s" % ("ok" if rpc("hello") is not None else "FAILED"))
-ok = bad == 0
-print("%s: %d rounds, %d failed calls, slowest %.2f s"
-      % ("PASS" if ok else "FAIL", n, bad, worst))
+# A frozen brain fails every call from then on; a healthy one misses the odd call (the same
+# ~1 % shows with the console closed: DEV178_BASELINE=1, bench 31 Oct). So: no run of 5 failed
+# calls in a row, and under 2 % failed.
+ok = longest_run < 5 and bad < 0.02 * 2 * n
+print("%s: %d rounds, %d failed calls (longest run %d), slowest %.2f s"
+      % ("PASS" if ok else "FAIL", n, bad, longest_run, worst))
