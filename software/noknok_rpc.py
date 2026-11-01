@@ -653,8 +653,13 @@ def service(force=False):
                         free = gc.mem_free()
                     except Exception:
                         free = -1
-                    _logfn("[rpc] poll error: %r (cause %r, mem_free %d)"
-                           % (e, getattr(e, "__cause__", None), free))
+                    # DEV-181: type + a short message only. repr(e) of a parse error
+                    # carries the whole raw request (~200 B), and the log line is kept
+                    # in code.py's RAM ring.
+                    cause = getattr(e, "__cause__", None)
+                    _logfn("[rpc] poll error: %s: %s%s (mem_free %d)"
+                           % (type(e).__name__, str(e)[:48],
+                              " (cause %s)" % type(cause).__name__ if cause else "", free))
             ms = (time.monotonic_ns() - t0) // 1000000
             _poll_stats["n"] += 1
             if ms > _poll_stats["max_ms"]:

@@ -1,6 +1,10 @@
 # code.py — noknok Pico W provisioning + launcher
 # Version: 0.39 (status sends at most 10 events per reply — DEV-169)
 #
+# v0.39 also (Sue): DEV-181 — the RAM log ring keeps at most LOG_RING_CHARS (120) of
+#   each line: with the Maxi, long "[rpc] poll error" lines (~280 B, the raw request
+#   included) slowly replaced the short boot lines, so the 80-line ring grew to ~22 KB
+#   - what looked like a memory leak (bench, Pi4RFID SWD heap dumps, 1 Nov).
 # v0.39 changes (Sue): DEV-169 — `status` returns at most STATUS_EVENTS (10) events
 #   per reply: the newest 10 without `since`, ev[since:since+10] with it; the app
 #   pages with `since` and `events_total`. The full history made the reply ~3.7 KB,
@@ -496,6 +500,8 @@ def _timestamp():
 # (rare, audit) lives in the Store, not in a file.
 DEBUG_LOG_MARKER = "/debug_log"        # bench: `pico.py put` an empty file of this name
 LOG_RING_LINES   = 80
+LOG_RING_CHARS   = 120     # DEV-181: the RAM copy of a line is cut here (the console gets
+                            # it whole). 80 full-length lines of ~280 B were ~22 KB of RAM.
 _log_ring        = []
 _log_to_flash    = None                # decided on first log() call
 
@@ -516,7 +522,7 @@ def log(msg):
     has synced)."""
     line = _timestamp() + str(msg)
     sys.stdout.write(line + "\n")          # console output
-    _log_ring.append(line)
+    _log_ring.append(line[:LOG_RING_CHARS])
     if len(_log_ring) > LOG_RING_LINES:
         del _log_ring[0]
     if _flash_logging_enabled():
