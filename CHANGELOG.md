@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## settings.toml - 2026-11-02
+
+- DEV-186 - about 1 % of the app's requests to the Smart Lamp Maxi failed (up to 6 % in one bench run), because the brain ran out of its small Python stack while reading the request (the app is answered from inside the lamp's own module calls). `settings.toml` now sets CircuitPython's own `CIRCUITPY_PYSTACK_SIZE = 8192` (default 2048). Bench, Maxi, 40 min per size: 2048 = 0.87 % / 5.93 % failed, 4096 = 0.74 %, 6144 = 0.38 %, 8192 = 0.09 % / 0.28 %. It costs ~4 KB of Python memory (6144 costs the same). Side effect: a request sent within milliseconds of the previous reply now often waits ~1 s to connect; spaced requests (the app's pattern) are not affected. Existing brains get it with the next copy of settings.toml. Breaking: no.
+
 ## noknok_rpc.py 0.5 - 2026-10-29
 
 - DEV-170 - one network connection to the brain that sent only part of a request and then closed (or sent nothing at all) froze the whole product for good: buttons, LEDs and the WiFi reconnect stopped, only a replug helped. The web server library the brain uses waited for the rest of the request forever. The brain now uses its own version of the two waiting steps: it stops as soon as the other side has closed, and gives one request at most 1 second for its headers and body, then drops it. Covers the home network and the setup hotspot (same server). Host test `tools/test_http_freeze.py`. Breaking: no.
