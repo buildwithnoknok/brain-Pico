@@ -1,5 +1,16 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.38 (console output never blocks — DEV-178; radio off before resets — DEV-172)
+# Version: 0.39 (status sends at most 10 events per reply — DEV-169)
+#
+# v0.39 also (Sue): DEV-181 — the RAM log ring keeps at most LOG_RING_CHARS (120) of
+#   each line: with the Maxi, long "[rpc] poll error" lines (~280 B, the raw request
+#   included) slowly replaced the short boot lines, so the 80-line ring grew to ~22 KB
+#   - what looked like a memory leak (bench, Pi4RFID SWD heap dumps, 1 Nov).
+# v0.39 changes (Sue): DEV-169 — `status` returns at most STATUS_EVENTS (10) events
+#   per reply: the newest 10 without `since`, ev[since:since+10] with it; the app
+#   pages with `since` and `events_total`. The full history made the reply ~3.7 KB,
+#   and with code.py loaded CircuitPython could not send that: the reply stopped
+#   after its header and the brain's network stopped for ~6 s (no ping), and under
+#   noknok_rpc 0.6 it stayed broken (bench, Pi4RFID, 30 Oct). (0.38 = DEV-178/DEV-172.)
 #
 # v0.38 changes (Sue): DEV-178 — log(), event() and crash tracebacks go through
 #   nk._print() (usb_cdc console write, never waits) instead of print()/sys.stdout,
@@ -463,7 +474,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.38"
+CODE_VERSION = "0.39"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -504,6 +515,8 @@ def _timestamp():
 # (rare, audit) lives in the Store, not in a file.
 DEBUG_LOG_MARKER = "/debug_log"        # bench: `pico.py put` an empty file of this name
 LOG_RING_LINES   = 80
+LOG_RING_CHARS   = 120     # DEV-181: the RAM copy of a line is cut here (the console gets
+                            # it whole). 80 full-length lines of ~280 B were ~22 KB of RAM.
 _log_ring        = []
 _log_to_flash    = None                # decided on first log() call
 
@@ -524,7 +537,7 @@ def log(msg):
     has synced)."""
     line = _timestamp() + str(msg)
     nk._print(line)                        # console output, never blocks (DEV-178)
-    _log_ring.append(line)
+    _log_ring.append(line[:LOG_RING_CHARS])
     if len(_log_ring) > LOG_RING_LINES:
         del _log_ring[0]
     if _flash_logging_enabled():
@@ -1263,13 +1276,20 @@ def _h_hello(args, msg):
         "ops": rpc.dispatcher().ops(),
     }
 
+STATUS_EVENTS = 10      # events per `status` reply (keeps it under rpc.MAX_REPLY)
+
 def _h_status(args, msg):
     """Phase-1 subset of `status` (DEV-36 adds per-module firmware state):
-    event history, crash strikes, storage mode, memory. `since` (int) skips
-    the first N events so the app can page."""
+    event history, crash strikes, storage mode, memory. At most STATUS_EVENTS
+    events per reply (DEV-169: a bigger reply did not get out): without `since`
+    the newest ones, with `since` (int) ev[since:since+STATUS_EVENTS] so the app
+    can page; `events_total` says how many there are."""
     import gc
     ev = events()
-    since = int(args.get("since") or 0)
+    if args.get("since") is None:
+        since = max(0, len(ev) - STATUS_EVENTS)
+    else:
+        since = max(0, int(args.get("since") or 0))
     c = nk.conductor()
     modules = []
     power = None
@@ -1293,12 +1313,14 @@ def _h_status(args, msg):
         "store": nk.store().backend,
         "drive_visible": nk.usb_drive_visible(),
         "mem_free": gc.mem_free(),
+        "mem_alloc": gc.mem_alloc(),     # DEV-181: in use; free + in use = heap size
         "ip": str(wifi.radio.ipv4_address) if wifi.radio.connected else None,
         "link": rpc.link_stats(),
         "last_bad_request": rpc._last_bad,
         "modules": modules,
         "power": power,                  # PicoHub power status or null (DEV-123)
-        "events": ev[since:],
+        "events": ev[since:since + STATUS_EVENTS],
+        "events_since": since,
         "events_total": len(ev),
     }
 
