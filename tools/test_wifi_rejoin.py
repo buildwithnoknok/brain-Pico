@@ -111,20 +111,24 @@ for model in ("background", "foreground"):
         check("  ... offline boot not counted as a drop", rpc.link_stats()["drops"] == 0)
         if model == "background":
             after = [t for at, t in radio.calls if at >= back]
-            check("  ... joined at the first attempt after the router came back",
-                  len(after) == 1)
+            check("  ... joined by the attempt running then or the first one after (%d after)"
+                  % len(after), len(after) <= 1)
 
-# attempts are spaced by the backoff and at most every 5 min, never in a burst
+# attempts are spaced by the backoff and at most every LINK_MAX_S (60 s), never in a burst
 rpc, radio, joined, ups = run("foreground", 10 ** 9, minutes=60, full_every=3)
 gaps = [b[0] - a[0] for a, b in zip(radio.calls, radio.calls[1:])]
-check("router never back: attempts spaced 30 s .. 300 s (%s)" % [int(g) for g in gaps[:6]],
-      gaps and min(gaps) >= 29 and max(gaps) <= 306)
+check("router never back: attempts spaced 30 s .. %d s (%s)"
+      % (rpc.LINK_MAX_S, [int(g) for g in gaps[:6]]),
+      gaps and min(gaps) >= 29 and max(gaps) <= rpc.LINK_MAX_S + 6)
 fulls = sum(1 for _, t in radio.calls if t == rpc.LINK_JOIN_S)
 check("router never back: only every 3rd attempt is a full one (%d of %d)" % (fulls, len(radio.calls)),
       fulls == len(radio.calls) // 3)
 stall = sum(t for _, t in radio.calls)
-# before DEV-79: 15 attempts x 5 s = 75 s per hour, each a 5 s freeze
-check("safety net on, router never back: product stalled %.1f s in 60 min (<= 30 s, was 75 s)" % stall, stall <= 30.0 + 1e-6)
+# before DEV-79: 15 attempts x 5 s = 75 s per hour, each a 5 s freeze. The safety net is
+# off by default (LINK_FULL_EVERY = 0); with LINK_MAX_S 60 (DEV-168) and the net on, every
+# 3rd of ~60 attempts an hour blocks LINK_JOIN_S: 20 x 5 + 40 x 0.5 = 120 s.
+check("safety net on (not default), router never back: stalled %.1f s in 60 min (<= 121 s)"
+      % stall, stall <= 121.0)
 rpc.LINK_FULL_EVERY = 0
 rpc2, radio2 = rpc, radio
 clock.t = 0.0; del logs[:]
@@ -135,6 +139,9 @@ while clock.t < 3600:
     radio.tick(); rpc.service(force=True); clock.t += 0.05
 check("LINK_FULL_EVERY = 0: longest stall %.1f s (kicks only)" % radio.max_block,
       radio.max_block == rpc.LINK_KICK_S)
+total = sum(t for _, t in radio.calls)
+check("LINK_FULL_EVERY = 0, router never back: stalled %.1f s in 60 min (<= 31 s, DEV-168)" % total,
+      total <= 31.0)
 
 # a link that drops later is counted and rejoined, on_up runs again
 clock.t = 0.0
@@ -153,6 +160,50 @@ while clock.t < t_drop + 600:
 check("drop while online: counted once", rpc.link_stats()["drops"] == 1)
 check("drop while online: rejoined", radio.connected and rpc._link["was_up"])
 check("drop while online: on_up ran once (after the rejoin)", len(ups) == 1)
+
+# DEV-168 (bench 31 Oct): after a rejoin the brain switches power save off again and pings
+# the router; while up, every link check pings the router once (counted when it misses)
+clock.t = 0.0
+rpc, radio = fresh("background")
+pm_sets, pings = [], []
+radio.ipv4_gateway = "192.168.1.1"
+radio.answer = True
+def _ping(ip, timeout=None):
+    pings.append((clock.t, ip, timeout))
+    return 0.004 if radio.answer else None
+radio.ping = _ping
+import wifi as _wifi
+_wifi.PowerManagement = types.SimpleNamespace(NONE="none")
+orig_setattr = type(radio).__setattr__
+def _track(self, k, v):
+    if k == "power_management":
+        pm_sets.append(clock.t)
+    orig_setattr(self, k, v)
+type(radio).__setattr__ = _track
+radio._done()
+rpc.set_wifi_credentials("home", "pw", 80)
+radio.net_at = 0.0
+for _ in range(1000):                         # 50 s up
+    radio.tick(); rpc.service(force=True); clock.t += 0.05
+n_up = len(pings)
+check("while up: router pinged at every link check (%d in 50 s)" % n_up, n_up >= 1)
+check("router ping uses GW_PING_S", all(p[2] == rpc.GW_PING_S for p in pings))
+radio.connected = False; radio.ipv4_address = None; radio.join_started = None
+radio.net_at = clock.t + 20
+pm0, p0 = len(pm_sets), len(pings)
+t_drop = clock.t
+while clock.t < t_drop + 120:
+    radio.tick(); rpc.service(force=True); clock.t += 0.05
+check("after the rejoin: power save switched off again", len(pm_sets) > pm0)
+check("after the rejoin: the router was pinged", len(pings) > p0)
+check("rejoin log names the router's answer", any("router 4 ms" in str(l) for l in logs))
+radio.answer = False
+m0 = rpc.link_stats()["gw_miss"]
+for _ in range(1300):                         # 65 s up, router silent
+    radio.tick(); rpc.service(force=True); clock.t += 0.05
+check("router not answering: gw_miss counts it", rpc.link_stats()["gw_miss"] >= m0 + 2)
+check("link_stats counts answered pings (gw_ok)", rpc.link_stats()["gw_ok"] >= 2)
+type(radio).__setattr__ = orig_setattr
 
 print("PASS (0 failures)" if not fails else "FAIL (%d failures)" % len(fails))
 sys.exit(1 if fails else 0)
