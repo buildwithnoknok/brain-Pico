@@ -526,6 +526,14 @@ compiled — `noknok.py` 184 KB → `noknok.mpy` 45 KB — so it loads with a fr
    shipped-configured brain. The event history (`[FW]/[CRASH]/…`) is kept in the Store (not a
    file), whatever the marker says.
 
+**If the serial console goes silent** (no output, Ctrl-C does nothing) while the lamp and the
+app keep working: that is a known CircuitPython 10.x USB fault (DEV-172), most often right after a
+reset or when a terminal opens the port. Unplug the brain and plug it in again. Since code.py
+0.38 / noknok.py 1.24 noknok's own output never waits for the console (DEV-178), so the product
+keeps running when it happens; lines written meanwhile are lost (the last 80 stay in the RAM
+log). Your own `print()` in a product script still waits: keep it out of the product loop, or
+the product stops until the console is read again.
+
 ## Bench-flashing modules (bring-up)
 
 `bench_flash.py` puts **application firmware** onto a CH32V003 module that has only the

@@ -1,6 +1,14 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.37 (safe mode no longer leaves the lamp dark — DEV-154)
+# Version: 0.38 (console output never blocks — DEV-178; radio off before resets — DEV-172)
 #
+# v0.38 changes (Sue): DEV-178 — log(), event() and crash tracebacks go through
+#   nk._print() (usb_cdc console write, never waits) instead of print()/sys.stdout,
+#   and the CircuitPython status bar is off: a console the host does not read, or
+#   that TinyUSB lost (DEV-172), no longer hangs the product.
+# v0.38 changes (Sue): DEV-172 — the app's reboot, a product switch, the end of
+#   setup and the hard reset before the product all go through nk.hard_reset():
+#   WiFi radio off, then microcontroller.reset(). Bench 29 Oct: resets with the
+#   radio busy hung the next boot (USB back, console silent) in 3 of 26 cases.
 # v0.37 changes (Sue): DEV-154 — new safemode.py: when CircuitPython starts in
 #   safe mode after a core crash (hard fault, brownout, ...), code.py never runs
 #   and the lamp stayed dark until a replug. safemode.py now restarts the brain,
@@ -441,6 +449,13 @@ import sys
 import time
 import supervisor
 import microcontroller
+try:
+    # The status bar (the "Wi-Fi: ... | code.py" title line) is written through the
+    # same blocking path as print(); a jammed console hung the brain there too
+    # (DEV-172/178). Off for the whole run.
+    supervisor.status_bar.console = False
+except Exception:
+    pass
 import wifi
 import socketpool
 import ssl
@@ -448,7 +463,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.37"
+CODE_VERSION = "0.38"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -508,7 +523,7 @@ def log(msg):
     (see above). Every line is timestamped (uptime, plus wall-clock once NTP
     has synced)."""
     line = _timestamp() + str(msg)
-    sys.stdout.write(line + "\n")          # console output
+    nk._print(line)                        # console output, never blocks (DEV-178)
     _log_ring.append(line)
     if len(_log_ring) > LOG_RING_LINES:
         del _log_ring[0]
@@ -534,7 +549,7 @@ def event(msg):
     assignments [ROLE], factory resets [RESET], ...), so a single module's
     history is easy to find. Best-effort; never raises."""
     line = _timestamp() + str(msg)
-    sys.stdout.write(line + "\n")
+    nk._print(line)                        # never blocks (DEV-178)
     nk.store().append(EVENTS_KEY, line, EVENTS_MAX)   # Store, never the FAT (DEV-18)
 
 def events():
@@ -832,7 +847,7 @@ def _hard_reset_if_needed():
     _release_conductor()
     event(f"[BOOT] hard reset before the product: {_hard_reset_why}")
     time.sleep(0.5)
-    microcontroller.reset()
+    nk.hard_reset()                      # radio off first (DEV-172)
 
 def _rescue_from_cache(why):
     """Parked-module rescue with the on-device cache as the only image source.
@@ -1288,14 +1303,17 @@ def _h_status(args, msg):
     }
 
 def _h_reboot(args, msg):
-    """Reply first, reset after the response has gone out (deferred)."""
-    log("[rpc] reboot requested by the app")
+    """Reply first, reset after the response has gone out (deferred).
+    args.radio_off (bool, default true): false = plain reset with the radio
+    still up - only for the DEV-179 bench A/B, the app never sends it."""
+    radio_off = args.get("radio_off", True) is not False
+    log("[rpc] reboot requested by the app" + ("" if radio_off else " (radio left on)"))
     def _reboot():
         nk.flush_settings()              # the last few seconds of changes
         time.sleep(0.5)                  # let the reply leave the radio first
-        microcontroller.reset()
+        nk.hard_reset(radio_off)         # radio off first (DEV-172)
     rpc.defer(_reboot)
-    return {"rebooting": True}
+    return {"rebooting": True, "radio_off": radio_off}
 
 def _h_factory_reset(args, msg):
     """Same wipe as the knob-hold gesture (noknok.factory_reset), deferred so
@@ -1567,7 +1585,7 @@ def _do_provision(ssid, password, script_url, module_firmware, product_id,
         nk.flush_settings()
         time.sleep(0.5)                  # let the reply leave the radio first
         _set_crash_count(0)
-        microcontroller.reset()
+        nk.hard_reset()                  # radio off first (DEV-172)
     rpc.defer(_switch)
     return {"accepted": True, "mode": "switch", "rebooting": True}
 
@@ -1854,7 +1872,7 @@ def run_ap_provisioning():
                 _install_settings(pending["config_defaults"])
                 log("[boot] Credentials saved — hardware reset into WiFi mode")
                 time.sleep(2)  # let the success page flush to the browser
-                microcontroller.reset()
+                nk.hard_reset()               # radio off first (DEV-172)
                 return
             # Filesystem read-only (drive visible to a PC): the app already saw
             # the success page, so say it loudly here and offer setup again
@@ -2745,7 +2763,7 @@ def _boot_hold_reset_check():
             return                  # the normal power-on
 
         # Seen: feedback on everything that can give it, then keep watching.
-        print("[reset] button held at power-on — keep holding %.0f s to factory-reset"
+        nk._print("[reset] button held at power-on — keep holding %.0f s to factory-reset"
               % BOOT_HOLD_S)
         for b in c.ledbutton:
             b.set_color(255, 255, 255)
@@ -2755,7 +2773,7 @@ def _boot_hold_reset_check():
         while time.monotonic() < deadline:
             time.sleep(BOOT_HOLD_POLL_S)
             if not held():
-                print("[reset] released — normal boot")
+                nk._print("[reset] released — normal boot")
                 for b in c.ledbutton:
                     b.led_off()
                 return
@@ -2781,7 +2799,7 @@ def _boot_hold_reset_check():
         event("[RESET] factory reset via boot-hold")
         nk.factory_reset(delay=0.4)
     except Exception as e:
-        print(f"[reset] boot-hold check skipped: {e!r}")
+        nk._print(f"[reset] boot-hold check skipped: {e!r}")
     finally:
         # Free the pins; the reload that follows starts a fresh VM anyway.
         try:
@@ -2815,7 +2833,7 @@ def run_product(connected):
         log(f"[crash] product.py {type(e).__name__}: {e}  (strike {strikes}/{CRASH_MAX})")
         try:
             import traceback
-            traceback.print_exception(e)     # full trace to the serial console
+            traceback.print_exception(e, file=nk.console_file)   # never blocks (DEV-178)
         except Exception:
             pass
         event(f"[CRASH] product.py {type(e).__name__}: {str(e)[:120]}  "
@@ -2963,7 +2981,7 @@ def main():
         except Exception:
             pass
         _boot_hold_reset_check()         # v0.18: button held from power-on? wipe + AP
-        print("[boot] power-on — reloading once (cold-boot WiFi workaround, see main())")
+        nk._print("[boot] power-on — reloading once (cold-boot WiFi workaround, see main())")
         supervisor.reload()
     log_new_boot()
     log("[boot] noknok Pico W — starting")

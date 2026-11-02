@@ -23,8 +23,19 @@
 import time
 import struct
 
-__version__ = "1.2"   # 1.2 = DEV-133: discover() notes bootloader devices, request_bootloader()
+__version__ = "1.3"   # 1.3 = DEV-178: console output through noknok._print (never blocks)
+                      # 1.2 = DEV-133: discover() notes bootloader devices, request_bootloader()
                       # 1.1 = DEV-46: LEDs 16x + dispatch on the 0xF0 type byte
+
+
+def _print(*args, **kw):
+    """noknok._print (console output that never blocks, DEV-178); plain print()
+    when this file is used without noknok.py (host tests)."""
+    try:
+        import noknok
+        noknok._print(*args, **kw)
+    except ImportError:
+        print(*args, **kw)
 
 try:
     import usb.core
@@ -515,7 +526,7 @@ def discover(dp=None, dm=None, settle_sec=3, max_sec=20, empty_grace=6):
                 continue                # no answer yet - retried on the next pass
             entry = _USB_TYPES.get(mtype)
             if entry is None:
-                print("  USB module %s: unknown module type 0x%02X - skipped "
+                _print("  USB module %s: unknown module type 0x%02X - skipped "
                       "(newer module than this noknok_usb.py?)" % (key, mtype))
                 skipped.add(key)
                 continue
