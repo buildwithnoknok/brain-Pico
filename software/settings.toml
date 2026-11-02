@@ -40,3 +40,11 @@ NOKNOK_MDNS = 1
 # 1 = visible; a PC may edit files, the program cannot write (maker/bench).
 # Read by boot.py at power-up. From the REPL: noknok.set_usb_drive(True).
 NOKNOK_USB_DRIVE = 0
+
+# ── Python stack (DEV-186) ───────────────────────────────────────────────────
+# CircuitPython's own setting, read at every start. The app is answered from
+# inside the product's module calls, so the request parser runs on top of the
+# product's call chain; at CircuitPython's default (2048 bytes) about 1-6 % of
+# app requests to the Smart Lamp Maxi failed with "pystack exhausted". 8192
+# brings that to about 0.1-0.3 % and costs ~4 KB of Python memory. Leave it.
+CIRCUITPY_PYSTACK_SIZE = 8192

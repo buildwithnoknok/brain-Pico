@@ -183,6 +183,7 @@ Test: `tools/test_two_bus.py` (host, tier S).
 | `NOKNOK_MDNS` | `1` = advertise `noknok-XXXX.local` (default) · `0` = off | `code.py` app channel |
 | `NOKNOK_FRAM` | `1` = probe the I2C FRAM at 0x50 and use it as the Store if a chip answers. Unset or anything else = nvm only, the bus is not touched (default since 1.14) | `noknok.store()` |
 | `NOKNOK_WATCHDOG` | `0` = off (default, shipped brains) · `1` = advanced/bench: 8 s hardware watchdog while the product runs, plus the `bench.wifi_drop` op - read the watchdog section below first | `code.py` |
+| `CIRCUITPY_PYSTACK_SIZE` | CircuitPython's own key; its default is `2048`. The shipped file sets **`8192`** (DEV-186): the app is answered from inside the product's module calls, and at 2048 about 1-6 % of app requests to a deep product (Smart Lamp Maxi) failed with "pystack exhausted". 8192 costs ~4 KB of Python memory. Takes effect at the next start. | CircuitPython (VM start) |
 
 ### The watchdog setting (`NOKNOK_WATCHDOG`) - advanced, not supported on shipped brains
 
