@@ -7,6 +7,7 @@ Convention: Confluence "Development Conventions" (SD space, page 120160257).
 ## docs only (no code change) - 2026-11-03
 
 - DEV-184 - new `docs/device-protocol.md`: Device Protocol v1 overview written from the code (message format, carrier, settings model and lifetimes, what is not built, `/rpc` is unauthenticated today). `docs/provisioning-http-api.md` now says mDNS is on by default (it has been since code.py 0.36) and points to the new page; README BLE wording corrected. Breaking: no.
+
 ## settings.toml - 2026-11-02
 
 - DEV-186 - about 1 % of the app's requests to the Smart Lamp Maxi failed (up to 6 % in one bench run), because the brain ran out of its small Python stack while reading the request (the app is answered from inside the lamp's own module calls). `settings.toml` now sets CircuitPython's own `CIRCUITPY_PYSTACK_SIZE = 8192` (default 2048). Bench, Maxi, 40 min per size: 2048 = 0.87 % / 5.93 % failed, 4096 = 0.74 %, 6144 = 0.38 %, 8192 = 0.09 % / 0.28 %. It costs ~4 KB of Python memory (6144 costs the same). Side effect: a request sent within milliseconds of the previous reply now often waits ~1 s to connect; spaced requests (the app's pattern) are not affected. Existing brains get it with the next copy of settings.toml. Breaking: no.
