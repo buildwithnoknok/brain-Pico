@@ -182,13 +182,14 @@ the phone by this point, since it is long off the setup AP.
 
 ## `POST /rpc` — Device Protocol v1 (DEV-34, since code.py 0.17)
 
-One JSON message protocol, transport-agnostic (spec: Confluence 113868802 §2). The
+One JSON message protocol, transport-agnostic (overview, status, settings model:
+[device-protocol.md](device-protocol.md); this section is the op reference). The
 form endpoints above are now thin **adapters** over the same handlers. App 1.5.2 still
 uses the form endpoints for setup and calls only `hello` and `settings.*` over `/rpc`
 (after setup); the other ops are served but not called by the app yet. Served **on the
-setup AP and on home WiFi for the product's whole lifetime**. **mDNS is off by default:**
+setup AP and on home WiFi for the product's whole lifetime**. **mDNS is on by default since code.py 0.36 (DEV-70):**
 the name **`noknok-XXXX.local`** (`XXXX` = last two bytes of the MCU id; `hello` returns
-the name) is advertised only with `NOKNOK_MDNS = 1` in `settings.toml`; the app finds a
+the name) is advertised unless `NOKNOK_MDNS = 0` in `settings.toml`; the app still finds a
 brain by sending `hello` to every address of the phone's /24 (or a typed IP).
 **No authorisation:** every op is open to anyone who can reach port 80 (setup hotspot,
 home LAN); pairing / authorisation is DEV-35. Implementation: `software/noknok_rpc.py`
@@ -234,7 +235,7 @@ key ≤ 32 chars, string ≤ 256 chars, all values ≤ 1 KB JSON; scalars only (
 **Write policy (nvm wear + power cuts):** a scope is written after 5 s without changes, at the
 latest 60 s after the first change, never two writes closer than 30 s; forced before any
 reboot / switch / crash reload. **Link:** the servicing slot watches the WiFi link every 30 s
-(every 1 s while it is down) and re-joins with backoff (30 s → 5 min), also on a brain that
+(every 1 s while it is down) and re-joins with backoff (up to 60 s since noknok_rpc 0.6, DEV-168), also on a brain that
 booted offline. Since noknok_rpc 0.2 (DEV-79) an attempt is a 0.5 s "kick" that lets the radio
 finish the join in the background (bench-proven on the Pico 2 W: link up ~3 s later, 5/5;
 noknok_rpc 0.3 runs kicks only, `LINK_FULL_EVERY = 0`; N = every Nth attempt a full ≤ 5 s one). Once the link is up the carrier restarts and

@@ -59,11 +59,13 @@ it. Subsequent boots reconnect to WiFi and re-run the product directly.
   not clear it. Power-cycle or `microcontroller.reset()`. Open bug, DEV-47.
 - Diagnosis rule: an error that comes back in **0.00 s** is the Pico's own stack, not the router.
 
-**Note:** BLE was the original plan but is not supported on RP2350 in CircuitPython 10.x —
-provisioning uses WiFi AP instead. Full process, test steps, and gotchas are documented in
+**Note:** BLE was the original plan and was skipped for the launch brain —
+provisioning uses the WiFi AP instead. Full process, test steps, and gotchas are documented in
 Confluence: *Software Development -> Pico W Provisioning — Process & Implementation*.
 
-**HTTP API reference:** the app ↔ brain endpoints (`/connect`, `/roles/assign`, `POST /rpc`)
+**Protocol:** [docs/device-protocol.md](docs/device-protocol.md) is the Device Protocol v1
+overview (message format, carrier, settings model, what is not built, authorisation status).
+**HTTP API reference:** the app ↔ brain endpoints (`/connect`, `/roles/assign`, `POST /rpc` ops)
 are documented in
 [docs/provisioning-http-api.md](docs/provisioning-http-api.md).
 
