@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## docs only (no code change) - 2026-11-03
+
+- DEV-184 - new `docs/device-protocol.md`: Device Protocol v1 overview written from the code (message format, carrier, settings model and lifetimes, what is not built, `/rpc` is unauthenticated today). `docs/provisioning-http-api.md` now says mDNS is on by default (it has been since code.py 0.36) and points to the new page; README BLE wording corrected. Breaking: no.
+
 ## noknok_rpc.py 0.5 - 2026-10-29
 
 - DEV-170 - one network connection to the brain that sent only part of a request and then closed (or sent nothing at all) froze the whole product for good: buttons, LEDs and the WiFi reconnect stopped, only a replug helped. The web server library the brain uses waited for the rest of the request forever. The brain now uses its own version of the two waiting steps: it stops as soon as the other side has closed, and gives one request at most 1 second for its headers and body, then drops it. Covers the home network and the setup hotspot (same server). Host test `tools/test_http_freeze.py`. Breaking: no.

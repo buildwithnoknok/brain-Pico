@@ -182,13 +182,14 @@ the phone by this point, since it is long off the setup AP.
 
 ## `POST /rpc` — Device Protocol v1 (DEV-34, since code.py 0.17)
 
-One JSON message protocol, transport-agnostic (spec: Confluence 113868802 §2). The
+One JSON message protocol, transport-agnostic (overview, status, settings model:
+[device-protocol.md](device-protocol.md); this section is the op reference). The
 form endpoints above are now thin **adapters** over the same handlers. App 1.5.2 still
 uses the form endpoints for setup and calls only `hello` and `settings.*` over `/rpc`
 (after setup); the other ops are served but not called by the app yet. Served **on the
-setup AP and on home WiFi for the product's whole lifetime**. **mDNS is off by default:**
+setup AP and on home WiFi for the product's whole lifetime**. **mDNS is on by default since code.py 0.36 (DEV-70):**
 the name **`noknok-XXXX.local`** (`XXXX` = last two bytes of the MCU id; `hello` returns
-the name) is advertised only with `NOKNOK_MDNS = 1` in `settings.toml`; the app finds a
+the name) is advertised unless `NOKNOK_MDNS = 0` in `settings.toml`; the app still finds a
 brain by sending `hello` to every address of the phone's /24 (or a typed IP).
 **No authorisation:** every op is open to anyone who can reach port 80 (setup hotspot,
 home LAN); pairing / authorisation is DEV-35. Implementation: `software/noknok_rpc.py`
