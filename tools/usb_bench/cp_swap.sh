@@ -1,4 +1,5 @@
 #!/bin/sh
+: "${BENCH_SUDO_PW:?set BENCH_SUDO_PW (Pi sudo password) in the environment}"
 # SPDX-License-Identifier: MIT
 # cp_swap.sh - run ON THE BENCH HOST (Pi4): install a CircuitPython .uf2 on the bench Pico
 # without touching it (DEV-45 A/B tests). Files on CIRCUITPY survive a UF2 install.
@@ -17,10 +18,10 @@ EOF
 ( cd "$P" && timeout 30 python3 pico.py run /tmp/to_uf2.py 10 ) >/dev/null 2>&1
 i=0; while [ ! -e /dev/disk/by-label/RP2350 ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
 [ -e /dev/disk/by-label/RP2350 ] || { echo "UF2 drive did not appear (Pico wedged? needs a replug)"; exit 3; }
-echo raspberry | sudo -S -p "" mkdir -p $MNT
-echo raspberry | sudo -S -p "" mount /dev/disk/by-label/RP2350 $MNT || exit 4
-echo raspberry | sudo -S -p "" cp "$UF2" $MNT/ ; sync
-echo raspberry | sudo -S -p "" umount $MNT 2>/dev/null
+echo "$BENCH_SUDO_PW" | sudo -S -p "" mkdir -p $MNT
+echo "$BENCH_SUDO_PW" | sudo -S -p "" mount /dev/disk/by-label/RP2350 $MNT || exit 4
+echo "$BENCH_SUDO_PW" | sudo -S -p "" cp "$UF2" $MNT/ ; sync
+echo "$BENCH_SUDO_PW" | sudo -S -p "" umount $MNT 2>/dev/null
 i=0; while ! ls /dev/serial/by-id/usb-Raspberry_Pi_Pico* >/dev/null 2>&1 && [ $i -lt 40 ]; do sleep 1; i=$((i+1)); done
 sleep 5
 cat > /tmp/ver.py <<'EOF'

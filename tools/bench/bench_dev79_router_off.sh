@@ -1,4 +1,5 @@
 #!/bin/bash
+: "${BENCH_SUDO_PW:?set BENCH_SUDO_PW (Pi sudo password) in the environment}"
 # SPDX-FileCopyrightText: 2026 noknok (Christopher Houben)
 # SPDX-License-Identifier: MIT
 #
@@ -31,8 +32,8 @@ done
 echo "$(ts) STEP 1 router gone (no answer for 30 s)"
 timeout 3000 python3 $BP/tools/bench/serial_listen.py 2700 > ~/dev/pico/dev79_console.log 2>&1 &
 sleep 2
-echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a off >/dev/null; sleep 4
-echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a on >/dev/null
+echo "$BENCH_SUDO_PW" | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a off >/dev/null; sleep 4
+echo "$BENCH_SUDO_PW" | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a on >/dev/null
 echo "$(ts) STEP 2 brain power-cut, cold boot without a network (plug the router back in after ~5 min)"
 until ping -c 1 -W 1 $ROUTER >/dev/null 2>&1; do sleep 2; done
 T_BACK=$(date +%s)

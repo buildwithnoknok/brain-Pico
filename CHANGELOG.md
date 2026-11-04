@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## bench tools - 2026-11-04
+
+- DEV-180 - bench/soak/usb_bench scripts and docs read the Pi sudo password from env `BENCH_SUDO_PW` (scripts abort if unset) instead of a hard-coded default; no credentials in the public repo. Not run on hardware. Breaking: no (set `BENCH_SUDO_PW`).
+
 ## docs only (no code change) - 2026-11-03
 
 - DEV-184 - new `docs/device-protocol.md`: Device Protocol v1 overview written from the code (message format, carrier, settings model and lifetimes, what is not built, `/rpc` is unauthenticated today). `docs/provisioning-http-api.md` now says mDNS is on by default (it has been since code.py 0.36) and points to the new page; README BLE wording corrected. Breaking: no.
