@@ -5,7 +5,7 @@
 # dhcp_offers.py [IFACE] [SECONDS] - DEV-113: who answers DHCP on this network?
 #
 # Runs on the bench host (needs root for UDP port 68):
-#   echo raspberry | sudo -S python3 dhcp_offers.py wlan0 8
+#   echo "$BENCH_SUDO_PW" | sudo -S python3 dhcp_offers.py wlan0 8
 # Sends ONE DHCPDISCOVER with a random, locally administered MAC and prints every
 # DHCPOFFER that comes back: server, offered address, gateway, DNS. Requests nothing,
 # so no lease is taken. A healthy home network shows exactly one offer (the router).

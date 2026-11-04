@@ -1,4 +1,5 @@
 #!/bin/bash
+: "${BENCH_SUDO_PW:?set BENCH_SUDO_PW (Pi sudo password) in the environment}"
 # SPDX-FileCopyrightText: 2026 noknok (Christopher Houben)
 # SPDX-License-Identifier: MIT
 #
@@ -63,8 +64,8 @@ else
     say "round 3: online=${s:-no} $info  FAIL"
 fi
 say "power cut (uhubctl -l 2, real power-on): count must go back to 0"
-echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a off >/dev/null; sleep 4
-echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a on  >/dev/null
+echo "$BENCH_SUDO_PW" | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a off >/dev/null; sleep 4
+echo "$BENCH_SUDO_PW" | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a on  >/dev/null
 s=$(online_within 240)
 v=$(nvm6)
 if [ -n "$s" ] && [ "$v" = "NVM6=a0" ]; then

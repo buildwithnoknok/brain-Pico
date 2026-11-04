@@ -6,7 +6,7 @@
 # does this Pico answer DHCP on the HOME network with 192.168.4.x? Set STOP_DHCP = True
 # to test the fix (code.py 0.32 _stop_ap(): stop_dhcp_ap() after stop_ap()).
 # While it prints "PROBE NOW", run on the Pi:
-#   echo raspberry | sudo -S python3 tools/bench/dhcp_offers.py wlan0 8
+#   echo "$BENCH_SUDO_PW" | sudo -S python3 tools/bench/dhcp_offers.py wlan0 8
 # A "<-- noknok setup-hotspot DHCP (rogue)" line = cause confirmed. Uses /data/wifi.json,
 # never prints the password. Ends with microcontroller.reset() (clean radio again).
 import json, time, wifi, microcontroller

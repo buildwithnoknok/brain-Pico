@@ -1,4 +1,5 @@
 #!/bin/bash
+: "${BENCH_SUDO_PW:?set BENCH_SUDO_PW (Pi sudo password) in the environment}"
 # SPDX-FileCopyrightText: 2026 noknok (Christopher Houben)
 # SPDX-License-Identifier: MIT
 #
@@ -38,8 +39,8 @@ grep -q 'dev107_store_cuts' "$SCRIPT" || { echo "could not patch PHASES"; exit 1
 ts() { date '+%F %T'; }
 say() { echo "$(ts) $*" | tee -a "$LOG"; }
 cut() {
-    echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a off >/dev/null; sleep 3
-    echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a on  >/dev/null
+    echo "$BENCH_SUDO_PW" | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a off >/dev/null; sleep 3
+    echo "$BENCH_SUDO_PW" | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a on  >/dev/null
 }
 # HAND=1: a person pulls the brain's cable during the tone and plugs it back in (the original
 # DEV-107 condition: data lines break and re-make mechanically). Returns 1 if nobody pulled.
@@ -64,7 +65,7 @@ diag() {   # $1 = round
         timeout 30 python3 "$REPO/tools/bench/serial_listen.py" 10 --ctrlc
         echo "-- rpc hello again"; up; echo
         echo "-- data-only port cycle (hub 1-1 port 4)"
-        echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 1-1 -p 4 -a cycle -d 2 >/dev/null
+        echo "$BENCH_SUDO_PW" | sudo -S -p "" /usr/sbin/uhubctl -l 1-1 -p 4 -a cycle -d 2 >/dev/null
         sleep 8
         echo "-- rpc hello after the port cycle (uptime continued = no reset)"; up; echo
         dmesg | tail -8

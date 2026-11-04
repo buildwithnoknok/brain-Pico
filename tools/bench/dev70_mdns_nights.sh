@@ -1,4 +1,5 @@
 #!/bin/bash
+: "${BENCH_SUDO_PW:?set BENCH_SUDO_PW (Pi sudo password) in the environment}"
 # SPDX-FileCopyrightText: 2026 noknok (Christopher Houben)
 # SPDX-License-Identifier: MIT
 #
@@ -68,8 +69,8 @@ for mode in $PHASES; do
     { grep -v NOKNOK_MDNS "$BASE"; echo "NOKNOK_MDNS = $v"; } > "$OUT/settings.toml"
     (cd "$PICO" && timeout 120 ./pico.py put "$OUT/settings.toml" settings.toml) \
         || echo "$(ts) FAIL settings put (phase $n)"
-    echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a off >/dev/null; sleep 4
-    echo raspberry | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a on  >/dev/null
+    echo "$BENCH_SUDO_PW" | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a off >/dev/null; sleep 4
+    echo "$BENCH_SUDO_PW" | sudo -S -p "" /usr/sbin/uhubctl -l 2 -a on  >/dev/null
     sleep 90
     # A cold boot can come up OFFLINE (seen 23 Oct 02:57 and 03:04): the product runs and
     # the brain joins later through its rejoin loop. Wait up to BOOT_WAIT_S for that

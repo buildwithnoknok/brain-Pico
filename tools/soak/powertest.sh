@@ -1,4 +1,5 @@
 #!/bin/sh
+: "${BENCH_SUDO_PW:?set BENCH_SUDO_PW (Pi sudo password) in the environment}"
 # SPDX-FileCopyrightText: 2026 noknok (Christopher Houben)
 # SPDX-License-Identifier: MIT
 #
@@ -24,10 +25,10 @@ BEFORE=$(timeout 60 python3 pico.py run uptime_pico.py 40 2>&1 | grep -o 'monoto
 echo "method : uhubctl $ARGS"
 echo "before : $BEFORE"
 
-echo raspberry | sudo -S /usr/sbin/uhubctl $ARGS -a off > /tmp/uh_off.txt 2>&1
+echo "$BENCH_SUDO_PW" | sudo -S /usr/sbin/uhubctl $ARGS -a off > /tmp/uh_off.txt 2>&1
 tail -3 /tmp/uh_off.txt | sed 's/^/  off: /'
 sleep "$OFF"
-echo raspberry | sudo -S /usr/sbin/uhubctl $ARGS -a on > /tmp/uh_on.txt 2>&1
+echo "$BENCH_SUDO_PW" | sudo -S /usr/sbin/uhubctl $ARGS -a on > /tmp/uh_on.txt 2>&1
 tail -3 /tmp/uh_on.txt | sed 's/^/  on : /'
 
 i=0

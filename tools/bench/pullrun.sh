@@ -1,4 +1,5 @@
 #!/bin/sh
+: "${BENCH_SUDO_PW:?set BENCH_SUDO_PW (Pi sudo password) in the environment}"
 # SPDX-License-Identifier: MIT
 # pullrun.sh ROUNDS [MIN_DELAY MAX_DELAY] (seconds after the update starts) - DEV-124 power-pull run, Pi side. Needs J1 powered from a Pi USB
 # port. Each round: start an app update on the Pico, cut ALL Pi USB power (uhubctl -l 2, a real VBUS cut on
@@ -7,7 +8,7 @@
 ROUNDS=${1:-5}; MIN=${2:-0.05}; MAX=${3:-1.8}   # MIN/MAX: random delay AFTER the PR START marker
 cd /home/noknok/dev/pico || exit 1
 mkdir -p ~/bob/pr; : > ~/bob/pullrun.log
-usb() { echo raspberry | sudo -S /usr/sbin/uhubctl -l 2 -a "$1" >/dev/null 2>&1; }
+usb() { echo "$BENCH_SUDO_PW" | sudo -S /usr/sbin/uhubctl -l 2 -a "$1" >/dev/null 2>&1; }
 wait_port() { i=0; while [ $i -lt 40 ]; do ls /dev/serial/by-id/usb-Raspberry_Pi_Pico*-if00 >/dev/null 2>&1 && return 0; i=$((i+1)); sleep 1; done; return 1; }
 classify() { for t in 1 2 3 4; do o=$(timeout 40 python3 pico.py run pr_check.py 30 2>&1 | grep "PR STATE"); [ -n "$o" ] && { echo "$o"; return; }; sleep 4; done; echo "PR STATE unreadable"; }
 n=0; hit=0; clean=0; early=0; parked=0; brick=0; old=0; new=0
