@@ -31,7 +31,7 @@
 # Port: the by-id path is stable across re-enumeration; ttyACM numbering is not
 # (the WCH-LinkE also exposes a CDC port and grabs ttyACM0 if it enumerates first).
 
-import os, sys, time, glob, serial
+import os, sys, time, glob, signal, serial
 
 # PICO_SERIAL=<serial> picks one board when several Picos are plugged in (else the first found).
 PORT_GLOB = '/dev/serial/by-id/usb-Raspberry_Pi_Pico*%s-if00' % os.environ.get('PICO_SERIAL', '')
@@ -80,12 +80,20 @@ class Pico:
         self.ser.write(CTRL_B + CTRL_C + CTRL_C)
         try:
             self._read_until(b'>>> ', timeout=3.0)
-        except TimeoutError:
-            # code.py had already finished ("Code done running ... Press any
-            # key to enter the REPL") — typical right after a reset. Ctrl-C is
-            # not "a key" there; a carriage return is. Then the prompt appears.
-            self.ser.write(b'\r')
-            self._read_until(b'>>> ', timeout=8.0)
+        except TimeoutError as e:
+            # DEV-173: a previous pico.py killed mid-run leaves the board in the RAW
+            # REPL (prints 'raw REPL; CTRL-B to exit' / '>', never '>>> '). Ctrl-B
+            # leaves it; send it again and accept the friendly prompt.
+            seen = str(e)
+            if 'raw REPL' in seen or seen.rstrip("'\")").endswith('>'):
+                self.ser.write(CTRL_B)
+                self._read_until(b'>>> ', timeout=5.0)
+            else:
+                # code.py had already finished ("Code done running ... Press any
+                # key to enter the REPL") — typical right after a reset. Ctrl-C is
+                # not "a key" there; a carriage return is. Then the prompt appears.
+                self.ser.write(b'\r')
+                self._read_until(b'>>> ', timeout=8.0)
         self.ser.write(CTRL_A)
         self._read_until(b'raw REPL; CTRL-B to exit\r\n>', timeout=5.0)
 
@@ -224,7 +232,7 @@ class Pico:
         return rc
 
     def reset(self):
-        self.ser.write(CTRL_C + CTRL_C)
+        self.ser.write(CTRL_B + CTRL_C + CTRL_C)   # Ctrl-B: leave a raw REPL left by a killed run (DEV-173)
         time.sleep(0.2)
         self.ser.write(CTRL_D)       # soft reboot -> code.py runs again
         print('soft reboot sent')
@@ -237,6 +245,18 @@ def main(argv):
         return 2
     cmd, args = argv[1], argv[2:]
     p = Pico()
+
+    def _leave_raw(signum, frame):
+        # DEV-173: `timeout N pico.py ...` kills us with SIGTERM mid-run. Without this the
+        # board stays in the raw REPL (silent, no '>>>') and the next session times out.
+        try:
+            p.ser.write(CTRL_C + CTRL_B)
+            p.ser.flush()
+        except Exception:
+            pass
+        os._exit(128 + signum)
+    signal.signal(signal.SIGTERM, _leave_raw)
+    signal.signal(signal.SIGINT, _leave_raw)
     if cmd == 'run':   return p.run(*args)
     if cmd == 'exec':  return p.exec(args[0])
     if cmd == 'put':   return p.put(*args)

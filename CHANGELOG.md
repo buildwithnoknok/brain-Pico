@@ -4,6 +4,11 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## code.py 0.40 + bench tools - 2026-11-05
+
+- DEV-189 - a parked brain (3 crash strikes) is verified reachable: it joins WiFi and answers `/rpc` (`hello` state `parked`), and the app's `reboot` gets it out of park. New: if the network side fails while parked, the brain parks offline (radio off, knob factory reset still works) instead of ending `code.py`. Bench test `tools/bench/bench_dev189_park.py`. Breaking: no.
+- DEV-173 - `tools/pico.py`: leaves a raw REPL first (Ctrl-B before Ctrl-C in `reset`, raw-REPL prompt accepted in `enter_raw`), and a run killed by `timeout` (SIGTERM/SIGINT) now sends Ctrl-C + Ctrl-B before exiting, so the board is not left silent in the raw REPL. Host test `tools/test_pico_raw.py`. Breaking: no.
+
 ## bench tools - 2026-11-04
 
 - DEV-180 - bench/soak/usb_bench scripts and docs read the Pi sudo password from env `BENCH_SUDO_PW` (scripts abort if unset) instead of a hard-coded default; no credentials in the public repo. Not run on hardware. Breaking: no (set `BENCH_SUDO_PW`).
