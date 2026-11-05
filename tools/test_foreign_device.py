@@ -12,6 +12,11 @@
 #              address: no noknok object is created; the state entry is kept.
 #   busy     - a real module that misses the first GET_VERSION is still restored.
 #   regress  - a noknok-only bus enumerates and restores exactly as before.
+#   orphan   - DEV-188: a WIPED brain (no saved modules) finds noknok modules that kept
+#              their addresses, restarts them through the bootloader round trip and
+#              adopts them; a module without a bootloader stays skipped; a foreign
+#              board gets at most one 0xB1 probe there, and none on a brain that has
+#              saved modules.
 #
 # Run from the repo root:   python -I tools/test_foreign_device.py
 
@@ -58,6 +63,7 @@ class NoknokDev:
         self.last_cmd = None
         self.miss_b1 = 0             # GET_VERSION replies to drop (module busy)
         self.armed = False           # a 0xB1 was just written (not a presence ping)
+        self.has_bl = True           # answers 0xB0 by going to its bootloader at 0x7E
 
     def reply(self, buf):
         if self.last_cmd == 0xB1:
@@ -122,6 +128,13 @@ class FakeBus:
         return None
 
     def readfrom_into(self, addr, buf):
+        if addr == 0x7E:
+            d = self._at(0x7E)
+            if d is None:
+                raise OSError(19)
+            for i in range(len(buf)):
+                buf[i] = 0                   # bootloader status: idle, no error
+            return
         if addr == 0x7F:
             for d in self.devs:
                 if isinstance(d, NoknokDev) and d.address is None:
@@ -146,6 +159,13 @@ class FakeBus:
         d = self._at(addr)
         if d is None:
             raise OSError(19)
+        if addr == 0x7E and isinstance(d, NoknokDev):
+            if data and data[0] == 0x05:     # bootloader BOOT: the app restarts at 0x7F
+                d.address = None
+            return
+        if isinstance(d, NoknokDev) and data and data[0] == 0xB0 and d.has_bl:
+            d.address = 0x7E                 # app -> bootloader
+            return
         if isinstance(d, ForeignDev):
             d.writes += 1
             d.cmds.append(data[0] if data else None)
@@ -154,7 +174,7 @@ class FakeBus:
             d.armed = d.last_cmd == 0xB1
 
     def scan(self):
-        return sorted(d.address for d in self.devs if d.address)
+        return sorted(d.address for d in self.devs if d.address and 0x08 <= d.address <= 0x77)
 
 
 busio = types.ModuleType("busio")
@@ -215,7 +235,8 @@ got = addrs(c)
 check("two modules found", len(got) == 2, repr(got))
 check("...neither got 0x08 (foreign device there)", 0x08 not in got.values(), repr(got))
 check("...the log names the skipped address", "device at 0x08 (bus A)" in log, log)
-check("...the foreign device never got a write", oled.writes == 0, "writes=%d" % oled.writes)
+check("...fresh brain: the foreign device got at most one write, a 0xB1 probe (DEV-188)",
+      oled.writes <= 1 and set(oled.cmds) <= {0xB1}, "cmds=%r" % oled.cmds)
 
 WIRED.clear()
 WIRED[A] = [NoknokDev(BUZ, 0x01)]
@@ -284,6 +305,50 @@ check("...no 'skipped' line", "address skipped" not in log, log)
 power_cycle()
 c, log = boot()
 check("power cycle: same stable addresses", addrs(c) == first, repr(addrs(c)))
+
+# ── orphan (DEV-188) ──────────────────────────────────────────────────────────
+print("orphan: wiped brain, modules kept their addresses (J1 powered)")
+import module_flasher                          # noqa: E402
+module_flasher.time.sleep = lambda s: None
+WIRED.clear()
+buz, knob, ledb = NoknokDev(BUZ, 0x01), NoknokDev(KNOB, 0x02), NoknokDev(LEDB, 0x03)
+WIRED[A] = [buz, knob]
+WIRED[B] = [ledb]
+c, log = boot(keep_store=False)
+first = addrs(c)
+check("setup: three modules enumerated", len(first) == 3, repr(first))
+c, log = boot(keep_store=False)                # the wipe: Store empty, modules NOT power-cycled
+got = addrs(c)
+check("wiped brain adopts all three", len(got) == 3, repr(got) + log)
+check("...the log says 'adopted orphan' three times", log.count("adopted orphan") == 3, log)
+check("...no 'address skipped' line", "address skipped" not in log, log)
+c, log = boot()
+check("...reload afterwards: restored, no adoption", addrs(c) == got and "adopted" not in log,
+      repr(addrs(c)) + log)
+
+print("orphan: a module without a 0x7E bootloader")
+WIRED.clear()
+buz, knob = NoknokDev(BUZ, 0x01), NoknokDev(KNOB, 0x02)
+WIRED[A] = [buz, knob]
+c, log = boot(keep_store=False)
+knob.has_bl = False
+c, log = boot(keep_store=False)
+check("buzzer adopted", BUZ in addrs(c), repr(addrs(c)))
+check("...knob not adopted, logged, its address stays skipped",
+      KNOB not in addrs(c) and "no bootloader answer" in log and "address skipped" in log, log)
+
+print("orphan: foreign board next to modules")
+WIRED.clear()
+oled = ForeignDev(0x3C)
+WIRED[A] = [NoknokDev(BUZ, 0x01), oled]
+c, log = boot(keep_store=False)
+check("wiped brain: foreign board got at most one 0xB1 probe",
+      oled.writes <= 1 and set(oled.cmds) <= {0xB1}, repr(oled.cmds))
+check("...and was never adopted or given an object",
+      0x3C not in addrs(c).values() and len(addrs(c)) == 1, repr(addrs(c)))
+oled.writes, oled.cmds = 0, []
+c, log = boot()                                # brain with saved modules
+check("brain with saved modules: foreign board gets NO write", oled.writes == 0, repr(oled.cmds))
 
 print("\n%s (%d failure%s)" % ("PASS" if not fails else "FAIL", fails, "" if fails == 1 else "s"))
 sys.exit(1 if fails else 0)

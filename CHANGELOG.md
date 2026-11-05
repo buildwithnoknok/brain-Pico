@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## noknok.py 1.25 - 2026-11-05
+
+- DEV-188 - a re-flashed or wiped brain (no saved modules) adopts noknok modules that kept their address because they stayed powered: an unknown address that answers `0xB1` with protocol `0x01` is restarted through the bootloader round trip and enumerated again at `0x7F`. Foreign I2C boards are still never given an address or a driver; on a brain with no saved modules they get one `0xB1` probe, otherwise no write (DEV-119). Host test `tools/test_foreign_device.py` (orphan cases). Breaking: no.
+
 ## code.py 0.40 + bench tools - 2026-11-05
 
 - DEV-189 - a parked brain (3 crash strikes) is verified reachable: it joins WiFi and answers `/rpc` (`hello` state `parked`), and the app's `reboot` gets it out of park. New: if the network side fails while parked, the brain parks offline (radio off, knob factory reset still works) instead of ending `code.py`. Bench test `tools/bench/bench_dev189_park.py`. Breaking: no.

@@ -136,6 +136,13 @@
 #             DEV-172 — hard_reset(): every deliberate reset switches the WiFi
 #             radio off first (a reset with the radio busy hung the next boot on
 #             the bench). factory_reset() uses it.
+# v1.25 (Sue): DEV-188 — a brain with NO saved modules (wiped, or Store lost) adopts
+#             noknok modules that kept their address while it was wiped: an unknown
+#             address that answers 0xB1 with PROTOCOL_VERSION is sent through the
+#             bootloader round trip (0xB0 -> 0x7E -> boot), one at a time, and the
+#             0x7F sweep adopts it (_adopt_orphan). A foreign board gets at most one
+#             0xB1 probe there; a brain with saved modules never writes to unknown
+#             addresses (DEV-119 unchanged). No bootloader answer = still skipped.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -156,7 +163,7 @@ import json
 import os
 import struct
 
-__version__ = "1.24"
+__version__ = "1.25"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -2251,6 +2258,18 @@ class Conductor:
         for bus_name, bus in self._buses():
             for a in self._scan(bus):
                 if 0x08 <= a <= 0x77 and a not in used:
+                    # DEV-188: a noknok module whose saved state was lost (brain wiped
+                    # or Store gone while the modules stayed powered) still sits on its
+                    # old address. If it passes the same interim noknok check restore
+                    # uses (DEV-119), send it through the bootloader round trip; its
+                    # app restarts at 0x7F and the sweep below adopts it with UID +
+                    # type. Only on a brain with NO saved modules (wiped / new): there
+                    # a foreign board gets at most ONE 0xB1 probe per boot (a register
+                    # pointer write; it never answers 0x01 so it gets nothing else).
+                    # A brain with saved modules never writes to unknown addresses.
+                    if (not known and self.read_version(a, bus)[0] == self.PROTOCOL_VERSION
+                            and self._adopt_orphan(a, bus, bus_name)):
+                        continue                # address is free again
                     used.add(a)
                     _print("  [enum] device at 0x%02X (bus %s) is not a known noknok "
                           "module - address skipped" % (a, bus_name))
@@ -2490,6 +2509,37 @@ class Conductor:
                 return (proto, ver)
             time.sleep(0.02)
         return None
+
+    def _adopt_orphan(self, addr, bus, bus_name):
+        """DEV-188: make a noknok module that the Store does not know (it kept its
+        address while the brain was wiped) start over at 0x7F, so enumerate()'s
+        sweep adopts it. Same round trip as bootloader_version(): 0xB0 -> bootloader
+        at 0x7E -> boot -> the app restarts unassigned. One module at a time (two at
+        0x7E would collide). True when the module left `addr`. A module without a
+        0x7E bootloader ignores 0xB0: False, it stays skipped (logged)."""
+        try:
+            from module_flasher import ModuleFlasher
+            f = ModuleFlasher(bus)
+            f.enter_bootloader(addr)
+            try:
+                f.wait_for_bootloader(timeout=1.0)
+            except Exception:
+                _print("  [enum] noknok module at 0x%02X (bus %s) is not in the saved "
+                       "state and has no bootloader answer - not adopted" % (addr, bus_name))
+                return False
+            try:
+                f.boot()
+            finally:
+                try:
+                    f.wait_for_bootloader_gone(timeout=2.0)
+                except Exception:
+                    pass
+        except Exception as e:
+            _print("  [enum] adopting 0x%02X (bus %s) failed: %r" % (addr, bus_name, e))
+            return False
+        _print("  [enum] adopted orphan noknok module from 0x%02X (bus %s): restarted, "
+               "re-enumerates at 0x7F" % (addr, bus_name))
+        return True
 
     def _restore_state(self, filename=None):
         """

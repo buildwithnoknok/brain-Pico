@@ -393,6 +393,14 @@ Core:
 - Dynamic I2C addressing: modules boot at staging address `0x7F` and are assigned runtime
   addresses; the Store caches the UID→address map so reboots re-find modules without
   re-enumerating (and self-heals if hardware changed).
+  An address where something answers that the Store does not know is never handed out
+  (DEV-119: a Qwiic / Stemma QT board at a fixed address). **Re-flashed or wiped brain while the
+  modules stayed powered (noknok.py 1.25, DEV-188):** a brain with no saved modules asks each
+  such address once for `0xB1`; a noknok module (reply byte 0 = protocol `0x01`) is sent through
+  the bootloader round trip (`0xB0` -> `0x7E` -> boot), one at a time, restarts at `0x7F` and is
+  adopted as new (log: `adopted orphan noknok module from 0x..`; about 1-2 s per module). A
+  foreign board gets that one `0xB1` probe only on such a brain; a brain with saved modules never
+  writes to unknown addresses.
 - **Factory reset by boot-hold (code.py 0.18)** — the one reset gesture every product shares:
   hold any LED Button or Knob button **while plugging in the power** and keep holding. After
   ~5 s (modules found) every LED Button lights white and a buzzer clicks; hold **3 s more** and
