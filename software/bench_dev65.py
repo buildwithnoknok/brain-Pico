@@ -81,7 +81,19 @@ try:
             return {t: dict({"version": v, "url": "x"}, **({} if layout is None else {"layout": layout}))
                     for t, v in fake.items()}
 
-        rep = c.firmware_report(manifest(2), read_layout=True, strict_layout=True)
+        # DEV-157: firmware_report()/update_all() also list module types this test does not
+        # exercise (the PicoHub - its stage-1 is its own line - and USB modules). Only the
+        # rows of the modules in `mods` are compared; the rest is printed, not judged.
+        uids = {getattr(m, "_uid_hex", None) for _, m in mods}
+
+        def mine(rows):
+            return [r for r in rows if r.get("uid") in uids]
+
+        rep_all = c.firmware_report(manifest(2), read_layout=True, strict_layout=True)
+        for r in rep_all:
+            if r.get("uid") not in uids:
+                print("    %-11s uid=%s fw %-7s (not tested here)" % (r["type"], r["uid"], r["installed"]))
+        rep = mine(rep_all)
         for r in rep:
             print("    %-11s uid=%s fw %-7s layout installed=%s image=%s  %s"
                   % (r["type"], r["uid"], r["installed"], r["layout_installed"],
@@ -94,7 +106,7 @@ try:
         # 2. wrong layout in the manifest -> every module with another layout is BLOCKED
         for wrong in (1, 2):
             lie = manifest(wrong)
-            res = c.update_all(lie, get_image, logfn=lambda *a: None)
+            res = mine(c.update_all(lie, get_image, logfn=lambda *a: None))
             mismatched = [r for r in rep if r["layout_installed"] != wrong]
             refused = {r["uid"] for r in res if not r["updated"] and r["error"]}
             check("image layout %d: every mismatching module refused, none written" % wrong,
@@ -104,7 +116,7 @@ try:
         # raises there, update_all() records the failure - nothing is flashed)
 
         # 3. fail closed: no layout in the manifest
-        res = c.update_all(manifest(None), get_image, logfn=lambda *a: None)
+        res = mine(c.update_all(manifest(None), get_image, logfn=lambda *a: None))
         check("manifest without layout: all refused, none written",
               len(res) == len(mods) and not any(r["updated"] for r in res))
 
