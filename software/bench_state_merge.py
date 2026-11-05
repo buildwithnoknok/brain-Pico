@@ -8,16 +8,19 @@
 # wiped the file and the rescue said "unknown UID".
 #
 # Step 6 of module-I2C-bootloader/firmware/stage0/test/regress_all.sh.
-import json
+# Precondition: the LED Button is parked at 0x7E (regress_all.sh does that) and
+# keyboard_firmware.bin is on the Pico for the rescue.
+# DEV-156: the saved module state lives in the Store (nvm) since DEV-18, not in
+# noknok_state.json - read it with noknok.store().get("state").
+import noknok
 from noknok import Conductor
 
 print("=== 1. enumerate with the LED Button parked ===")
 c = Conductor(); c.enumerate()
 print("   LED Buttons seen:", len(c.ledbutton), " buzzers:", len(c.buzzer))
 
-print("=== 2. state file after that enumerate ===")
-with open("noknok_state.json") as f:
-    st = json.load(f)
+print("=== 2. saved state (Store) after that enumerate ===")
+st = noknok.store().get("state") or {}
 for uid, info in st.items():
     a = info.get("address")
     print("   %s -> type %d @%s" % (uid, info["type"], ("0x%02X" % a) if a else "None (no address)"))
