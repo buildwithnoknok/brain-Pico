@@ -1,5 +1,14 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.39 (status sends at most 10 events per reply — DEV-169)
+# Version: 0.40 (parked brain: network fallback — DEV-189)
+#
+# v0.40 (Sue): DEV-189 — a parked brain (3 crash strikes) stays reachable (join WiFi, /rpc
+# hello/status/reboot/factory_reset/provision) - verified on the bench, that already worked.
+# New: the parked loop's network side is guarded - if it throws, the brain parks OFFLINE
+# (radio down, knob factory-reset still works) instead of ending code.py at a dead REPL.
+# Soft reload while parked: strikes kept (nvm), parks again WITH network; `reboot` / power-on
+# clear the strikes.
+#
+# v0.39: status sends at most 10 events per reply — DEV-169
 #
 # v0.39 also (Sue): DEV-181 — the RAM log ring keeps at most LOG_RING_CHARS (120) of
 #   each line: with the Maxi, long "[rpc] poll error" lines (~280 B, the raw request
@@ -474,7 +483,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.39"
+CODE_VERSION = "0.40"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -2446,6 +2455,28 @@ def _set_crash_count(n):
     except Exception:
         pass
 
+# ── Parked brain: network fallback (DEV-189) ──────────────────────────────────
+# A parked brain stays reachable (safe_idle joins WiFi and serves /rpc). If the network
+# side itself throws there, the exception must not end code.py (main() runs bare: an
+# uncaught exception leaves a dead brain at the REPL - not even the knob reset works).
+# _park_offline() logs it, puts the radio down and safe_idle carries on knob-only.
+
+def _park_offline(e):
+    """Network part of the parked loop failed: go offline, keep the knob. Returns False."""
+    log(f"[crash] parked: network side failed ({type(e).__name__}: {str(e)[:60]}) - "
+        f"staying parked OFFLINE until the next power-on or reset")
+    event(f"[CRASH] parked offline: network failed ({type(e).__name__})")
+    nk.set_service_hook(None)            # the knob driver must not pump (and rejoin) the radio
+    try:
+        rpc.stop_http()
+    except Exception:
+        pass
+    try:
+        wifi.radio.enabled = False
+    except Exception:
+        pass
+    return False
+
 # ── Safe-mode restarts (DEV-154) ───────────────────────────────────────────────
 # safemode.py (see that file) restarts a brain that CircuitPython put into safe
 # mode, at most SM_MAX times in a row, counting in nvm[6] and leaving the reason in
@@ -2972,14 +3003,25 @@ def safe_idle(connected):
     # Parked is exactly when the app must still get through (the "stopped"
     # card, DEV-36): the channel comes up after the re-fetch above (no more
     # client traffic) and this loop pumps it.
-    start_app_channel()
+    # DEV-189: the network side runs guarded - if it throws, park offline, keep the knob.
+    network = True
+    try:
+        if str(nk.env("NOKNOK_BENCH_PARK_NET_FAIL", "0")) == "1":     # bench only (DEV-189 test)
+            raise RuntimeError("bench: NOKNOK_BENCH_PARK_NET_FAIL")
+        start_app_channel()
+    except Exception as e:
+        network = _park_offline(e)
     while True:
         if knob is not None:
             try:
                 c.check_factory_reset(knob.read())
             except Exception:
                 pass
-        rpc.service()
+        if network:
+            try:
+                rpc.service()
+            except Exception as e:
+                network = _park_offline(e)
         time.sleep(0.05)
 
 

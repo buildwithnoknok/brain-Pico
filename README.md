@@ -260,6 +260,14 @@ setup-time writes into `/data`, `settings.toml` for pins and drive visibility; s
   lives in `microcontroller.nvm` and clears on a real power-on. After three, a clean boot parks
   in a safe idle that still answers the knob-hold factory reset and, if online, fetches a fresh
   `product.py` once — acting on it only if it differs. (It used to end at "Code done running".)
+  **Parked = still reachable (DEV-189, code.py 0.40):** the parked brain joins the home WiFi and
+  serves `/rpc` (`hello` says `state: parked`, `status.strikes` = 3; about 20 s after boot on the
+  bench). The app's `reboot` (a hard reset) or a product switch clears the strikes and gives three
+  fresh tries; a power cycle does the same. A **soft reload** (Ctrl-D, `supervisor.reload()`) keeps
+  the count, so the brain parks again, with network. If the network side itself fails while
+  parked, the brain logs `[CRASH] parked offline`, switches the radio off and keeps the knob-only
+  safe idle (it no longer ends `code.py`); a reset or power cycle brings the network back.
+  Bench-only flag to test that path: `NOKNOK_BENCH_PARK_NET_FAIL = 1` in `settings.toml`.
 - **Safe-mode restart (`safemode.py`, DEV-154).** If CircuitPython itself crashes (hard fault,
   brownout, ...) it starts in *safe mode*, where `code.py` never runs and the lamp stays dark.
   `safemode.py` then restarts the brain, at most **2 times in a row**; a third safe mode in a row
