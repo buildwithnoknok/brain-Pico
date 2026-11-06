@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## code.py 0.42 + noknok_fetch.py 1.0.0 (new) + module_flasher.py - 2026-11-06
+
+- DEV-205 - module firmware updates no longer fail with MemoryError: the daily OTA pass streams each image into the cache in 1 KB chunks (size and CRC32 checked against the published index before the rename; a failed or partial download leaves no cache entry and keeps the old one), and I2C modules are flashed from the cache file page by page. The new helper `noknok_fetch.py` is imported only inside the OTA pass, so a normal boot loads nothing extra. `module_flasher.crc32()` accepts an image that carries its checked CRC32. Before, a 16 KB image needed one contiguous block (the largest free block on a booted brain was 11 KB), so PicoHub 0.3.1 never reached brains. Breaking: no. New file to deploy: `noknok_fetch.mpy` (build_mpy.ps1, brain image and restore scripts include it).
+
 ## noknok.py 1.26 - 2026-11-06
 
 - DEV-204 - a module of another type at a saved address is no longer taken for the saved module: restore compares the firmware version a module reports with the one saved for it (new `fw` field in the saved state) and re-enumerates a mismatch through the bootloader round trip (`[MODULE]` line). So a PicoHub at an old Knob address can no longer be read as a held Knob at power-on (it had factory-reset a bench brain). A pass that restarted the PicoHub this way ends in one hard reset (fresh USB host, else the USB LEDs stay missing and the product parks). The 5 s knob-hold factory reset acts only on knobs / LED buttons verified in this boot (`Conductor.verify_modules`). code.py unchanged (0.41): its boot-hold call of `verified_pressables()` waits for DEV-207. Host test `tools/test_foreign_device.py` (dev204 cases), bench `tools/bench/bench_dev204_swap.py`. Breaking: no.

@@ -4,7 +4,7 @@
 complete noknok brain with **one gesture**: hold BOOTSEL, plug it into any PC, drag the file
 onto the `RP2350` drive. It holds CircuitPython **and** the CIRCUITPY filesystem (`boot.py`,
 `code.py`, `settings.toml`, `noknok.mpy`, `noknok_rpc.mpy`, `noknok_usb.mpy`,
-`module_flasher.mpy`, `lib/`). The same file is the factory-flash artefact.
+`module_flasher.mpy`, `noknok_fetch.mpy`, `lib/`). The same file is the factory-flash artefact.
 
 It replaces the multi-step bench recovery (flash_nuke → CircuitPython → copy files) for
 consumers and production. `tools/restore/restore_brain.sh` stays the bench tool (backups,

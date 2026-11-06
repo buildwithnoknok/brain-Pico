@@ -21,6 +21,7 @@ over I2C.
 | `bench_fs_policy.py` / `bench_store.py` / `bench_yank.py` | DEV-18 bench scripts (how to run them and the pass criteria: [TESTS.md](TESTS.md)): filesystem read-only outside a window; Store round-trip + stable addresses; board-guided power-yank test (beeps, then a tone = pull the cable). |
 | `lib/` | Pinned CircuitPython libraries the brain needs (see `lib/README.md`). |
 | `module_flasher.py` | I2C OTA flasher — streams a module application `.bin` to the CH32V003 bootloader (`ModuleFlasher`). Shared by the bench tool and (later) the provisioning flow. |
+| `noknok_fetch.py` | OTA-only helper (DEV-205): streams a module image into the firmware cache in 1 KB chunks (size + CRC32 checked before the rename) and lets the I2C flasher read the cached image page by page (`CachedImage`). Imported only inside the daily OTA pass, so a normal boot loads nothing extra. |
 | `bench_flash.py` | Bench bring-up tool — flashes application firmware onto a blank module (bootloader only) one at a time from the REPL. See [Bench-flashing modules](#bench-flashing-modules-bring-up). |
 | `trio_demo.py` | Light & Sound Controller demo — uses all three I2C modules. |
 | `noknok_setup_roles.py` | One-time role-assignment wizard. |
@@ -320,6 +321,10 @@ Earlier features:
   a WiFi drop cannot leave one module half-written and the rest untouched. The cache stays: it
   is the offline rescue source. (A download made after a Conductor has existed in the process
   can hang without timing out — reproduced 12 Sep 2026 — which is why the order is fixed.)
+  Images are streamed into the cache in 1 KB chunks and flashed from the cache file page by page
+  (`noknok_fetch.py`, code.py 0.42, DEV-205): the old `resp.content` / whole-file read needed one
+  free block of the image size and failed at ~16 KB on a booted brain (largest free block measured
+  at 11 KB with 117 KB free).
 - **`_bootloader_gate()` refuses an image the module cannot run.** Backwards compatibility is a
   promise about the *protocol*, not about *installability* — an app relinked to a new base
   address is wire-compatible and still hangs a module whose bootloader writes elsewhere, and
@@ -531,7 +536,7 @@ first had fragmented the heap) and the brain never started its setup AP. A `.mpy
 compiled — `noknok.py` 184 KB → `noknok.mpy` 45 KB — so it loads with a fraction of the RAM.
 
 - Build: `tools/build_mpy.ps1` → `C:\Users\chris\noknok\pico-deploy\mpy\` (`noknok`,
-  `noknok_rpc`, `noknok_usb`, `module_flasher`). `code.py` and `boot.py` stay `.py`.
+  `noknok_rpc`, `noknok_usb`, `module_flasher`, `noknok_fetch`). `code.py` and `boot.py` stay `.py`.
 - **`mpy-cross` must match the Pico's CircuitPython version** (10.3.1 → mpy v6.3). Official
   builds: `adafruit-circuit-python.s3.amazonaws.com` → `bin/mpy-cross/`. Upgrading
   CircuitPython means rebuilding.

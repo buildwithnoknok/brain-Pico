@@ -84,6 +84,9 @@ _ERRMSG = {
 
 def crc32(data):
     """zlib CRC32 (poly 0xEDB88320). Matches the bootloader's crc32_buf()."""
+    known = getattr(data, "known_crc32", None)   # DEV-205: file-backed image, CRC already checked
+    if known is not None:
+        return known
     try:
         import binascii
         return binascii.crc32(data) & 0xFFFFFFFF

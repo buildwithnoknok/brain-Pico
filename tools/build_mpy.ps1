@@ -27,7 +27,7 @@ $ErrorActionPreference = "Stop"
 $src = Join-Path $PSScriptRoot "..\software"
 
 # The libraries code.py and products import. Add new library files here.
-$libs = @("noknok.py", "noknok_rpc.py", "noknok_usb.py", "module_flasher.py")
+$libs = @("noknok.py", "noknok_rpc.py", "noknok_usb.py", "module_flasher.py", "noknok_fetch.py")
 
 if (-not (Test-Path $MpyCross)) { throw "mpy-cross not found: $MpyCross" }
 Write-Output ("Compiler: " + (& $MpyCross --version))

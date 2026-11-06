@@ -1,5 +1,5 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.41 (parked brain answers the app before the re-fetch — DEV-200)
+# Version: 0.42 (module images streamed into the cache, noknok_fetch — DEV-205)
 #
 # v0.41 (Sue): DEV-200 — safe_idle() starts the app channel FIRST and serves only the app for
 # PARK_REFETCH_AFTER_S (60 s) before the product.py re-fetch (a stalled download blocked
@@ -488,7 +488,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.41"
+CODE_VERSION = "0.42"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -2372,21 +2372,6 @@ def alert_customer():
 def _cache_paths(mtype):
     return "%s/fw_%s.bin" % (nk.DATA_DIR, mtype), "%s/fw_%s.json" % (nk.DATA_DIR, mtype)
 
-def _cache_image(mtype, image, spec):
-    """Store a verified image + sidecar. Returns the .bin path. Sidecar carries
-    what rescue needs to trust it later: version, layout, size, crc32."""
-    from module_flasher import crc32 as _crc
-    bin_path, meta_path = _cache_paths(mtype)
-    meta = {"version": spec.get("version"), "layout": spec.get("layout"),
-            "size": len(image), "crc32": "%08x" % _crc(image)}
-    # Both atomic, image first (DEV-18): a power cut between the two leaves an
-    # old sidecar next to a new image, which the size/crc32 check on read
-    # rejects — never a half-written file under the real name.
-    with nk.writable():                         # one window for the pair
-        nk.write_atomic(bin_path, image)
-        nk.write_atomic(meta_path, json.dumps(meta))
-    return bin_path
-
 def _cache_meta(mtype):
     """The sidecar for a type, or None. Cheap: no image read."""
     _, meta_path = _cache_paths(mtype)
@@ -2545,29 +2530,6 @@ def _is_fresh_start():
         return False
 
 
-def _download_image(session, url, timeout=30, size=None, crc32=None):
-    """Download one module's offset-linked app .bin over WiFi (BINARY, not .text).
-    Returns bytes. Raises on any connectivity/HTTP/size failure — update_all()
-    (noknok.py) catches it, marks that module FAILED and moves on to the rest.
-
-    `size` / `crc32` come from the module's index.json and are checked before
-    the bytes go anywhere near a module. The bootloader's own CRC cannot catch
-    a truncated or corrupted download — it is computed over whatever we send —
-    so without this a short download would be flashed, pass verification, hang
-    the module, get parked, and be downloaded again."""
-    resp = session.get(url, timeout=timeout)
-    try:
-        if resp.status_code != 200:
-            raise ValueError("HTTP %d" % resp.status_code)
-        image = resp.content
-    finally:
-        resp.close()
-    if len(image) < 256:  # a real app image is KBs; this size means an error
-        raise ValueError("image too small (%d bytes) — not a firmware binary" % len(image))
-    _verify_image(image, size, crc32)
-    return image
-
-
 def _verify_image(image, size, crc32):
     """Raise unless `image` matches the declared size and CRC32 (zlib). Either
     may be None (older index.json) — then that check is skipped."""
@@ -2676,10 +2638,9 @@ def check_and_flash_modules(module_firmware):
         if not url:
             continue
         try:
-            image = _download_image(session, url, size=spec.get("size"),
-                                    crc32=spec.get("crc32"))
-            _cache_image(mtype, image, spec)
-            log(f"[fw] cached {mtype} {spec.get('version')}: {len(image)} bytes")
+            from noknok_fetch import fetch_to_cache          # DEV-205: OTA-only import
+            n = fetch_to_cache(session, url, *_cache_paths(mtype), spec)
+            log(f"[fw] cached {mtype} {spec.get('version')}: {n} bytes")
         except Exception as e:
             log(f"[fw] fetch FAILED {mtype}: {e!r}")
             _field_alerts.append("fetch failed %s" % mtype)
@@ -2744,7 +2705,12 @@ def check_and_flash_modules(module_firmware):
     # The files stay afterwards — they ARE the rescue cache.
     def get_image(entry):
         spec = resolved.get(entry["type"]) or {}
-        image, meta = _cache_read(entry["type"])
+        if entry.get("bus") == "i2c":          # DEV-205: flash from the file, page by page
+            from noknok_fetch import open_cached
+            meta = _cache_meta(entry["type"]) or {}
+            image = open_cached(_cache_paths(entry["type"])[0], meta)
+        else:
+            image, meta = _cache_read(entry["type"])
         if meta.get("version") != spec.get("version"):
             raise ValueError("cache holds %s, current is %s (fetch failed?)"
                              % (meta.get("version"), spec.get("version")))

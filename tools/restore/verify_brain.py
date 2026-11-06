@@ -41,7 +41,7 @@ def exists(p):
 
 
 print("lib bytes:", walk("/lib"))
-for name in ("noknok", "noknok_rpc", "noknok_usb", "module_flasher"):
+for name in ("noknok", "noknok_rpc", "noknok_usb", "module_flasher", "noknok_fetch"):
     try:
         m = __import__(name)
         print("  import %-15s ok %s" % (name, getattr(m, "__version__", "")))
@@ -52,7 +52,7 @@ for name in ("code.py", "safemode.py", "boot.py", "settings.toml"):
     if not exists("/" + name):
         bad += 1
         print("  missing /" + name)
-for name in ("noknok.py", "noknok_rpc.py", "noknok_usb.py", "module_flasher.py"):
+for name in ("noknok.py", "noknok_rpc.py", "noknok_usb.py", "module_flasher.py", "noknok_fetch.py"):
     if exists("/" + name[:-3] + ".mpy") and exists("/" + name):
         bad += 1
         print("  both /%s and /%s.mpy exist (the .py wins and may not fit in RAM)" % (name, name[:-3]))

@@ -67,7 +67,7 @@ SECTOR = 512                                          # CircuitPython FILESYSTEM
 
 # What a brain consists of: tools/restore/restore_brain.sh (DEV-84), the reference.
 CODE_FILES = ("code.py", "boot.py", "safemode.py")   # safemode.py: DEV-154
-LIBS = ("noknok", "noknok_rpc", "noknok_usb", "module_flasher")   # imported by code.py -> .mpy
+LIBS = ("noknok", "noknok_rpc", "noknok_usb", "module_flasher", "noknok_fetch")   # imported by code.py -> .mpy
 
 UF2_MAGIC0, UF2_MAGIC1, UF2_MAGIC_END = 0x0A324655, 0x9E5D5157, 0x0AB16F30
 UF2_FLAG_FAMILY = 0x00002000
