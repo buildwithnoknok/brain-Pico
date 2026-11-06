@@ -402,6 +402,17 @@ Core:
   adopted as new (log: `adopted orphan noknok module from 0x..`; about 1-2 s per module). A
   foreign board gets that one `0xB1` probe only on such a brain; a brain with saved modules never
   writes to unknown addresses.
+  **A different module at a saved address (noknok.py 1.26, DEV-204):** the Store record keeps each
+  module's firmware version; a device at a saved address that reports another version is not
+  restored as that module (`[MODULE]` console line) and is re-enumerated through the same round
+  trip, so it comes back as what it really is - a PicoHub at an old Knob address is never read as
+  a held Knob by the boot-hold check. If the PicoHub itself went through that round trip, the
+  brain saves the corrected state and hard-resets once (the PicoHub's restart drops the USB port,
+  and the Pico's USB host only finds a USB module again after a hard reset). The 5 s knob-hold factory reset (`check_factory_reset`) only
+  acts after every knob / LED button was verified in this boot (seen at `0x7F`, or round-tripped
+  and back with the same UID and type). Not yet covered: two modules of different type with the
+  SAME firmware version swapped, then held at power-on (the boot-hold verification
+  `Conductor.verified_pressables()` exists but code.py does not call it yet - DEV-207).
 - **Factory reset by boot-hold (code.py 0.18)** — the one reset gesture every product shares:
   hold any LED Button or Knob button **while plugging in the power** and keep holding. After
   ~5 s (modules found) every LED Button lights white and a buzzer clicks; hold **3 s more** and

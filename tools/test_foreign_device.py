@@ -17,6 +17,9 @@
 #              adopts them; a module without a bootloader stays skipped; a foreign
 #              board gets at most one 0xB1 probe there, and none on a brain that has
 #              saved modules.
+#   dev204   - a module of another type at a saved address: other firmware -> not restored,
+#              round trip, re-adopted as itself; same firmware -> verify_modules() catches it;
+#              check_factory_reset() wipes only after the knob verified.
 #
 # Run from the repo root:   python -I tools/test_foreign_device.py
 
@@ -64,6 +67,7 @@ class NoknokDev:
         self.miss_b1 = 0             # GET_VERSION replies to drop (module busy)
         self.armed = False           # a 0xB1 was just written (not a presence ping)
         self.has_bl = True           # answers 0xB0 by going to its bootloader at 0x7E
+        self.fw = (2, 3, 0)          # GET_VERSION reply (DEV-204 compares it)
 
     def reply(self, buf):
         if self.last_cmd == 0xB1:
@@ -72,7 +76,7 @@ class NoknokDev:
                 self.armed = False
                 raise OSError(19)
             self.armed = False
-            buf[:4] = bytes([1, 2, 3, 0])[:len(buf)]
+            buf[:4] = bytes([1] + list(self.fw))[:len(buf)]
         else:
             for i in range(len(buf)):
                 buf[i] = 0
@@ -189,6 +193,7 @@ MOD0011 = {"NOKNOK_I2C_SDA": "GP10", "NOKNOK_I2C_SCL": "GP11",
 os.environ.update(MOD0011)
 A, B = ("GP11", "GP10"), ("GP21", "GP20")
 BUZ, KNOB, LEDB = "cdab67a8bcbdf011", "cdabaaa8bcbd3312", "cdab315428be26be"
+HUB = "cdab6e273abc758f"
 
 fails = 0
 def check(name, cond, extra=""):
@@ -349,6 +354,120 @@ check("...and was never adopted or given an object",
 oled.writes, oled.cmds = 0, []
 c, log = boot()                                # brain with saved modules
 check("brain with saved modules: foreign board gets NO write", oled.writes == 0, repr(oled.cmds))
+
+# ── DEV-204: a different module at a saved address ────────────────────────────
+print("dev204: PicoHub-like module on a saved Knob address (other firmware)")
+WIRED.clear()
+knob, hub = NoknokDev(KNOB, 0x02), NoknokDev(HUB, 0x07)
+hub.fw = (0, 3, 1)
+WIRED[A] = [knob, hub]
+c, log = boot(keep_store=False)
+first = addrs(c)
+check("setup: knob + hub enumerated, fw saved", len(first) == 2
+      and c._state_map()[KNOB].get("fw") == "2.3.0", repr(c._state_map()))
+ka, ha = first[KNOB], first[HUB]
+WIRED[A].remove(knob)                          # the knob is gone ...
+hub.address = ka                               # ... and the hub sits on the knob's saved address
+c, log = boot()
+check("hub NOT restored as the knob", not c.knob, repr(addrs(c)))
+check("...[MODULE] mismatch logged", "[MODULE]" in log and "not restored" in log, log)
+check("...hub re-enumerated as itself (round trip)", c.picohub is not None
+      and c.picohub._uid_hex == HUB, repr(addrs(c)) + log)
+
+print("dev204: same firmware, swapped type (restore cannot tell) -> verify_modules catches it")
+WIRED.clear()
+knob, ledb = NoknokDev(KNOB, 0x02), NoknokDev(LEDB, 0x03)
+WIRED[A] = [knob, ledb]
+c, log = boot(keep_store=False)
+first = addrs(c)
+knob.address, ledb.address = first[LEDB], first[KNOB]   # swapped, both report fw 2.3.0
+c, log = boot()
+check("restore (version only) still builds a knob object", len(c.knob) == 1, repr(addrs(c)))
+check("...that knob is not verified", not getattr(c.knob[0], "_verified", False))
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    ok = c.verify_modules(c.knob + c.ledbutton)   # all pressables, as the reset paths do
+check("verify_modules: both re-enumerate as themselves, knob = its own UID",
+      ok and c.knob and c.knob[0]._uid_hex == KNOB and c.knob[0]._verified, out.getvalue())
+
+print("dev204: an impostor that cannot round-trip fails verification")
+WIRED.clear()
+knob = NoknokDev(KNOB, 0x02)
+WIRED[A] = [knob]
+c, log = boot(keep_store=False)
+ka = addrs(c)[KNOB]
+WIRED[A].remove(knob)
+imp = NoknokDev(LEDB, 0x03)
+imp.address, imp.has_bl = ka, False            # same fw, no bootloader: restore takes it
+WIRED[A].append(imp)
+c, log = boot()
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    ok = c.verify_modules(c.knob)
+check("verify_modules False and [MODULE] logged (its button is ignored: no reset)",
+      not ok and "[MODULE]" in out.getvalue(), out.getvalue())
+
+print("dev204: check_factory_reset only wipes after the knob verified")
+calls = []
+class St:
+    pressed = True
+c._do_factory_reset = lambda: calls.append("reset")
+c._reset_feedback = lambda warn: None
+c.knob = [noknok.NoknokKnob(c.i2c, address=ka)]          # an unverified knob object
+c.knob[0]._uid_hex, c.knob[0].i2c_bus = KNOB, "A"
+def hold6(c):
+    """Press, then pretend the press started 6 s ago, press again (no clock patching:
+    enumerate() inside verify_modules() needs a running clock)."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        c.check_factory_reset(St())
+        c._reset_hold_start -= 6.0
+        c.check_factory_reset(St())
+hold6(c)
+check("impostor knob held 6 s: NO factory reset", calls == [], repr(calls))
+WIRED.clear()
+real = NoknokDev(KNOB, 0x02)
+WIRED[A] = [real]
+c, log = boot(keep_store=False)
+c._do_factory_reset = lambda: calls.append("reset")
+c._reset_feedback = lambda warn: None
+hold6(c)
+check("real (verified) knob held 6 s: factory reset", calls == ["reset"], repr(calls))
+
+print("dev204: a PicoHub round trip ends in ONE hard reset (fresh USB host), a knob round trip not")
+_orig_pins, _orig_hr = noknok.pins, noknok.hard_reset
+resets = []
+noknok.pins = lambda g: ("GP0", "GP1") if g == "usb" else _orig_pins(g)
+noknok.hard_reset = lambda *a, **k: resets.append("hard")
+WIRED.clear()
+knob, hub = NoknokDev(KNOB, 0x02), NoknokDev(HUB, 0x07)
+hub.fw = (0, 3, 1)
+WIRED[A] = [knob, hub]
+c, log = boot(keep_store=False)
+first = addrs(c)
+knob.address, hub.address = first[HUB], first[KNOB]      # swapped on the bus
+resets.clear()
+c, log = boot()
+check("swap incl. the PicoHub: exactly one hard reset after the save", resets == ["hard"],
+      repr(resets) + log)
+check("...the saved state is already corrected before it",
+      c._state_map()[HUB]["address"] == hub.address and c._state_map()[KNOB]["address"] == knob.address,
+      repr(c._state_map()))
+resets.clear()
+c, log = boot()
+check("...next boot: restored normally, no reset (no loop)", resets == [] and "[MODULE]" not in log,
+      repr(resets) + log)
+WIRED.clear()
+knob, ledb = NoknokDev(KNOB, 0x02), NoknokDev(LEDB, 0x03)
+ledb.fw = (2, 4, 1)
+WIRED[A] = [knob, ledb]
+c, log = boot(keep_store=False)
+first = addrs(c)
+knob.address, ledb.address = first[LEDB], first[KNOB]
+resets.clear()
+c, log = boot()
+check("swap without the PicoHub: re-adopted, no hard reset", resets == [] and "[MODULE]" in log
+      and len(addrs(c)) == 2, repr(resets) + log)
+noknok.pins, noknok.hard_reset = _orig_pins, _orig_hr
 
 print("\n%s (%d failure%s)" % ("PASS" if not fails else "FAIL", fails, "" if fails == 1 else "s"))
 sys.exit(1 if fails else 0)

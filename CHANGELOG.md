@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## noknok.py 1.26 - 2026-11-06
+
+- DEV-204 - a module of another type at a saved address is no longer taken for the saved module: restore compares the firmware version a module reports with the one saved for it (new `fw` field in the saved state) and re-enumerates a mismatch through the bootloader round trip (`[MODULE]` line). So a PicoHub at an old Knob address can no longer be read as a held Knob at power-on (it had factory-reset a bench brain). A pass that restarted the PicoHub this way ends in one hard reset (fresh USB host, else the USB LEDs stay missing and the product parks). The 5 s knob-hold factory reset acts only on knobs / LED buttons verified in this boot (`Conductor.verify_modules`). code.py unchanged (0.41): its boot-hold call of `verified_pressables()` waits for DEV-207. Host test `tools/test_foreign_device.py` (dev204 cases), bench `tools/bench/bench_dev204_swap.py`. Breaking: no.
+
 ## code.py 0.41 - 2026-11-06
 
 - DEV-200 - a parked brain starts the app channel first and serves only the app for 60 s before the product.py re-fetch (a stalled download had blocked `hello` for 71 s); the re-fetch is skipped if an app request created a Conductor meanwhile. Parked `hello` now answers about 6 s after boot (was 20-27 s). Breaking: no.

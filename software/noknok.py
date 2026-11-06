@@ -143,6 +143,14 @@
 #             0x7F sweep adopts it (_adopt_orphan). A foreign board gets at most one
 #             0xB1 probe there; a brain with saved modules never writes to unknown
 #             addresses (DEV-119 unchanged). No bootloader answer = still skipped.
+# v1.26 (Sue): DEV-204 — restore compares the firmware version a module reports with the
+#             one saved for that UID ('fw' in the Store record); a mismatch = a different
+#             module at the saved address: not restored, sent through the bootloader round
+#             trip, re-adopted at 0x7F with its real UID + type, [MODULE] event.
+#             Modules seen at 0x7F this boot are _verified; verify_modules() round-trips
+#             the others. check_factory_reset() only wipes after the knobs verified.
+#             set_event_hook() lets code.py record the events. A pass that
+#             round-tripped the PicoHub ends in hard_reset() (fresh USB host, DEV-133).
 #
 # Quick start:
 #   from noknok import Conductor
@@ -163,7 +171,7 @@ import json
 import os
 import struct
 
-__version__ = "1.25"
+__version__ = "1.26"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -222,6 +230,21 @@ console_file = _ConsoleFile()
 # offline products pay nothing. Makers add zero lines.
 
 _service_hook = None
+_event_hook = None
+
+def set_event_hook(fn):
+    """Install the function that records audit events (code.py's event(): the Store
+    ring the app reads via status). DEV-204 mismatch events go through it."""
+    global _event_hook
+    _event_hook = fn
+
+def _event(msg):
+    _print("  " + msg)
+    if _event_hook is not None:
+        try:
+            _event_hook(msg)
+        except Exception:
+            pass
 
 def set_service_hook(fn):
     """Install (or clear with None) the function the drivers call to service
@@ -2324,6 +2347,7 @@ class Conductor:
                 module, type_name = self._make_module(module_type, bus_name, addr, uid_hex)
                 if module is not None:
                     self._apply_version(module, addr)
+                    module._verified = True      # DEV-204: UID + type read from the module this boot
 
                 self._registry[uid_hex] = module
                 new_found += 1
@@ -2333,6 +2357,21 @@ class Conductor:
 
         # ── Step 3: Save state ────────────────────────────────────────────────
         self._save_state()
+
+        # DEV-204: the PicoHub went through the bootloader round trip in this pass (it was
+        # an orphan or sat on another module's saved address). Its restart drops the USB
+        # host port for a moment, and the Pico's PIO USB host never sees a USB module come
+        # back within one session (DEV-133): the product would run without its USB LEDs,
+        # crash and park. The corrected state is saved above, so a hard reset now gives a
+        # fresh host and the next boot restores everything normally (no loop: nothing is
+        # round-tripped again once the saved versions match).
+        if (getattr(self, "_roundtrips", 0) and self.picohub is not None
+                and getattr(self.picohub, "_verified", False) and pins("usb") is not None):
+            _event("[MODULE] the PicoHub restarted during enumeration - hard reset for a "
+                   "fresh USB host")
+            self._roundtrips = 0
+            hard_reset()
+        self._roundtrips = 0
 
         # ── Summary ───────────────────────────────────────────────────────────
         total = sum([len(self.buzzer), len(self.knob), len(self.ledbutton),
@@ -2463,6 +2502,11 @@ class Conductor:
                     t = 0
                 entry = {"address": module.address, "type": t,
                          "i2c_bus": getattr(module, "i2c_bus", "A")}   # DEV-74
+                fw = getattr(module, "firmware_version", None)
+                if fw:
+                    entry["fw"] = fw                # DEV-204: restore compares it
+                elif isinstance(data.get(uid_hex), dict) and data[uid_hex].get("fw"):
+                    entry["fw"] = data[uid_hex]["fw"]
                 if hasattr(module, "bootloader"):
                     bl = module.bootloader
                     entry["bl"] = list(bl) if bl else None
@@ -2539,7 +2583,45 @@ class Conductor:
             return False
         _print("  [enum] adopted orphan noknok module from 0x%02X (bus %s): restarted, "
                "re-enumerates at 0x7F" % (addr, bus_name))
+        self._roundtrips = getattr(self, "_roundtrips", 0) + 1
         return True
+
+    def verify_modules(self, mods):
+        """DEV-204: make sure each module in `mods` really is what the brain thinks.
+        A module seen at 0x7F this boot is verified (UID + type came from it). A
+        restored one is not: its address came from the Store. It is sent through the
+        bootloader round trip (as _adopt_orphan), re-enumerates at 0x7F, and passes
+        only if the same UID comes back as the same type. Used before any action
+        that reads a button for a factory reset. Re-enumerates the I2C buses if it
+        checked anything (addresses are stable). True when every module passed."""
+        todo = [m for m in mods if m is not None and not getattr(m, "_verified", False)]
+        if not todo:
+            return True
+        want = [(getattr(m, "_uid_hex", None), type(m), m.address,
+                 getattr(m, "i2c_bus", "A")) for m in todo]
+        for uid, cls, addr, bus_name in want:
+            bus = self._bus(bus_name)
+            if bus is not None:
+                self._adopt_orphan(addr, bus, bus_name)
+        self.enumerate()
+        ok = True
+        for uid, cls, addr, bus_name in want:
+            m = self._registry.get(uid)
+            if m is None or type(m) is not cls or not getattr(m, "_verified", False):
+                _event("[MODULE] 0x%02X (bus %s) is not the saved %s %s - its button is "
+                       "ignored" % (addr, bus_name, cls.__name__, uid))
+                ok = False
+        return ok
+
+    def verified_pressables(self):
+        """DEV-204, for code.py's boot-hold: verify every knob / LED button (bootloader
+        round trip for the ones restored from the Store) and return only the verified
+        ones. A different module at a saved Knob address read as 'held' and wiped a brain.
+        Lives here, not in code.py: code.py is compiled from source at every boot and
+        each KB there costs boot RAM (a 1 KB larger code.py left the radio deaf, 6 Nov)."""
+        self.verify_modules(list(self.ledbutton) + list(self.knob))
+        return [m for m in list(self.ledbutton) + list(self.knob)
+                if getattr(m, "_verified", False)]
 
     def _restore_state(self, filename=None):
         """
@@ -2582,6 +2664,18 @@ class Conductor:
                 # scan keeps the address from being handed out.
                 _print("  state: 0x%02X (bus %s) answers but not as a noknok module - "
                       "%s not restored" % (addr, bus_name, uid_hex))
+                continue
+            saved_fw = info.get("fw")
+            if saved_fw and version[1] != saved_fw:
+                # DEV-204: the device at this address reports another firmware than the
+                # module saved here - it is a different module (a PicoHub at an old Knob
+                # address factory-reset a brain through the boot-hold check). Do not
+                # restore it as the saved module; send it through the bootloader round
+                # trip so it re-enumerates at 0x7F with its real UID + type.
+                _event("[MODULE] 0x%02X (bus %s) answers fw %s, saved %s fw %s (type %s) - "
+                       "not restored, re-enumerating it" % (addr, bus_name, version[1],
+                                                             uid_hex, saved_fw, type_code))
+                self._adopt_orphan(addr, bus, bus_name)
                 continue
             claimed.add(addr)
 
@@ -3037,6 +3131,13 @@ class Conductor:
 
         # Target reached → confirm and reset.
         if held >= hold_seconds:
+            # DEV-204: a factory reset only from a knob verified in this boot - a
+            # different module at a saved knob address must never wipe the brain.
+            if not self.verify_modules(list(self.knob) + list(self.ledbutton)):
+                _print("[reset] hold ignored: a knob could not be verified (DEV-204)")
+                self._reset_hold_start = None
+                self._reset_warned = False
+                return
             self._reset_feedback(warn=False)   # confirmation
             self._do_factory_reset()
 
