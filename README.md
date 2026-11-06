@@ -261,8 +261,9 @@ setup-time writes into `/data`, `settings.toml` for pins and drive visibility; s
   in a safe idle that still answers the knob-hold factory reset and, if online, fetches a fresh
   `product.py` once — acting on it only if it differs. (It used to end at "Code done running".)
   **Parked = still reachable (DEV-189, code.py 0.40):** the parked brain joins the home WiFi and
-  serves `/rpc` (`hello` says `state: parked`, `status.strikes` = 3; about 20 s after boot on the
-  bench). The app's `reboot` (a hard reset) or a product switch clears the strikes and gives three
+  serves `/rpc` (`hello` says `state: parked`, `status.strikes` = 3; about 6 s after boot on the
+  bench since code.py 0.41: the app channel comes first, and the product.py re-fetch waits 60 s
+  so a slow download cannot block it - DEV-200). The app's `reboot` (a hard reset) or a product switch clears the strikes and gives three
   fresh tries; a power cycle does the same. A **soft reload** (Ctrl-D, `supervisor.reload()`) keeps
   the count, so the brain parks again, with network. If the network side itself fails while
   parked, the brain logs `[CRASH] parked offline`, switches the radio off and keeps the knob-only

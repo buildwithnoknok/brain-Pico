@@ -1,5 +1,10 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.40 (parked brain: network fallback — DEV-189)
+# Version: 0.41 (parked brain answers the app before the re-fetch — DEV-200)
+#
+# v0.41 (Sue): DEV-200 — safe_idle() starts the app channel FIRST and serves only the app for
+# PARK_REFETCH_AFTER_S (60 s) before the product.py re-fetch (a stalled download blocked
+# hello for 71 s). The re-fetch is skipped if an app request created a Conductor meanwhile
+# (DEV-32 rule). The DEV-189 network fallback (_park_offline) is unchanged.
 #
 # v0.40 (Sue): DEV-189 — a parked brain (3 crash strikes) stays reachable (join WiFi, /rpc
 # hello/status/reboot/factory_reset/provision) - verified on the bench, that already worked.
@@ -483,7 +488,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.40"
+CODE_VERSION = "0.41"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -2969,41 +2974,59 @@ def start_app_channel():
         log(f"[rpc] app channel NOT started (ignored): {e!r}")
 
 
+# DEV-200: a parked brain serves the app FIRST. The product.py re-fetch is a network
+# client that can stall for over a minute (seen: 71 s on one read) and nothing pumps
+# the app channel while it blocks, so it waits until the app has had this long.
+PARK_REFETCH_AFTER_S = 60
+
+
+def _park_pump(network):
+    """One pass of the parked app channel; returns False once it failed (offline)."""
+    if network:
+        try:
+            rpc.service()
+        except Exception as e:
+            network = _park_offline(e)
+    return network
+
+
+def _park_refetch(creds):
+    """A different product.py published upstream? Then try it (strikes reset, reload).
+    Runs only while no Conductor exists (DEV-32: a download after a Conductor existed
+    can hang)."""
+    try:
+        with open(product_script_path(), "r") as fh:
+            current = fh.read()
+        if download_and_save_script(creds.get("script_url")):
+            with open(PRODUCT_SCRIPT_FILE, "r") as fh:
+                fresh = fh.read()
+            if fresh != current:
+                log("[crash] a different product.py was published — trying it")
+                event("[CRASH] fresh product.py fetched, strikes reset")
+                _set_crash_count(0)
+                supervisor.reload()
+            log("[crash] published product.py is identical — staying parked")
+    except Exception as e:
+        log(f"[crash] re-fetch skipped: {e!r}")
+
+
 def safe_idle(connected):
     """Parked after CRASH_MAX crashes. Two ways out, neither needing a laptop:
     hold the knob for the factory-reset gesture (DEV-7 — this used to be dead
     here), or a newer product.py published upstream — fetched once if we are
     online, and only acted on if it actually differs from the one that crashes.
-    A power cycle also resets the strike count for three more tries."""
+    The app can also leave park (reboot / product switch = hard reset, DEV-189).
+    A power cycle also resets the strike count for three more tries.
+
+    Order (DEV-200): app channel first, PARK_REFETCH_AFTER_S of app-only service,
+    then the re-fetch (skipped if the app made a Conductor meanwhile), then the
+    Conductor and the knob loop."""
     log(f"[crash] product parked after {CRASH_MAX} crashes — safe idle. "
         f"Hold the knob to factory-reset.")
     event(f"[CRASH] parked after {CRASH_MAX} crashes")
 
-    if connected:
-        try:
-            creds = load_wifi_credentials() or {}
-            with open(product_script_path(), "r") as fh:
-                current = fh.read()
-            if download_and_save_script(creds.get("script_url")):
-                with open(PRODUCT_SCRIPT_FILE, "r") as fh:
-                    fresh = fh.read()
-                if fresh != current:
-                    log("[crash] a different product.py was published — trying it")
-                    event("[CRASH] fresh product.py fetched, strikes reset")
-                    _set_crash_count(0)
-                    supervisor.reload()
-                log("[crash] published product.py is identical — staying parked")
-        except Exception as e:
-            log(f"[crash] re-fetch skipped: {e!r}")
-
-    c = get_conductor()
-    knob = c.knob[0] if (c is not None and c.knob) else None
-    if knob is None:
-        log("[crash] no knob on the bus — power-cycle to retry")
-    # Parked is exactly when the app must still get through (the "stopped"
-    # card, DEV-36): the channel comes up after the re-fetch above (no more
-    # client traffic) and this loop pumps it.
-    # DEV-189: the network side runs guarded - if it throws, park offline, keep the knob.
+    # Parked is exactly when the app must still get through (the "stopped" card,
+    # DEV-36). DEV-189: the network side runs guarded - if it throws, park offline.
     network = True
     try:
         if str(nk.env("NOKNOK_BENCH_PARK_NET_FAIL", "0")) == "1":     # bench only (DEV-189 test)
@@ -3011,17 +3034,28 @@ def safe_idle(connected):
         start_app_channel()
     except Exception as e:
         network = _park_offline(e)
+
+    if connected and network:
+        until = time.monotonic() + PARK_REFETCH_AFTER_S
+        while network and time.monotonic() < until:
+            network = _park_pump(network)
+            time.sleep(0.05)
+        if network and nk.conductor() is None:
+            _park_refetch(load_wifi_credentials() or {})
+        elif network:
+            log("[crash] re-fetch skipped: modules already in use (an app request)")
+
+    c = get_conductor()
+    knob = c.knob[0] if (c is not None and c.knob) else None
+    if knob is None:
+        log("[crash] no knob on the bus — power-cycle to retry")
     while True:
         if knob is not None:
             try:
                 c.check_factory_reset(knob.read())
             except Exception:
                 pass
-        if network:
-            try:
-                rpc.service()
-            except Exception as e:
-                network = _park_offline(e)
+        network = _park_pump(network)
         time.sleep(0.05)
 
 
