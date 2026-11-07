@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## code.py 0.43 - 2026-11-07
+
+- DEV-196 - "Recover my device" (non-wipe brain image) kept the WiFi only if the brain's Store held a copy of it, and that copy was written only at setup: a brain set up before 15 Sep 2026, or whose Store record was lost, came back in setup mode. Every boot with a good `wifi.json` now also writes a missing Store copy (no write when it is already there), so those brains heal themselves on their next normal boot. Bench: copy back after one boot; recovery 4/4 with the product running after ~45 s. Breaking: no.
+
 ## code.py 0.42 + noknok_fetch.py 1.0.0 (new) + module_flasher.py - 2026-11-06
 
 - DEV-205 - module firmware updates no longer fail with MemoryError: the daily OTA pass streams each image into the cache in 1 KB chunks (size and CRC32 checked against the published index before the rename; a failed or partial download leaves no cache entry and keeps the old one), and I2C modules are flashed from the cache file page by page. The new helper `noknok_fetch.py` is imported only inside the OTA pass, so a normal boot loads nothing extra. `module_flasher.crc32()` accepts an image that carries its checked CRC32. Before, a 16 KB image needed one contiguous block (the largest free block on a booted brain was 11 KB), so PicoHub 0.3.1 never reached brains. Breaking: no. New file to deploy: `noknok_fetch.mpy` (build_mpy.ps1, brain image and restore scripts include it).

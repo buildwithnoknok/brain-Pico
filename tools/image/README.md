@@ -47,7 +47,10 @@ firmware + nvm) and `boards/raspberry_pi_pico2_w/mpconfigboard.mk` (`CIRCUITPY_F
 
 **Store kept (default) = consumer recovery.** The brain's WiFi copy survives in the Store:
 `code.py` rebuilds `/data/wifi.json` from it, joins the home WiFi, downloads its product
-again and runs - no app needed. A brain with nothing in the Store opens the `noknok-setup`
+again and runs - no app needed (bench, 7 Nov 2026: product running ~45 s after the copy).
+Since code.py 0.43 (DEV-196) every boot with a good `wifi.json` also writes a missing Store copy,
+so brains set up before 15 Sep 2026 (or whose Store record was lost) heal themselves on their
+next normal boot; before that, the image put them into setup mode. A brain with nothing in the Store opens the `noknok-setup`
 hotspot. **`-wipe` = factory state** (fresh chips have an empty nvm anyway; use it for a unit
 going to another person, or when the Store itself is suspect).
 
