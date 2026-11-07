@@ -1,5 +1,5 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.42 (module images streamed into the cache, noknok_fetch — DEV-205)
+# Version: 0.43 (wifi.json also back-fills a missing Store copy — DEV-196)
 #
 # v0.41 (Sue): DEV-200 — safe_idle() starts the app channel FIRST and serves only the app for
 # PARK_REFETCH_AFTER_S (60 s) before the product.py re-fetch (a stalled download blocked
@@ -488,7 +488,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.42"
+CODE_VERSION = "0.43"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -935,6 +935,7 @@ def load_wifi_credentials():
     for path in (WIFI_CREDENTIALS_FILE, _LEGACY_WIFI_FILE):
         creds = nk.read_json(path)
         if isinstance(creds, dict) and creds.get("ssid"):
+            nk.store().set(WIFI_STORE_KEY, creds)   # DEV-196: back-fill a missing copy (no-op if equal)
             return creds
     creds = nk.store().get(WIFI_STORE_KEY)
     if isinstance(creds, dict) and creds.get("ssid"):
