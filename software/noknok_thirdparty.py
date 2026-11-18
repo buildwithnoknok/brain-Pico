@@ -30,7 +30,8 @@ power-on register values matched), "family" (chip family only, e.g. SSD1306 size
 "user" (named by the user, not probed).
 
 Rules kept: no bit-banging (uses the Conductor's busio buses), no FS writes,
-reads return None on an I2C hiccup (same contract as noknok modules).
+reads return None on an I2C hiccup or a bus that is gone (same contract as noknok modules),
+and nothing here raises into the product loop.
 """
 
 import sys
@@ -42,7 +43,10 @@ except Exception:                       # pragma: no cover - running without nok
     def _service():
         pass
 
-__version__ = "0.3.0"   # 0.3.0: RESERVED_ADDRESSES removed (no address pool: DEV-246 cancelled);
+__version__ = "0.3.1"   # 0.3.1: attach() survives a bad saved naming (unknown type, broken key);
+                        #        a transfer on a bus that is gone returns None (ValueError /
+                        #        RuntimeError too, not only OSError) (DEV-248 review)
+                        # 0.3.0: RESERVED_ADDRESSES removed (no address pool: DEV-246 cancelled);
                         #        user namings + OLED height saved in the Store (remember/forget),
                         #        attach() applies them and caches compact status rows (c.thirdparty_rows);
                         #        bus_clear() / recover_buses() removed (the Conductor does it, DEV-245)
@@ -199,9 +203,11 @@ class ThirdPartyModule:
             return False
         _service()
         bus = self.i2c
-        while not bus.try_lock():
-            pass
+        locked = False
         try:
+            while not bus.try_lock():
+                pass
+            locked = True
             if inbuf is None:
                 bus.writeto(self.address, out)
             elif out is None:
@@ -209,11 +215,17 @@ class ThirdPartyModule:
             else:
                 bus.writeto_then_readfrom(self.address, out, inbuf)
             return True
-        except OSError:
+        except (OSError, ValueError, RuntimeError):
+            # OSError: I2C hiccup / chip gone. ValueError / RuntimeError: the bus object was
+            # deinit'ed under the driver. Either way: None to the product, chip marked lost.
             self._lost = True
             return False
         finally:
-            bus.unlock()
+            if locked:
+                try:
+                    bus.unlock()
+                except Exception:
+                    pass
 
     def _read_reg(self, reg, n):
         buf = bytearray(n)
@@ -230,15 +242,42 @@ class ThirdPartyModule:
 def _probe_reg(i2c, address, reg, n):
     """Read n bytes of register `reg` from a not-yet-identified chip. None on error."""
     buf = bytearray(n)
-    while not i2c.try_lock():
-        pass
+    locked = False
     try:
+        while not i2c.try_lock():
+            pass
+        locked = True
         i2c.writeto_then_readfrom(address, bytes([reg]), buf)
         return buf
-    except OSError:
+    except (OSError, ValueError, RuntimeError):
         return None
     finally:
-        i2c.unlock()
+        if locked:
+            try:
+                i2c.unlock()
+            except Exception:
+                pass
+
+
+def _probe_status(i2c, address):
+    """Plain 1-byte read (no register pointer) from a not-yet-identified chip, e.g. the
+    SSD1306 status byte. None on error."""
+    buf = bytearray(1)
+    locked = False
+    try:
+        while not i2c.try_lock():
+            pass
+        locked = True
+        i2c.readfrom_into(address, buf)
+        return buf[0]
+    except (OSError, ValueError, RuntimeError):
+        return None
+    finally:
+        if locked:
+            try:
+                i2c.unlock()
+            except Exception:
+                pass
 
 
 # ── Unknown device ────────────────────────────────────────────────────────────
@@ -334,7 +373,9 @@ def assign(c, type_name, bus_name, address, log=print):
 
 def _apply_options(m, opts):
     """Saved per-board options. Today only the OLED height (the chip cannot report it)."""
-    h = (opts or {}).get("height")
+    if not isinstance(opts, dict):          # nothing saved, or a broken entry: defaults
+        return
+    h = opts.get("height")
     if m.TYPE == "ssd1306" and h in (32, 64) and h != m.HEIGHT:
         m.set_size(h)
 
@@ -353,11 +394,7 @@ def attach(c, log=print, assign_map=None):
         setattr(c, t, [])
     sv = saved()
     if assign_map is None:
-        assign_map = {}
-        for k, e in sv.items():
-            if e.get("type"):
-                b, a = k.split("-")
-                assign_map[(b, int(a, 16))] = e["type"]
+        assign_map = _saved_namings(sv, log)
     for bus_name, bus in c._buses():
         own = _noknok_addresses(c, bus_name)
         for a in c._scan(bus):
@@ -365,12 +402,15 @@ def attach(c, log=print, assign_map=None):
                 continue
             named = assign_map.get((bus_name, a))
             if named:
-                m = load(named)(bus, a, bus_name)
-                if m.setup():
-                    _apply_options(m, sv.get(_key(bus_name, a)))
-                    _add(c, m)
-                    log("[3p] 0x%02X (bus %s): %s (named)" % (a, bus_name, m.NAME))
-                    continue
+                try:
+                    m = load(named)(bus, a, bus_name)
+                    if m.setup():
+                        _apply_options(m, sv.get(_key(bus_name, a)))
+                        _add(c, m)
+                        log("[3p] 0x%02X (bus %s): %s (named)" % (a, bus_name, m.NAME))
+                        continue
+                except Exception as e:      # renamed / removed driver, typo saved by the app
+                    log("[3p] 0x%02X (bus %s): saved naming %r skipped: %r" % (a, bus_name, named, e))
             m = identify(bus, a, bus_name, log)
             if isinstance(m, UnknownDevice):
                 c.unknown_devices.append(m)
@@ -394,6 +434,25 @@ def attach(c, log=print, assign_map=None):
         c.thirdparty_rows = info.describe(c)
         _unload("info")
     return c.thirdparty
+
+
+def _saved_namings(sv, log):
+    """{(bus, address): type} from the Store entries that name a board. A broken entry
+    (key that does not parse, type no driver has) is logged and skipped, never raised:
+    it would crash the product at every boot until the Store is wiped (DEV-248 review)."""
+    out = {}
+    for k, e in sv.items():
+        try:
+            t = e.get("type")
+            if not t:
+                continue
+            if t not in TYPES:
+                raise ValueError("no driver for this type")
+            b, a = k.split("-")
+            out[(b, int(a, 16))] = t
+        except Exception as ex:
+            log("[3p] saved entry %r skipped: %r" % (k, ex))
+    return out
 
 
 def _is_store(c, address):

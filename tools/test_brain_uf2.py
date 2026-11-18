@@ -183,7 +183,7 @@ for lib in B.LIBS:
           d[:2] == b"C\x06" and b"Users" not in d and b":/" not in d, d[:2])
     check("  ...and no %s.py next to it (a .py would win over the .mpy)" % lib, lib + ".py" not in f)
 expected = set(B.CODE_FILES) | {"settings.toml", ".fseventsd/no_log"} | {l + ".mpy" for l in B.LIBS} | set(libs)
-check("exactly the restore set: code.py, boot.py, settings.toml, 4 x .mpy, lib/",
+check("exactly the restore set: code.py, boot.py, settings.toml, %d x .mpy, lib/" % len(B.LIBS),
       set(f) == expected, sorted(set(f) ^ expected))
 restore = open(os.path.join(HERE, "restore", "restore_brain.sh"), encoding="utf-8").read()
 check("library list matches restore_brain.sh LIBS",

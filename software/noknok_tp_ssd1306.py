@@ -13,7 +13,7 @@ a 128x64 panel needs d.set_size(64) - the app would store that per board.
 Cost: one page = 129 bytes = ~12 ms at 100 kHz; show() sends the changed pages (all 4 of a
 128x32 = ~50 ms). show(max_pages=1) spreads that over several loop passes."""
 import time
-from noknok_thirdparty import ThirdPartyModule
+from noknok_thirdparty import ThirdPartyModule, _probe_status
 
 try:
     from noknok import _font8x16, _glyph_index      # the font the noknok Display uses
@@ -34,16 +34,8 @@ class SSD1306(ThirdPartyModule):
 
     @classmethod
     def identify(cls, i2c, address):
-        b = bytearray(1)
-        while not i2c.try_lock():
-            pass
-        try:
-            i2c.readfrom_into(address, b)
-        except OSError:
-            return False
-        finally:
-            i2c.unlock()
-        return (b[0] & 0x80) == 0
+        b = _probe_status(i2c, address)
+        return b is not None and (b & 0x80) == 0
 
     def set_size(self, height):
         """32 or 64 rows. Re-initialises the panel and clears the buffer."""

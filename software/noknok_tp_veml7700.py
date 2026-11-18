@@ -36,14 +36,23 @@ class VEML7700(ThirdPartyModule):
               (0b01, 0b0001), (0b01, 0b0010), (0b01, 0b0011))
     LOW, HIGH = 100, 20000      # raw counts: step more / less sensitive outside this
 
-    def setup(self, step=1, autorange=True):
-        """Start at gain 1/4, 100 ms (up to ~17,600 lx). With autorange, every
+    start_step, autorange = 1, True     # the product's choice, kept for recovery
+
+    def setup(self, step=None, autorange=None):
+        """Start at gain 1/4, 100 ms (step 1, up to ~17,600 lx). With autorange, every
         lux read moves ONE ladder step when the raw count is outside LOW..HIGH,
         so a product loop is never blocked; the value settles after a few reads
-        (worst case dark: 6 steps, ~2.5 s). Powers the chip on (SD = 0)."""
-        self.autorange = autorange
+        (worst case dark: 6 steps, ~2.5 s). Powers the chip on (SD = 0).
+        Arguments a product passes are kept: after a power loss the recovery calls
+        setup() without arguments and gets the same start step and autorange back.
+        Sleeps one integration time (~110 ms) for the first result; during a recovery
+        that happens inside the product loop, once per power loss."""
+        if step is not None:
+            self.start_step = step
+        if autorange is not None:
+            self.autorange = autorange
         self._last = None
-        ok = self._apply(step)
+        ok = self._apply(self.start_step)
         time.sleep(self.ITS[self._it] / 1000 + 0.01)   # first result after one IT
         return ok
 
@@ -77,6 +86,8 @@ class VEML7700(ThirdPartyModule):
 
     @property
     def lux(self):
+        """Lux, or None (no reading yet / I2C error). While a new range settles it may
+        repeat the last real value for up to 2 x the integration time."""
         if not self._check():
             return None
         if time.monotonic() < self._settle:
