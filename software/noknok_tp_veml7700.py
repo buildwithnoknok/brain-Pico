@@ -84,6 +84,11 @@ class VEML7700(ThirdPartyModule):
         raw = self._raw(self.REG_ALS)
         if raw is None:
             return None
+        if raw == 0 and self.autorange and self._step < len(self.LADDER) - 1:
+            # Bench 18 Nov 2026: in a dim room (0.7 lx) the start range (gain 1/4) counts 0.
+            # That is "below this range", not "dark": step up, report no value yet.
+            self._apply(self._step + 1)
+            return self._last
         x = raw * self._resolution()
         if self.GAINS[self._gain] < 1.0 and x > 100:
             # Vishay non-linearity correction for low gain / high light
