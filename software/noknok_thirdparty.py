@@ -43,6 +43,8 @@ except Exception:                       # pragma: no cover - running without nok
         pass
 
 __version__ = "0.3.0"   # 0.3.0: RESERVED_ADDRESSES removed (no address pool: DEV-246 cancelled);
+                        #        user namings + OLED height saved in the Store (remember/forget),
+                        #        attach() applies them and caches compact status rows (c.thirdparty_rows);
                         #        bus_clear() / recover_buses() removed (the Conductor does it, DEV-245)
                         # 0.2.2: pull-up check suggests which board to move to the other bus
 
@@ -63,6 +65,46 @@ TYPES = tuple(t for t, _, _ in REGISTRY)
 
 # No reserved addresses (DEV-246 cancelled, 17 Nov 2026): boards are plugged in with the
 # brain off; at boot the Conductor skips every address that answers (DEV-119).
+
+
+# What the user told the brain about a board (DEV-249 ops thirdparty.assign / .set / .forget):
+# Store key "thirdparty" = {"A-30": {"type": "soldered_pir"}, "A-3c": {"height": 64}} (nvm/FRAM,
+# never the FAT: ADR-003). attach() reads it by itself, so a product needs no extra code.
+STORE_KEY = "thirdparty"
+
+
+def _key(bus_name, address):
+    return "%s-%02x" % (bus_name, address)
+
+
+def saved():
+    """The saved namings / options, {} without a Store (e.g. on a desktop)."""
+    try:
+        from noknok import store
+        return dict(store().get(STORE_KEY) or {})
+    except Exception:
+        return {}
+
+
+def remember(bus_name, address, **fields):
+    """Save fields for one board (type=..., height=...). Returns the saved entry."""
+    from noknok import store
+    sv = saved()
+    e = dict(sv.get(_key(bus_name, address)) or {})
+    e.update(fields)
+    sv[_key(bus_name, address)] = e
+    store().set(STORE_KEY, sv)
+    return e
+
+
+def forget(bus_name, address):
+    """Drop everything saved for one board. True if there was something."""
+    from noknok import store
+    sv = saved()
+    had = sv.pop(_key(bus_name, address), None) is not None
+    if had:
+        store().set(STORE_KEY, sv)
+    return had
 
 
 def load(type_name):
@@ -278,6 +320,7 @@ def assign(c, type_name, bus_name, address, log=print):
     m = drv(bus, address, bus_name)
     if not m.setup():
         return None
+    _apply_options(m, saved().get(_key(bus_name, address)))
     c.unknown_devices = [u for u in c.unknown_devices
                          if not (u.i2c_bus == bus_name and u.address == address)]
     for o in [o for o in c.thirdparty if o.i2c_bus == bus_name and o.address == address]:
@@ -285,19 +328,36 @@ def assign(c, type_name, bus_name, address, log=print):
         getattr(c, o.TYPE).remove(o)
     _add(c, m)
     log("[3p] 0x%02X (bus %s): %s (%s, named by user)" % (address, bus_name, m.NAME, m.VENDOR))
+    c.thirdparty_rows = _call("info", "describe", c)
     return m
+
+
+def _apply_options(m, opts):
+    """Saved per-board options. Today only the OLED height (the chip cannot report it)."""
+    h = (opts or {}).get("height")
+    if m.TYPE == "ssd1306" and h in (32, 64) and h != m.HEIGHT:
+        m.set_size(h)
 
 
 def attach(c, log=print, assign_map=None):
     """Identify fixed-address boards on every bus the Conductor has up. Call after
     c.enumerate() / c.enumerate_all(). Safe to call again (rebuilds the lists).
     Boards must be present at boot (plug them in with the brain off); hot-plug is not supported.
-    assign_map: {(bus, address): type} for boards without an ID (stored by the app).
+    assign_map: {(bus, address): type} for boards without an ID. Default: what the user saved
+    through the app (Store key "thirdparty", see remember()).
+    Also sets c.thirdparty_rows: compact rows for the app's status reply (cached here so a
+    status poll never imports a helper).
     Adds c.thirdparty, c.unknown_devices and c.<type> lists (maybe empty)."""
     c.thirdparty, c.unknown_devices = [], []
     for t in TYPES:
         setattr(c, t, [])
-    assign_map = assign_map or {}
+    sv = saved()
+    if assign_map is None:
+        assign_map = {}
+        for k, e in sv.items():
+            if e.get("type"):
+                b, a = k.split("-")
+                assign_map[(b, int(a, 16))] = e["type"]
     for bus_name, bus in c._buses():
         own = _noknok_addresses(c, bus_name)
         for a in c._scan(bus):
@@ -307,6 +367,7 @@ def attach(c, log=print, assign_map=None):
             if named:
                 m = load(named)(bus, a, bus_name)
                 if m.setup():
+                    _apply_options(m, sv.get(_key(bus_name, a)))
                     _add(c, m)
                     log("[3p] 0x%02X (bus %s): %s (named)" % (a, bus_name, m.NAME))
                     continue
@@ -316,18 +377,21 @@ def attach(c, log=print, assign_map=None):
                 log("[3p] 0x%02X (bus %s): unknown board%s" % (
                     a, bus_name, (", could be: " + ", ".join(m.candidates)) if m.candidates else ""))
             else:
+                _apply_options(m, sv.get(_key(bus_name, a)))
                 _add(c, m)
                 log("[3p] 0x%02X (bus %s): %s (%s, %s)" % (a, bus_name, m.NAME, m.VENDOR, m.CONFIDENCE))
     used = {m.TYPE for m in c.thirdparty}
     for t in TYPES:                       # drop drivers that matched nothing
         if t not in used:
             _unload(t)
+    c.thirdparty_rows = []
     if c.unknown_devices or c.thirdparty:
         info = _helper("info")
         for u in c.unknown_devices:
             u.hint = info.HINTS.get(u.address, "")
         for w in info.pullup_warnings(c):
             log("[3p] " + w)
+        c.thirdparty_rows = info.describe(c)
         _unload("info")
     return c.thirdparty
 

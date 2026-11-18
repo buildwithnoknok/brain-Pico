@@ -89,13 +89,21 @@ def pullup_warnings(c):
 
 
 def describe(c):
-    """List of dicts for the app's status reply (same keys as noknok modules + extras)."""
+    """Compact rows for the app's status reply: the keys noknok modules have (type, uid,
+    fw, bus) plus address, thirdparty, confidence. Names, units and help texts come from
+    thirdparty-boards.json in the app, not from here: status is capped at 3000 bytes
+    (DEV-169) and a row is ~110 bytes. Extras only where the brain knows more than the
+    registry: OLED height; for unknown boards the candidates and a hint."""
     rows = []
     for m in list(c.thirdparty) + list(c.unknown_devices):
-        rows.append({"type": m.TYPE, "uid": m.identity, "fw": None, "bus": m.i2c_bus,
-                     "address": m.address, "thirdparty": True,
-                     "confidence": getattr(m, "CONFIDENCE", None),
-                     "capabilities": getattr(m, "CAPABILITIES", {}),
-                     "hint": getattr(m, "hint", None),
-                     "candidates": getattr(m, "candidates", None)})
+        r = {"type": m.TYPE, "uid": m.identity, "fw": None, "bus": m.i2c_bus,
+             "address": m.address, "thirdparty": True,
+             "confidence": getattr(m, "CONFIDENCE", None)}
+        if m.TYPE == "ssd1306":
+            r["height"] = m.HEIGHT
+        if m.TYPE == "unknown":
+            r["candidates"] = m.candidates
+            if getattr(m, "hint", ""):
+                r["hint"] = m.hint
+        rows.append(r)
     return rows

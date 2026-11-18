@@ -550,21 +550,22 @@ for m in c.thirdparty:         # or all boards with a generic read() -> dict
     print(m.TYPE, m.read())
 c.unknown_devices              # answered but not identified; .candidates = types the user can assign
 tp.pullup_warnings(c)          # e.g. "cut the I2C pull-up jumper on the TMP102"
-tp.describe(c)                 # rows for the app's status reply
+c.thirdparty_rows              # compact rows for the app's status reply (cached by attach)
+tp.remember("A", 0x30, type="soldered_pir")   # what the app saves (Store); attach() applies it
 ```
 
 | Type | Board | Address | Identified by | Reads |
 |---|---|---|---|---|
 | `veml7700` | Adafruit 4162 light | 0x10 | ID register | `lux`, `white` |
 | `tmp102` | SparkFun SEN-16304 temperature | 0x48-0x4B | register fingerprint | `temperature` (°C) |
-| `lsm6dsox` | Adafruit 4438 motion | 0x6A / 0x6B | WHO_AM_I | `acceleration` (m/s²), `gyro` (rad/s), `temperature` |
+| `lsm6dsox` | Adafruit 4438 motion | 0x6A / 0x6B | WHO_AM_I | `acceleration` (m/s²), `gyro` (dps), `temperature` |
 | `ads1115` | Adafruit 1085 / generic 4-channel ADC | 0x48-0x4B | register fingerprint | `a0`-`a3` (V) |
 | `msa311` | Adafruit 5309 / generic accelerometer | 0x62 | PART_ID | `acceleration` (m/s²) |
 | `ssd1306` | Adafruit 4440 0.91" OLED and compatibles | 0x3C / 0x3D | status byte (family) | `display`; `text()`, `show()` |
 | `soldered_pir` | Soldered PIR with easyC | 0x30-0x37 | none: `tp.assign()` only | `motion` |
 
-RAM (`.mpy`, 18 Nov 2026): core 5.6 KB; each driver 1.0-2.3 KB, loaded only when its chip is
-present; all 7 boards 19.5 KB. Two identical chips on one address cannot be told apart (move one
+RAM (`.mpy`, 18 Nov 2026): core 6.4 KB; each driver 1.0-2.3 KB, loaded only when its chip is
+present; all 7 boards 20.9 KB. Two identical chips on one address cannot be told apart (move one
 to the other bus or use its address jumper); a driver whose chip stops answering returns None.
 Add a driver: a `noknok_tp_<type>.py` with a `ThirdPartyModule` subclass (`identify()` read-only,
 `setup()`, `verify()`, `read()`) and one `REGISTRY` line in the core.
