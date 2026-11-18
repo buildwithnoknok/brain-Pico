@@ -21,6 +21,7 @@ over I2C.
 | `bench_fs_policy.py` / `bench_store.py` / `bench_yank.py` | DEV-18 bench scripts (how to run them and the pass criteria: [TESTS.md](TESTS.md)): filesystem read-only outside a window; Store round-trip + stable addresses; board-guided power-yank test (beeps, then a tone = pull the cable). |
 | `lib/` | Pinned CircuitPython libraries the brain needs (see `lib/README.md`). |
 | `module_flasher.py` | I2C OTA flasher — streams a module application `.bin` to the CH32V003 bootloader (`ModuleFlasher`). Shared by the bench tool and (later) the provisioning flow. |
+| `noknok_thirdparty.py` + `noknok_tp_*.py` | Third-party Qwiic / Stemma QT boards (DEV-248): core + one small driver per chip, imported only by products that use them. See [Third-party boards](#third-party-qwiic--stemma-qt-boards-dev-248). Ships as `.mpy`. |
 | `noknok_fetch.py` | OTA-only helper (DEV-205): streams a module image into the firmware cache in 1 KB chunks (size + CRC32 checked before the rename) and lets the I2C flasher read the cached image page by page (`CachedImage`). Imported only inside the daily OTA pass, so a normal boot loads nothing extra. |
 | `bench_flash.py` | Bench bring-up tool — flashes application firmware onto a blank module (bootloader only) one at a time from the REPL. See [Bench-flashing modules](#bench-flashing-modules-bring-up). |
 | `trio_demo.py` | Light & Sound Controller demo — uses all three I2C modules. |
@@ -528,6 +529,46 @@ if hub:
   so after a Pico reboot no newcomer can be given an address that is still in use.
 - Test: `tools/test_picohub.py` (host, tier S, a fake power manager speaking the command map).
 
+### Third-party Qwiic / Stemma QT boards (DEV-248)
+
+Products can use some popular third-party boards next to noknok modules. **Plug them in with the
+brain off**: at boot the Conductor scans each bus and gives noknok modules only addresses where
+nothing answers (DEV-119). Hot-plug is not supported. Needs noknok.py 1.27+ (bus clear, DEV-245).
+
+```python
+from noknok import Conductor
+import noknok_thirdparty as tp
+
+c = Conductor()
+c.enumerate()                  # noknok modules first
+tp.attach(c)                   # then identify the boards: c.veml7700, c.tmp102, ... (lists, maybe empty)
+tp.assign(c, "soldered_pir", "A", 0x30)   # boards without an ID are named, never guessed
+
+light = c.veml7700[0]          # keep the object: it sets the chip up again after a power loss
+light.lux                      # None on an I2C hiccup, like noknok modules
+for m in c.thirdparty:         # or all boards with a generic read() -> dict
+    print(m.TYPE, m.read())
+c.unknown_devices              # answered but not identified; .candidates = types the user can assign
+tp.pullup_warnings(c)          # e.g. "cut the I2C pull-up jumper on the TMP102"
+tp.describe(c)                 # rows for the app's status reply
+```
+
+| Type | Board | Address | Identified by | Reads |
+|---|---|---|---|---|
+| `veml7700` | Adafruit 4162 light | 0x10 | ID register | `lux`, `white` |
+| `tmp102` | SparkFun SEN-16304 temperature | 0x48-0x4B | register fingerprint | `temperature` (°C) |
+| `lsm6dsox` | Adafruit 4438 motion | 0x6A / 0x6B | WHO_AM_I | `acceleration` (m/s²), `gyro` (rad/s), `temperature` |
+| `ads1115` | Adafruit 1085 / generic 4-channel ADC | 0x48-0x4B | register fingerprint | `a0`-`a3` (V) |
+| `msa311` | Adafruit 5309 / generic accelerometer | 0x62 | PART_ID | `acceleration` (m/s²) |
+| `ssd1306` | Adafruit 4440 0.91" OLED and compatibles | 0x3C / 0x3D | status byte (family) | `display`; `text()`, `show()` |
+| `soldered_pir` | Soldered PIR with easyC | 0x30-0x37 | none: `tp.assign()` only | `motion` |
+
+RAM (`.mpy`, 18 Nov 2026): core 5.6 KB; each driver 1.0-2.3 KB, loaded only when its chip is
+present; all 7 boards 19.5 KB. Two identical chips on one address cannot be told apart (move one
+to the other bus or use its address jumper); a driver whose chip stops answering returns None.
+Add a driver: a `noknok_tp_<type>.py` with a `ThirdPartyModule` subclass (`identify()` read-only,
+`setup()`, `verify()`, `read()`) and one `REGISTRY` line in the core.
+
 ### Required CircuitPython libs (/lib)
 - `adafruit_httpserver/`
 - `adafruit_requests.mpy`
@@ -543,7 +584,8 @@ first had fragmented the heap) and the brain never started its setup AP. A `.mpy
 compiled — `noknok.py` 184 KB → `noknok.mpy` 45 KB — so it loads with a fraction of the RAM.
 
 - Build: `tools/build_mpy.ps1` → `C:\Users\chris\noknok\pico-deploy\mpy\` (`noknok`,
-  `noknok_rpc`, `noknok_usb`, `module_flasher`, `noknok_fetch`). `code.py` and `boot.py` stay `.py`.
+  `noknok_rpc`, `noknok_usb`, `module_flasher`, `noknok_fetch`, and the DEV-248
+  `noknok_thirdparty` + `noknok_tp_*`). `code.py` and `boot.py` stay `.py`.
 - **`mpy-cross` must match the Pico's CircuitPython version** (10.3.1 → mpy v6.3). Official
   builds: `adafruit-circuit-python.s3.amazonaws.com` → `bin/mpy-cross/`. Upgrading
   CircuitPython means rebuilding.
