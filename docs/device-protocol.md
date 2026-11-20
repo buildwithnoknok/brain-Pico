@@ -7,7 +7,7 @@ The message protocol between a client (the noknok app, a script, `curl`) and a n
 brain (Pico 2 W running `software/code.py`). It covers how a request is carried, which
 operations exist, how settings work, and what is **not** built.
 
-This page is written from the code (`software/noknok_rpc.py` 0.6.2, `software/code.py` 0.39,
+This page is written from the code (`software/noknok_rpc.py` 0.7.0, `software/code.py` 0.39,
 `software/noknok.py` 1.24). Where it and the code disagree, the code wins.
 
 **Where the details live** (one home per fact, not copied here):
@@ -69,6 +69,16 @@ Only one carrier exists: HTTP.
 - Request bounds: body at most 4 KB; one request must complete within about 2 s
   (`REQUEST_DEADLINE`) or it is dropped, so a slow or half-closed client cannot hold the
   product loop.
+- **Keep-alive (noknok_rpc 0.7.0, DEV-198):** a `/rpc` client that keeps its connection
+  (HTTP/1.1 without `Connection: close`, or 1.0 with `Connection: keep-alive`) sends its next
+  request on the same connection; the reply then says `connection: keep-alive` and
+  `keep-alive: timeout=20`. Every new connection costs the brain's network stack (about 1 new
+  connection per second cost 44-72 % ping loss), so a client that talks to a brain more than
+  now and then should reuse one connection (the app's single `http.Client` does). Bounds: at
+  most 2 kept connections, 20 s idle, 200 requests each; an idle one is closed when a new
+  client needs the slot (the client just reconnects). A client should close an idle
+  connection before 20 s itself. The setup pages (`GET /`, form endpoints) still close after
+  every reply.
 - A second carrier would feed the same `Dispatcher`; nothing in the dispatcher is HTTP-specific.
 
 ## 4. Operations

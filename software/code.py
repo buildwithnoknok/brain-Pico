@@ -1,5 +1,10 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.48 (working fallback product URL — DEV-265)
+# Version: 0.49 (brain capabilities in hello + provision check — DEV-268)
+#
+# v0.49 (Sue): DEV-268 — `hello` returns `capabilities` (i2c, i2c_b, usb_host from the pins in
+#   settings.toml and the build) and `provision` takes an optional `requires` list (the
+#   product manifest's needs): a brain that lacks one answers accepted:false, reason
+#   brain_lacks, missing[] and changes nothing. Replaces the manifest field brain_type.
 #
 # v0.48 (Sue): DEV-265 — the fallback SCRIPT_URL (used only when the saved credentials carry no script_url) pointed
 #   at poc/trio_demo.py in buildwithnoknok.github.io, removed on 24 Jun 2026: HTTP 404 on every boot, then the setup
@@ -514,7 +519,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.48"
+CODE_VERSION = "0.49"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -771,6 +776,35 @@ def _config_status():
                      for g in ("i2c_a", "i2c_b", "usb")},
             "source": cfg.get("source"),
             "problems": list(cfg.get("problems") or []) + list(_bus_problems)}
+
+def _capabilities():
+    """DEV-268: what this brain can drive, so the app (and provision below) only installs
+    products that fit, instead of a board name in the manifest. "i2c" always (missing bus A
+    pins show up in config.problems); "i2c_b" when bus B pins are set; "usb_host" when the
+    USB host pins are set AND this CircuitPython build has the usb_host module (the Pico 2 W
+    has it; an ESP32-S3 build does not today, RDM-12). "ble" will come with a BLE carrier."""
+    caps = ["i2c"]
+    try:
+        cfg = nk.pin_config()
+    except Exception:
+        return caps
+    if cfg.get("i2c_b"):
+        caps.append("i2c_b")
+    if cfg.get("usb"):
+        try:
+            import usb_host      # noqa: F401 - only asks whether the build has it
+            caps.append("usb_host")
+        except ImportError:
+            pass
+    return caps
+
+def _missing_caps(requires):
+    """DEV-268: the capabilities in `requires` (from the app, the product's manifest) that
+    this brain lacks. Anything not a list (an older app sends nothing) = no check."""
+    if not isinstance(requires, list):
+        return []
+    have = _capabilities()
+    return [str(c) for c in requires if str(c) not in have]
 
 # The role endpoints need a Conductor to talk to the I2C modules. Enumeration
 # takes a few seconds, so we create + enumerate it once on first use and reuse it.
@@ -1314,6 +1348,7 @@ def _h_hello(args, msg):
         "online": bool(wifi.radio.connected),
         "ap": bool(wifi.radio.ap_active),
         "config": _config_status(),     # DEV-74: pins in use + problems (app: "setup incomplete")
+        "capabilities": _capabilities(),  # DEV-268: i2c, i2c_b, usb_host (manifest `requires`)
         # DEV-100: why the last setup join failed (RAM). DEV-141: received = the
         # join_id of the last accepted provision (app: "did it get my request?").
         "setup": {"last_join": _last_join, "received": _received_join},
@@ -1597,14 +1632,22 @@ def _h_wifi_scan(args, msg):
     return r
 
 def _do_provision(ssid, password, script_url, module_firmware, product_id,
-                  config_defaults=None, force=False, join_id=None):
+                  config_defaults=None, force=False, join_id=None, requires=None):
     """Two situations, one op:
     - On the setup AP: hand the credentials to run_ap_provisioning()'s loop,
       which stops the AP, verifies the join, saves and hard-resets (as today).
     - On home WiFi (product running): a product switch. ssid/password may be
       omitted to keep the current network. Save, drop product.py, hard-reset;
-      the boot path downloads the new script before any Conductor exists."""
+      the boot path downloads the new script before any Conductor exists.
+    DEV-268: `requires` (the manifest's brain capabilities, sent by the app) is
+    checked first in both cases; a brain that lacks one refuses with reason
+    brain_lacks + missing[] and changes nothing (no join, no switch)."""
     global _join_seq, _received_join
+    missing = _missing_caps(requires)
+    if missing:
+        log(f"[cfg] product {product_id or '?'} needs {missing}: this brain lacks it - refused")
+        return {"accepted": False, "reason": "brain_lacks", "missing": missing,
+                "capabilities": _capabilities()}
     if wifi.radio.ap_active:
         if not ssid:
             return {"ok": False, "error": "ssid required"}
@@ -1697,7 +1740,7 @@ def register_ops():
     d.register("provision", lambda a, m: _do_provision(
         a.get("ssid"), a.get("password"), a.get("script_url"),
         a.get("module_firmware"), a.get("product_id"), a.get("config_defaults"),
-        bool(a.get("force")), a.get("join_id")))
+        bool(a.get("force")), a.get("join_id"), a.get("requires")))
     d.register("wifi.scan", _h_wifi_scan)          # DEV-100
 
 def _json(request, obj):

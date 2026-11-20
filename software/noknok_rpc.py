@@ -10,6 +10,15 @@
 # v0.3 (Sue): DEV-79 bench — on the Pico 2 W a 0.5 s kick finished the join in
 #   the background 5/5 (link up ~3 s later; bench_dev79_kick.py, 23 Oct), so the
 #   full 5 s safety-net attempts are off by default: LINK_FULL_EVERY = 0.
+# v0.7 (Sue): DEV-198 — HTTP keep-alive for POST /rpc. Every request used to be
+#   a new TCP connection that the brain closed; at about 1 request/s (a person
+#   fiddling with the settings page) that alone cost the brain 44-72 % ping loss
+#   (DEV-191 bench, DEV-198 verdict). Now a client that keeps its connection open
+#   (HTTP/1.1, the app's one http.Client) sends its next request on the same
+#   connection: no new handshake, no close, no TIME_WAIT on the brain. Bounded:
+#   KEEPALIVE_MAX connections, KEEPALIVE_IDLE s idle, KEEPALIVE_REQS requests each;
+#   an idle kept connection makes room when a new client waits. status.link
+#   counts `requests` and `reused` so a test can see whether reuse happens.
 #
 # One JSON message protocol, transport-agnostic (Confluence 113868802 §2):
 #
@@ -53,7 +62,7 @@ import gc
 import json
 import time
 
-__version__ = "0.6.2"
+__version__ = "0.7.0"
 
 SERVICE_INTERVAL = 0.05     # s between carrier polls from the implicit hook
 SOCKET_TIMEOUT   = 1.0      # s a stalled client may hold poll(). 0.2 s dropped the
@@ -75,7 +84,15 @@ SEND_BUDGET      = 0.5      # s for the whole reply; then it is cut off (status.
 MAX_REPLY        = 3000     # bytes: keep replies under this. Bench 30 Oct (Pi4RFID, code.py
                             # loaded): 3165 B went out in 0.15 s, a 3663 B reply stalled
                             # ~6 s with the network stack stopped (no ping) - see DEV-169
-SLOW_POLL_MS     = 50       # a poll longer than this counts in slow_polls
+KEEPALIVE_IDLE   = 20.0     # s a kept-alive /rpc connection may sit idle (DEV-198). Longer
+                            # than the phone's HTTP client idle time (Dart: 15 s), so the
+                            # PHONE closes first and the closed connection's TIME_WAIT
+                            # sits in the phone's network stack, not in the brain's
+KEEPALIVE_MAX    = 2        # kept-alive connections at once; with MAX_PENDING 3 one slot
+                            # is always free for a new client (and an idle kept one is
+                            # closed to make room when a new client is waiting)
+KEEPALIVE_REQS   = 200      # requests on one connection, then it is closed and renewed
+SLOW_POLL_MS     = 50      # a poll longer than this counts in slow_polls
 LINK_CHECK_S     = 30       # how often service() looks at the WiFi link
 LINK_JOIN_S      = 5        # blocking budget for a FULL rejoin attempt
 LINK_KICK_S      = 0.5      # budget of a kick: start the join, finish in the background
@@ -168,6 +185,8 @@ def _safe_server_class():
             self.conn = conn
             self.end = time.monotonic() + SEND_BUDGET
             self.cut = False
+            self.keep = False            # DEV-198: the library's close() after the reply
+                                         # is skipped when the connection is kept alive
 
         def send(self, data):
             left = self.end - time.monotonic()
@@ -189,10 +208,34 @@ def _safe_server_class():
             self.conn.settimeout(t)
 
         def close(self):
+            if self.keep and not self.cut:
+                return                   # kept alive: the server reads its next request
             self.conn.close()
 
+    def _may_keep(request, served, kept):
+        """DEV-198: may this connection stay open after the reply? Only POST /rpc
+        (the app's channel; the legacy setup pages keep the library's close), only
+        when the client did not ask to close (HTTP/1.1 keeps by default, 1.0 must
+        ask), when the whole body was read, and within the KEEPALIVE_* bounds."""
+        if request.method != "POST" or request.path != "/rpc":
+            return False
+        c = (request.headers.get("Connection") or "").lower()
+        if "close" in c:
+            return False
+        if request.http_version != "HTTP/1.1" and "keep-alive" not in c:
+            return False
+        try:
+            if int(request.headers.get("Content-Length") or 0) > MAX_BODY:
+                return False             # the body was not read: the stream is unusable
+        except ValueError:
+            return False
+        return served + 1 < KEEPALIVE_REQS and kept < KEEPALIVE_MAX
+
     class SafeServer(Server):
-        _noknok_pending = None           # [[conn, addr, bytes, deadline, fresh], ...] reading
+        # [[conn, addr, bytes, deadline, fresh, idle, served], ...] being read.
+        # idle = a kept-alive connection waiting for its next request (DEV-198);
+        # served = requests already answered on this connection.
+        _noknok_pending = None
 
         @staticmethod
         def _drop(lst, p):
@@ -209,19 +252,26 @@ def _safe_server_class():
                 self._noknok_pending = []
             pend = self._noknok_pending
             now = time.monotonic()
-            if len(pend) < MAX_PENDING:
+            idle = [p for p in pend if p[5]]
+            if len(pend) < MAX_PENDING or idle:
                 try:
                     conn, addr = self._sock.accept()
                 except OSError as e:
                     if (e.args[0] if e.args else None) not in (11, 104, 110, 116):
                         raise
                 else:
+                    if len(pend) >= MAX_PENDING:
+                        # DEV-198: a new client waits and every slot is taken: the
+                        # oldest idle kept-alive connection makes room (its client
+                        # simply opens a new one next time).
+                        self._drop(pend, idle[0])
+                        _poll_stats["evicted"] += 1
                     # The first read may wait FIRST_WAIT: the request's data trails the
                     # connect by a few ms, and the product loop may not come back here
                     # for a second (bench, 29 Oct: 1.15 s per request without this).
                     # Every later read is non-blocking.
                     conn.settimeout(FIRST_WAIT)
-                    pend.append([conn, addr, b"", now + REQUEST_DEADLINE, True])
+                    pend.append([conn, addr, b"", now + REQUEST_DEADLINE, True, False, 0])
             result = NO_REQUEST
             for p in list(pend):
                 conn = p[0]
@@ -237,21 +287,30 @@ def _safe_server_class():
                     conn.settimeout(READ_POLL)       # from now on: (almost) non-blocking
                 if n == 0:
                     self._drop(pend, p)              # the client closed: no request
-                    result = CONNECTION_TIMED_OUT
+                    if not p[5]:                     # (an idle kept one closing is normal)
+                        result = CONNECTION_TIMED_OUT
                     continue
                 if n:
+                    if p[5]:                         # the next request on a kept connection:
+                        p[5] = False                 # from now on the normal request deadline
+                        p[3] = now + REQUEST_DEADLINE
                     p[2] += bytes(self._buffer[:n])
                 need = _need(p[2])
                 if need is not None and len(p[2]) >= need:
                     pend.remove(p)
-                    return self._answer(conn, p[1], p[2])
+                    return self._answer(conn, p[1], p[2][:need], p[6], p[2][need:])
                 if now > p[3] or len(p[2]) > MAX_BODY + 2048:
-                    self._drop(pend, p)              # too slow, or headers too long
-                    result = CONNECTION_TIMED_OUT
+                    self._drop(pend, p)              # too slow, headers too long, or idle
+                    if not p[5]:                     # for KEEPALIVE_IDLE
+                        result = CONNECTION_TIMED_OUT
             return result
 
-        def _answer(self, conn, addr, raw):
-            """Handler + reply, as the library's poll() does after its reads."""
+        def _answer(self, conn, addr, raw, served=0, rest=b""):
+            """Handler + reply, as the library's poll() does after its reads.
+            served = requests answered before on this connection; rest = bytes
+            that came after this request (the start of the next one). DEV-198:
+            a /rpc connection the client keeps open goes back to the pending list
+            as idle instead of being closed."""
             try:
                 # Free Python memory BEFORE the handler and the reply allocate theirs.
                 # CircuitPython 10 grows the Python heap on demand, and on the bench
@@ -263,16 +322,37 @@ def _safe_server_class():
                 gc.collect()
                 link = _Bounded(conn)
                 request = Request(self, link, addr, raw)
+                pend = self._noknok_pending
+                kept = sum(1 for q in pend if q[6] > 0) if pend else 0
+                link.keep = _may_keep(request, served, kept)
                 handler = self._find_handler(request.method, request.path)
                 response = self._handle_request(request, handler)
+                _poll_stats["req"] += 1
+                if served:
+                    _poll_stats["reused"] += 1
                 if response is None:
                     conn.close()
                     return REQUEST_HANDLED_NO_RESPONSE
                 self._set_default_server_headers(response)
+                if link.keep:
+                    response._headers.setdefault("Connection", "keep-alive")
+                    response._headers.setdefault("Keep-Alive",
+                                                 "timeout=%d" % KEEPALIVE_IDLE)
                 link.end = time.monotonic() + SEND_BUDGET   # the budget is for sending
                 response._send()                     # the library's way; it closes conn
+                                                     # (link.close: not when kept)
                 if link.cut:
                     _poll_stats["cut"] += 1
+                elif link.keep:
+                    # Back to the pending list: idle until the client's next request
+                    # (or KEEPALIVE_IDLE), at once busy if that request already began.
+                    conn.settimeout(READ_POLL)
+                    t = time.monotonic()
+                    if pend is None:
+                        pend = self._noknok_pending = []
+                    pend.append([conn, addr, rest,
+                                 t + (REQUEST_DEADLINE if rest else KEEPALIVE_IDLE),
+                                 False, not rest, served + 1])
                 return REQUEST_HANDLED_RESPONSE_SENT
             except Exception:
                 try:
@@ -608,7 +688,8 @@ def _restart_http():
     except Exception as e:
         _logfn("[rpc] carrier restart failed: %r" % (e,))
 
-_poll_stats = {"max_ms": 0, "slow": 0, "n": 0, "cut": 0}
+_poll_stats = {"max_ms": 0, "slow": 0, "n": 0, "cut": 0,
+               "req": 0, "reused": 0, "evicted": 0}      # DEV-198 keep-alive counters
 
 def link_stats():
     """WiFi link counters + how long the app channel held the product loop:
@@ -617,7 +698,9 @@ def link_stats():
     st = {"drops": _link["drops"], "rejoins": _link["rejoins"],
           "backoff": _link.get("backoff"), "poll_max_ms": _poll_stats["max_ms"],
           "slow_polls": _poll_stats["slow"], "polls": _poll_stats["n"],
-          "cut_replies": _poll_stats["cut"], "gw_miss": _link["gw_miss"],
+          "cut_replies": _poll_stats["cut"], "requests": _poll_stats["req"],
+          "reused": _poll_stats["reused"], "ka_evicted": _poll_stats["evicted"],
+          "gw_miss": _link["gw_miss"],
           "gw_ok": _link["gw_ok"]}
     _poll_stats["max_ms"] = 0
     return st

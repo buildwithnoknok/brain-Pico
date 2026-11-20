@@ -171,8 +171,11 @@ def run(cls, clients, limit=4.0, every=0.01):
 
 
 BODY = b'{"id": 1, "op": "hello", "args": {}}'
+# "Connection: close": these cases test reading and the reply; keep-alive (DEV-198, a
+# client that keeps its connection) has its own section below with HEAD_KA.
 HEAD = (b"POST /rpc HTTP/1.1\r\nHost: brain\r\nContent-Type: application/json\r\n"
-        b"Content-Length: %d\r\n\r\n" % len(BODY))
+        b"Connection: close\r\nContent-Length: %d\r\n\r\n" % len(BODY))
+HEAD_KA = HEAD.replace(b"Connection: close\r\n", b"")      # HTTP/1.1: keep by default
 Safe = noknok_rpc._safe_server_class()
 DL = noknok_rpc.REQUEST_DEADLINE
 FAST = int(noknok_rpc.FIRST_WAIT * 1000) + 20          # ms: one pass may wait FIRST_WAIT
@@ -285,6 +288,115 @@ for _ in range(10):
 check("at most MAX_PENDING connections are collected; the rest wait in the backlog",
       len(srv._noknok_pending) == noknok_rpc.MAX_PENDING
       and len(lst.queue) == 5 - noknok_rpc.MAX_PENDING, (len(srv._noknok_pending), len(lst.queue)))
+
+print("\nDEV-198: HTTP keep-alive for POST /rpc")
+REQ_KA = HEAD_KA + BODY
+
+
+def polls(srv, n=1, every=0.01):
+    for _ in range(n):
+        srv.poll()
+        time.sleep(every)
+
+
+def fresh_server(clients):
+    srv, handled = make(Safe)
+    srv._sock = Listener(clients)
+    return srv, handled
+
+
+before = noknok_rpc.link_stats()
+ka = Client([(0, REQ_KA), (0.3, REQ_KA), (0.6, REQ_KA)])
+srv, h = fresh_server([(0, ka)])
+polls(srv, 90)
+check("3 requests on one kept connection -> all answered, ONE connection, still open",
+      len(h) == 3 and ka.sent.count(b"HTTP/1.1 200") == 3 and not ka.closed,
+      (len(h), ka.sent.count(b"HTTP/1.1 200"), ka.closed))
+check("... replies say Connection: keep-alive + Keep-Alive timeout",
+      b"connection: keep-alive" in ka.sent.lower() and b"keep-alive: timeout=" in ka.sent.lower(),
+      ka.sent[:200])
+after = noknok_rpc.link_stats()
+check("... link_stats(): requests +3, reused +2",
+      after["requests"] - before["requests"] == 3 and after["reused"] - before["reused"] == 2,
+      (after["requests"] - before["requests"], after["reused"] - before["reused"]))
+
+c1 = Client([(0, HEAD + BODY)])
+srv, h = fresh_server([(0, c1)])
+polls(srv, 10)
+check("client sends Connection: close -> closed after the reply, no keep-alive header",
+      len(h) == 1 and c1.closed and b"keep-alive" not in c1.sent)
+
+h10 = REQ_KA.replace(b"HTTP/1.1", b"HTTP/1.0", 1)
+c10 = Client([(0, h10)])
+srv, h = fresh_server([(0, c10)])
+polls(srv, 10)
+check("HTTP/1.0 without Connection: keep-alive -> closed after the reply", len(h) == 1 and c10.closed)
+
+cget = Client([(0, b"GET / HTTP/1.1\r\nHost: brain\r\n\r\n")])
+srv, h = fresh_server([(0, cget)])
+srv.route("/", "GET")(lambda r: Response(r, "page"))
+polls(srv, 10)
+check("legacy page (GET /) -> closed after the reply (keep-alive is /rpc only)",
+      cget.closed and b"page" in cget.sent, (cget.closed, cget.sent[:40]))
+
+cbye = Client([(0, REQ_KA), (0.2, "CLOSE")])
+srv, h = fresh_server([(0, cbye)])
+polls(srv, 40)
+check("client closes its idle kept connection -> server drops + closes it",
+      len(h) == 1 and cbye.closed and not srv._noknok_pending, (len(h), cbye.closed))
+
+old_idle = noknok_rpc.KEEPALIVE_IDLE
+noknok_rpc.KEEPALIVE_IDLE = 0.3
+cidle = Client([(0, REQ_KA)])
+srv, h = fresh_server([(0, cidle)])
+t0 = time.monotonic()
+while time.monotonic() - t0 < 1.0 and not cidle.closed:
+    polls(srv)
+check("kept connection idle for KEEPALIVE_IDLE -> closed by the server",
+      len(h) == 1 and cidle.closed and 0.25 <= cidle.closed_at - t0 <= 0.6,
+      round((cidle.closed_at or 0) - t0, 2))
+noknok_rpc.KEEPALIVE_IDLE = old_idle
+
+kas = [Client([(0, REQ_KA)]) for _ in range(3)]
+srv, h = fresh_server([(0, kas[0]), (0.05, kas[1]), (0.1, kas[2])])
+polls(srv, 30)
+check("3 keep-alive clients -> only KEEPALIVE_MAX (2) kept, the 3rd closed after its reply",
+      len(h) == 3 and [c.closed for c in kas] == [False, False, True],
+      [c.closed for c in kas])
+
+a, b = Client([(0, REQ_KA)]), Client([(0, REQ_KA)])
+late = Client([(0, HEAD + BODY)])
+filler = Client([(9.0, HEAD)])                 # connected, silent: holds the 3rd slot
+srv, h = fresh_server([(0, a), (0.05, b), (0.1, filler), (0.3, late)])
+polls(srv, 60)
+check("all slots taken (2 idle kept + 1 busy), a new client -> oldest idle closed, new one answered",
+      a.closed and not b.closed and late.sent and noknok_rpc.link_stats()["ka_evicted"] >= 1,
+      (a.closed, b.closed, bool(late.sent)))
+
+old_reqs = noknok_rpc.KEEPALIVE_REQS
+noknok_rpc.KEEPALIVE_REQS = 3
+cmax = Client([(0.2 * i, REQ_KA) for i in range(5)])
+srv, h = fresh_server([(0, cmax)])
+polls(srv, 120)
+check("KEEPALIVE_REQS reached -> the 3rd reply closes the connection",
+      len(h) == 3 and cmax.closed and cmax.sent.lower().count(b"connection: keep-alive") == 2,
+      (len(h), cmax.closed, cmax.sent.lower().count(b"connection: keep-alive")))
+noknok_rpc.KEEPALIVE_REQS = old_reqs
+
+cpipe = Client([(0, REQ_KA + REQ_KA)])
+srv, h = fresh_server([(0, cpipe)])
+polls(srv, 20)
+check("two requests in one packet (pipelined) -> both answered in order",
+      len(h) == 2 and cpipe.sent.count(b"HTTP/1.1 200") == 2, len(h))
+
+cslow = Client([(0, REQ_KA), (0.3, HEAD_KA), (0.6, BODY)])
+srv, h = fresh_server([(0, cslow)])
+polls(srv, 100)
+check("next request on a kept connection with a late body -> answered (request deadline)",
+      len(h) == 2, len(h))
+longest, cs, h, when = run(Safe, [(0, Client([(0, REQ_KA), (0.2, REQ_KA)]))], limit=0.8)
+check("keep-alive polling holds the loop <= %d ms" % FAST,
+      longest != "SPUN" and longest <= FAST and len(h) == 2, (longest, len(h)))
 
 print("\nservice() measures how long the app channel held the loop")
 
