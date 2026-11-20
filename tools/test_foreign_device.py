@@ -68,9 +68,13 @@ class NoknokDev:
         self.armed = False           # a 0xB1 was just written (not a presence ping)
         self.has_bl = True           # answers 0xB0 by going to its bootloader at 0x7E
         self.fw = (2, 3, 0)          # GET_VERSION reply (DEV-204 compares it)
+        self.get_id = False          # DEV-21: app answers 0xB4 GET_ID (old apps: zeros)
 
     def reply(self, buf):
-        if self.last_cmd == 0xB1:
+        if self.last_cmd == 0xB4 and self.get_id:
+            rec = self.uid + bytes([self.type])
+            buf[:10] = (rec + bytes([crc8(rec)]))[:len(buf)]
+        elif self.last_cmd == 0xB1:
             if self.miss_b1 and self.armed:
                 self.miss_b1 -= 1
                 self.armed = False
@@ -273,8 +277,9 @@ check("...the log says why", "answers but not as a noknok module" in log, log)
 check("...the knob still restores at its address", KNOB in addrs(c))
 check("...the buzzer's state entry is kept (rescue needs UID -> type)",
       isinstance(c._state_map().get(BUZ), dict), repr(c._state_map().get(BUZ)))
-check("...only GET_VERSION probes reached the foreign chip (max 3)",
-      set(foreign.cmds) <= {0xB1} and len(foreign.cmds) <= 3, repr(foreign.cmds))
+check("...only GET_ID (max 2, DEV-21) + GET_VERSION (max 3) probes reached the foreign chip",
+      set(foreign.cmds) <= {0xB1, 0xB4} and foreign.cmds.count(0xB4) <= 2
+      and foreign.cmds.count(0xB1) <= 3, repr(foreign.cmds))
 new = NoknokDev(LEDB, 0x03)                    # a newcomer must not get that address
 WIRED[A].append(new)
 c, log = boot()
@@ -468,6 +473,131 @@ c, log = boot()
 check("swap without the PicoHub: re-adopted, no hard reset", resets == [] and "[MODULE]" in log
       and len(addrs(c)) == 2, repr(resets) + log)
 noknok.pins, noknok.hard_reset = _orig_pins, _orig_hr
+
+# ── DEV-21: identity read (0xB4 GET_ID) ───────────────────────────────────────
+def new_fw(d, ver):
+    d.get_id, d.fw = True, ver
+    return d
+
+
+print("dev21: identify() reads 0xB4, rejects old apps' zeros and foreign chips")
+WIRED.clear()
+knob = new_fw(NoknokDev(KNOB, 0x02), (2, 4, 0))
+old = NoknokDev(LEDB, 0x03)                       # LED Button on 2.3.0: answers 0xB4 with zeros
+foreign = ForeignDev(0x40)
+WIRED[A] = [knob, old, foreign]
+c, log = boot(keep_store=False)
+bus = c._bus("A")
+check("new app: identify -> (uid, type)", c.identify(addrs(c)[KNOB], bus) == (KNOB, 0x02),
+      repr(c.identify(addrs(c)[KNOB], bus)))
+check("old app (zeros, CRC 0 matches): None", c.identify(addrs(c)[LEDB], bus) is None)
+check("foreign chip: None", c.identify(0x40, bus) is None)
+
+print("dev21: restore with new firmware")
+WIRED.clear()
+knob = new_fw(NoknokDev(KNOB, 0x02), (2, 4, 0))
+buz = new_fw(NoknokDev(BUZ, 0x01), (3, 6, 0))
+WIRED[A] = [knob, buz]
+c, log = boot(keep_store=False)
+first = addrs(c)
+c, log = boot()
+check("same UIDs answer 0xB4: both restored at their addresses", addrs(c) == first,
+      repr(addrs(c)) + log)
+check("...firmware version read", c.knob and c.knob[0].firmware_version == "2.4.0",
+      repr(c.knob and c.knob[0].firmware_version))
+
+print("dev21: foreign board on the address of a module saved with 0xB4 firmware")
+WIRED[A].remove(buz)
+foreign = ForeignDev(first[BUZ])
+WIRED[A].append(foreign)
+c, log = boot()
+check("no buzzer object", not c.buzzer and BUZ not in addrs(c), repr(addrs(c)))
+check("...it got 0xB4 only, no 0xB1 (silence = not it)", foreign.cmds
+      and set(foreign.cmds) == {0xB4}, repr(foreign.cmds))
+check("...[MODULE] event names it", "[MODULE]" in log and "not as a noknok module" in log, log)
+
+print("dev21: stale entry - another noknok module (same type, same firmware) on a saved address")
+WIRED.clear()
+k1 = new_fw(NoknokDev(KNOB, 0x02), (2, 4, 0))
+WIRED[A] = [k1]
+c, log = boot(keep_store=False)
+ka = addrs(c)[KNOB]
+WIRED[A].remove(k1)
+OTHER = "cdab0102030405ff"
+k2 = new_fw(NoknokDev(OTHER, 0x02), (2, 4, 0))   # a second knob, same fw, sits on ka
+k2.address = ka
+WIRED[A].append(k2)
+c, log = boot()
+check("not restored under the saved UID", KNOB not in addrs(c), repr(addrs(c)) + log)
+check("...re-enumerated as itself", addrs(c).get(OTHER) is not None and c.knob
+      and c.knob[0]._uid_hex == OTHER, repr(addrs(c)) + log)
+check("...[MODULE] 'another noknok module' logged", "another noknok module" in log, log)
+
+print("dev21: mixed bus - old firmware + new firmware")
+WIRED.clear()
+knob = new_fw(NoknokDev(KNOB, 0x02), (2, 4, 0))
+ledb = NoknokDev(LEDB, 0x03)                      # 2.3.0, no 0xB4
+buz = new_fw(NoknokDev(BUZ, 0x01), (3, 6, 0))
+WIRED[A] = [knob, ledb]
+WIRED[B] = [buz]
+c, log = boot(keep_store=False)
+first = addrs(c)
+check("enumerates all three", len(first) == 3, repr(first))
+c, log = boot()
+check("reload: all three restored (old one via 0xB1)", addrs(c) == first and "[MODULE]" not in log,
+      repr(addrs(c)) + log)
+
+print("dev21: rescue asks 0xB4 at 0x7E only for an unknown UID from a new stage-1")
+
+
+class FakeFlasher:
+    def __init__(self, uid, ver):
+        self.uid, self.ver, self.flashed = uid, ver, None
+
+    def get_version(self):
+        return self.ver
+
+    def get_uid(self):
+        return self.uid
+
+    def flash(self, image, runtime_addr=None):
+        self.flashed = image
+
+
+class IdBus:
+    """Records what reaches 0x7E; answers 0xB4 like a DEV-22 stage-1."""
+    def __init__(self, uid, mtype):
+        self.cmds, self.uid, self.type, self.last = [], bytes.fromhex(uid), mtype, None
+
+    def try_lock(self):
+        return True
+
+    def unlock(self):
+        pass
+
+    def writeto(self, addr, data):
+        self.cmds.append((addr, bytes(data)[0]))
+        self.last = bytes(data)[0]
+
+    def readfrom_into(self, addr, buf):
+        rec = self.uid + bytes([self.type])
+        buf[:10] = (rec + bytes([crc8(rec)]))[:len(buf)]
+
+
+NEVER = "cdab99887766554f"
+images = []
+lines = []
+for ver, want in (((1, 1, 3, 0, 2), "reflashed"), ((1, 1, 2, 0, 2), "none")):
+    b = IdBus(NEVER, 0x02)
+    f = FakeFlasher(NEVER, ver)
+    r = c._rescue_on(f, (0, 0), "A", lambda e: images.append(e["type"]) or b"img", lines.append, b)
+    sent_b4 = any(cmd == 0xB4 for _, cmd in b.cmds)
+    if want == "reflashed":
+        check("stage-1 1.3.0: never-seen UID identified via 0xB4 -> knob app pushed",
+              r["action"] == "reflashed" and r["type"] == "knob" and sent_b4, repr(r) + repr(lines))
+    else:
+        check("stage-1 1.2.0: no 0xB4 sent, 'unknown UID' as before",
+              r["action"] == "none" and r["detail"] == "unknown UID" and not sent_b4, repr(r))
 
 print("\n%s (%d failure%s)" % ("PASS" if not fails else "FAIL", fails, "" if fails == 1 else "s"))
 sys.exit(1 if fails else 0)
