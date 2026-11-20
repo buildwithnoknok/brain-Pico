@@ -21,6 +21,7 @@ over I2C.
 | `bench_fs_policy.py` / `bench_store.py` / `bench_yank.py` | DEV-18 bench scripts (how to run them and the pass criteria: [TESTS.md](TESTS.md)): filesystem read-only outside a window; Store round-trip + stable addresses; board-guided power-yank test (beeps, then a tone = pull the cable). |
 | `lib/` | Pinned CircuitPython libraries the brain needs (see `lib/README.md`). |
 | `module_flasher.py` | I2C OTA flasher — streams a module application `.bin` to the CH32V003 bootloader (`ModuleFlasher`). Shared by the bench tool and (later) the provisioning flow. |
+| `noknok_feeds.py` | **Public data for products** (exploration draft, 20 Nov 2026): reviewed providers for departures (transport.opendata.ch), weather (Open-Meteo) and the day-ahead power price (Energy-Charts), a size-capped HTTPS fetch, a feed manager (`feeds.add()` / `feeds.poll()`, backoff, last good data kept) and local-time helpers. Products must not do network I/O themselves (poc validator); they import this instead. Imported only by products that use it; ships as `.mpy`. See [Data feeds](#data-feeds-noknok_feeds). |
 | `noknok_fetch.py` | OTA-only helper (DEV-205): streams a module image into the firmware cache in 1 KB chunks (size + CRC32 checked before the rename) and lets the I2C flasher read the cached image page by page (`CachedImage`). Imported only inside the daily OTA pass, so a normal boot loads nothing extra. |
 | `bench_flash.py` | Bench bring-up tool — flashes application firmware onto a blank module (bootloader only) one at a time from the REPL. See [Bench-flashing modules](#bench-flashing-modules-bring-up). |
 | `trio_demo.py` | Light & Sound Controller demo — uses all three I2C modules. |
@@ -527,6 +528,30 @@ if hub:
 - Modules without a driver now keep their address reserved in the saved state, like the PicoHub,
   so after a Pico reboot no newcomer can be given an address that is still in use.
 - Test: `tools/test_picohub.py` (host, tier S, a fake power manager speaking the command map).
+
+### Data feeds (`noknok_feeds`)
+
+A product that shows public data (the next buses of a stop, the weather, the electricity price) imports
+`noknok_feeds`; it never opens a socket itself (the poc validator rejects `socketpool`, `ssl`, `adafruit_requests`
+in a product). The providers are a fixed, reviewed list, every request asks the API for only the fields it needs
+(a Swiss stationboard is 25 KB unfiltered, 2.5 KB for 15 departures with the field filter), answers over
+`MAX_BYTES` (6 KB) are refused, a failed fetch keeps the last good data and retries with a backoff, and `poll()`
+never raises. One blocking request at a time (up to `TIMEOUT_S` = 6 s): keep `every` >= 20 s.
+
+```python
+import noknok_feeds as nf
+feeds = nf.attach(c)
+feeds.add("deps", nf.departures, every=30, station="Bern, Bahnhof", limit=15)
+while True:
+    if feeds.poll():                    # at most one due feed per call
+        draw(feeds.get("deps"))         # last good data, None before the first success
+    c.sleep(0.05)
+```
+
+Providers: `departures(station, limit)`, `weather(place, hours)` (+ `geocode(place)`), `power_price(zone)`. Each result has
+`src`, the attribution line the product must show. Time helpers: `clock_ok()`, `utc_offset(epoch, std_hours)`, `local_hm(epoch, std_hours)`.
+Host test: `python tools/test_feeds.py` (real API answers recorded in `tools/fixtures/feeds/`). NOT yet bench-tested on a
+Pico (RAM, TLS time, app responsiveness while a fetch blocks): see the bench plan in the exploration repo `data-sources/FEEDS-DESIGN.md`.
 
 ### Required CircuitPython libs (/lib)
 - `adafruit_httpserver/`

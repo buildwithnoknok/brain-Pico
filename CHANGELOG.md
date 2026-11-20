@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## noknok_feeds 0.1.0 - 2026-11-20
+
+- (no DEV ticket yet, exploration account) - new library `noknok_feeds.py`: public data for products without network code in the product. Providers `departures()` (transport.opendata.ch stationboard with the API's field filter: 25 KB -> 2.5 KB), `weather()` / `geocode()` (Open-Meteo), `power_price()` (Energy-Charts, hourly averages from 15-minute prices); `get_json()` with a size cap (6 KB), a 6 s timeout and FeedError for every failure; `Feeds` manager (`add`, `update`, `poll` = at most one blocking fetch per call, round robin, backoff 15/30/60/120/240 s, last good data kept, never raises); EU summer-time helpers without `time.localtime`. Not imported by `code.py`; added to `tools/build_mpy.ps1`, `tools/image/build_brain_uf2.py` and `tools/restore/restore_brain.sh` (merge note: DEV-248 edits the same lists). Host test `tools/test_feeds.py` (53 checks, real recorded API answers in `tools/fixtures/feeds/`). Not bench-tested on a Pico yet. Breaking: no.
+
 ## noknok.py 1.27 - 2026-11-19
 
 - DEV-233 - `NoknokPicoHub` supports power-manager firmware 0.4.0 (DEV-143): `set_min_input_voltage()` now accepts 12 (0 / 12 / 15 / 20), new `set_fixed_input_voltage(9 | 12 | 15 | 20 | None)` sends `0x24` and returns the result code (NO_POWER = the charger does not offer that level, the board stays on its demand level); `status()` decodes `inputs.fixed_set` (0x20) and `warnings: fixed_not_offered` (0x40). On a 0.3.x power manager the new call answers UNKNOWN (0xFF) without raising, so a product keeps running. Tests: `tools/test_picohub.py` (+12, the old "12 refused" check now expects 12 accepted and 13 refused). README PicoHub section updated. Not tested against real 0.4.0 hardware (rigs taken): see the ticket. Breaking: no.
