@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 noknok (Christopher Houben)
+# SPDX-License-Identifier: MIT
+#
 # noknok.py  v1.9
 # CircuitPython library for the noknok modular ecosystem
 # Raspberry Pi Pico — I2C master ("Conductor")
@@ -151,6 +154,23 @@
 #             the others. check_factory_reset() only wipes after the knobs verified.
 #             set_event_hook() lets code.py record the events. A pass that
 #             round-tripped the PicoHub ends in hard_reset() (fresh USB host, DEV-133).
+# v1.28 (Sue): DEV-21 (ADR-005) — identify(address, bus): 0xB4 GET_ID -> (uid, type),
+#             valid CRC-8 + known type + real UID only. Restore asks it first: the saved
+#             UID = restored; another noknok UID = stale entry, not restored, round trip
+#             to 0x7F; silence from a module saved with 0xB4-capable firmware (GET_ID_SINCE)
+#             = foreign, not restored. Old firmware keeps the DEV-119/DEV-204 0xB1 check.
+#             Rescue asks 0xB4 at 0x7E for a UID the state does not know, only from a
+#             stage-1 newer than 1.2.0 (DEV-22). No bus scanning: saved addresses only.
+# v1.29 (Sue): DEV-21 (Sam's review) — the rescue gate is per flash layout (0xB1 byte 4):
+#             V003 (layout 2) from stage-1 1.3.0, X035 (layout 3, PicoHub) from 1.1.0
+#             (_BL_GET_ID_SINCE). 1.28 compared versions across chip families and shut
+#             the X035 1.1.0 out. Unknown layouts never get 0xB4.
+# v1.30 (Sam, exploration, DEV-245): I2C bus clear in _init_i2c(). A third-party
+#             chip interrupted mid-read holds SDA low through a Pico reset (PicoHub keeps
+#             the bus powered); busio.I2C then failed and the whole bus was skipped.
+#             _bus_clear() clocks SCL (max 9) until SDA is free, then sends a STOP. A bus
+#             that is switched off (SDA and SCL both low) is left alone. Never raises;
+#             also run before the Store's temporary FRAM bus (every bus open, ADR-011).
 #
 # Quick start:
 #   from noknok import Conductor
@@ -171,7 +191,7 @@ import json
 import os
 import struct
 
-__version__ = "1.27"
+__version__ = "1.30"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -684,8 +704,9 @@ class Store:
         sda, scl = env("NOKNOK_I2C_SDA"), env("NOKNOK_I2C_SCL")
         if not sda or not scl:
             raise OSError("no I2C bus A pins in settings.toml")
-        bus = busio.I2C(getattr(board, str(scl).strip()), getattr(board, str(sda).strip()),
-                        frequency=int(env("NOKNOK_I2C_FREQ", 100_000)))
+        scl_pin, sda_pin = getattr(board, str(scl).strip()), getattr(board, str(sda).strip())
+        _bus_clear(sda_pin, scl_pin)    # DEV-245: every bus open (a jammed bus = wrong record)
+        bus = busio.I2C(scl_pin, sda_pin, frequency=int(env("NOKNOK_I2C_FREQ", 100_000)))
         try:
             return fn(bus)
         finally:
@@ -1315,6 +1336,64 @@ def _crc8(data):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+def _bus_clear(sda_pin, scl_pin):
+    """I2C bus clear (NXP UM10204 3.1.16) before busio takes the pins. A chip that
+    was in the middle of a register read when the brain was interrupted (soft
+    reload, crash, Ctrl-C, Pico reset while the PicoHub keeps the bus powered)
+    holds SDA low forever, and busio.I2C then fails with "No pull up found": the
+    whole bus is skipped. RDM-13 bench, 16 Nov 2026: an Adafruit VEML7700 did this
+    6/6 times after an interrupted write-then-read; noknok modules never (0/12).
+    One SCL pulse released it.
+    Returns 0 = SDA free (nothing done), n = released after n SCL pulses,
+    -1 = still held low after 9 pulses, -2 = SCL low as well: the bus is switched
+    off or has no pull-ups (a PicoHub bus rail that is off reads SDA = SCL = 0,
+    RDM-13 bench 17 Nov 2026) - not clocked, busio then reports the bus.
+    Recovery only - digitalio never carries I2C traffic.
+    Never raises (DEV-245 review): any error (pin in use, e.g. a settings.toml typo
+    that gives two buses the same SCL pin; host Python) returns 0, and busio then
+    reports the bus as before."""
+    sda = scl = None
+    try:
+        import digitalio
+        try:
+            from microcontroller import delay_us as _wait    # exact 5 us half periods
+        except ImportError:
+            def _wait(us):
+                time.sleep(us / 1_000_000)
+        sda = digitalio.DigitalInOut(sda_pin)
+        sda.switch_to_input()
+        if sda.value:
+            return 0
+        scl = digitalio.DigitalInOut(scl_pin)
+        scl.switch_to_input(pull=digitalio.Pull.DOWN)   # pull-down: a floating
+        if not scl.value:                               # line reads low, not random
+            return -2
+        scl.switch_to_output(value=True, drive_mode=digitalio.DriveMode.OPEN_DRAIN)
+        n = -1
+        for i in range(1, 10):                  # 100 kHz minimums: tLOW 4.7 us, tHIGH 4.0 us
+            scl.value = False
+            _wait(5)
+            scl.value = True
+            _wait(5)
+            if sda.value:
+                n = i
+                break
+        # STOP: SDA rises while SCL is high
+        sda.switch_to_output(value=False, drive_mode=digitalio.DriveMode.OPEN_DRAIN)
+        _wait(5)
+        sda.value = True
+        return n
+    except Exception:
+        return 0
+    finally:
+        for p in (scl, sda):
+            if p is not None:
+                try:
+                    p.deinit()
+                except Exception:
+                    pass
+
+
 class Conductor:
     """
     I2C master for the noknok ecosystem.
@@ -1348,6 +1427,12 @@ class Conductor:
     # every noknok module (see DEV-1 / the bootloader doc). 0xB0 = ENTER_BOOTLOADER.
     CMD_GET_VERSION  = 0xB1   # write 0xB1, read 4 bytes [PROTO, FW_MAJOR, MINOR, PATCH]
     PROTOCOL_VERSION = 0x01   # the standard-command protocol version this lib understands
+    CMD_GET_ID       = 0xB4   # DEV-21 / ADR-005: write 0xB4, read 10 bytes [UID x8][TYPE][CRC8],
+                              # the same bytes as the 0x7F enumeration reply
+    # First app version per type that answers 0xB4 (DEV-21). A module saved with this
+    # firmware or newer MUST prove its identity on restore; older ones fall back to 0xB1.
+    GET_ID_SINCE = {TYPE_BUZZER: (3, 6, 0), TYPE_KNOB: (2, 4, 0), TYPE_LEDBUTTON: (2, 5, 0),
+                    TYPE_DISPLAY: (0, 8, 0), TYPE_PICOHUB: (0, 4, 0)}
 
     def __init__(self, sda=None, scl=None, frequency=None, sda_b=None, scl_b=None):
         # Pins: explicit arguments (board pin objects) > settings.toml. There is
@@ -1408,6 +1493,13 @@ class Conductor:
             if getattr(self, attr) is not None or not self._bus_pins.get(name):
                 continue
             sda, scl = self._bus_pins[name]
+            n = _bus_clear(sda, scl)          # RDM-13: free a bus a chip holds low
+            if n > 0:
+                _print("[i2c] bus %s: SDA was held low - released after %d clock pulse(s)"
+                       % (name, n))
+            elif n == -1:
+                _print("[i2c] bus %s: SDA held low - still stuck after 9 clock pulses "
+                       "(unplug the boards on this bus)" % name)
             try:
                 setattr(self, attr, busio.I2C(scl, sda, frequency=self._freq))
             except Exception as e:
@@ -1506,6 +1598,35 @@ class Conductor:
         if buf is None or buf[0] != self.PROTOCOL_VERSION:
             return (None, None)
         return (buf[0], "%d.%d.%d" % (buf[1], buf[2], buf[3]))
+
+    def identify(self, address, i2c=None):
+        """DEV-21 (ADR-005): ask the module at `address` who it is. Returns
+        (uid_hex, type) or None.
+
+        Write 0xB4 GET_ID, read 10 bytes [UID x8][TYPE][CRC8] - the same reply as
+        at 0x7F. Only accepted with a valid CRC-8, a known noknok I2C type and a
+        real UID: an app older than 0xB4 answers zeros (whose CRC-8 is also 0) or
+        junk, a foreign chip answers anything. Two tries. Used only at addresses
+        the saved state lists (restore) and at 0x7E (rescue): no bus scanning."""
+        for attempt in range(2):
+            if self._write(address, [self.CMD_GET_ID], i2c):
+                time.sleep(0.003)                   # let the module latch the command
+                buf = self._read(address, 10, i2c)
+                if buf is not None and len(buf) == 10 and _crc8(buf[:9]) == buf[9]:
+                    uid = bytes(buf[:8])
+                    if (buf[8] in self.GET_ID_SINCE and uid != b"\x00" * 8
+                            and uid != b"\xff" * 8):
+                        return (uid.hex(), buf[8])
+            time.sleep(0.01)
+        return None
+
+    @staticmethod
+    def _vtuple(v):
+        """"3.6.0" -> (3, 6, 0); None / junk -> None."""
+        try:
+            return tuple(int(x) for x in str(v).split(".")[:3])
+        except (TypeError, ValueError):
+            return None
 
     def _apply_version(self, module, address):
         """Populate module.protocol_version / module.firmware_version (both None if
@@ -2083,12 +2204,18 @@ class Conductor:
             f = ModuleFlasher(bus)
             st = f._read_status()
             if st is not None:
-                res = self._rescue_on(f, st, bus_name, get_image, logfn)
+                res = self._rescue_on(f, st, bus_name, get_image, logfn, bus)
                 res["i2c_bus"] = bus_name
                 return res
         return None                                       # nothing at 0x7E — normal
 
-    def _rescue_on(self, f, st, bus_name, get_image, logfn):
+    # First stage-1 per flash layout (0xB1 byte 4) that answers 0xB4 at 0x7E (DEV-21
+    # rescue; DEV-22): V003 (layout 2) from 1.3.0 with the type it kept, X035 (layout 3,
+    # PicoHub) from 1.1.0 with its fixed 0x07. Older stage-1s and unknown layouts never
+    # get the new command. Versions are per chip family: never compare across layouts.
+    _BL_GET_ID_SINCE = {2: (1, 3, 0), 3: (1, 1, 0)}
+
+    def _rescue_on(self, f, st, bus_name, get_image, logfn, bus=None):
         """rescue_parked_module() for the module parked at 0x7E on one bus."""
         from module_flasher import ST_ERROR
         state, err = st
@@ -2111,6 +2238,18 @@ class Conductor:
         saved = self._state_map()
         info = saved.get(uid)
         mf_key = self._TYPE_TO_MF_KEY.get(info.get("type", 0)) if info else None
+        since = self._BL_GET_ID_SINCE.get(self.layout_of(ver))
+        if not mf_key and bus is not None and since is not None and tuple(ver[1:4]) >= since:
+            # DEV-21: never seen on this brain (or the state was lost). A DEV-22
+            # stage-1 keeps the module type in its metadata and answers 0xB4 at 0x7E;
+            # type 0 (unknown) or another UID = no help, fall through as before.
+            from module_flasher import BL_ADDR
+            ident = self.identify(BL_ADDR, bus)
+            if ident is not None and ident[0] == uid:
+                mf_key = self._TYPE_TO_MF_KEY.get(ident[1])
+                if mf_key:
+                    logfn("  UID %s is not in the module state; its bootloader says %s (0xB4)"
+                          % (uid, mf_key))
         if not mf_key:
             logfn("  UID %s is not in the module state - cannot tell what app to push" % uid)
             return {"uid": uid, "type": None, "reason": reason,
@@ -2535,24 +2674,40 @@ class Conductor:
             return
         store().set("state", data)
 
-    def _restore_identity(self, addr, bus, type_code):
-        """Is the device at a remembered address still a noknok module? Returns its
-        (protocol_version, "x.y.z") or None.
-
-        INTERIM check (DEV-119, ADR-005): the saved type must be plausible and the
-        0xB1 GET_VERSION reply must start with PROTOCOL_VERSION; three tries, so a
-        module that is briefly busy is not dropped for the whole boot. Weaker than
-        an identity read (a foreign chip CAN return 0x01), so it stops the common
-        phantom only. DEV-21 replaces the body with the 0xB4 GET_ID check (valid
-        CRC8 and the saved UID) - keep it the one place restore asks."""
+    def _restore_identity(self, addr, bus, type_code, uid_hex=None, saved_fw=None):
+        """Is the device at a remembered address still THE saved module? The one
+        place restore asks. Returns (verdict, version):
+          "same"    - it answered 0xB4 with the saved UID and type (DEV-21, ADR-005);
+                      version = (protocol_version, "x.y.z")
+          "legacy"  - no 0xB4 answer, but the saved firmware predates 0xB4 and the
+                      0xB1 reply starts with PROTOCOL_VERSION (DEV-119 interim check,
+                      three tries): an old-firmware module, trusted as before
+          "other"   - a DIFFERENT noknok module answers 0xB4 here (stale entry)
+          "foreign" - not a noknok module we can trust (version None)
+        A module saved with firmware that answers 0xB4 (GET_ID_SINCE) must answer
+        it: a foreign chip can echo 0x01 to 0xB1, it cannot produce a UID + CRC."""
         if not isinstance(type_code, int) or not 0 < type_code < 0xFF:
-            return None
+            return ("foreign", None)
+        ident = self.identify(addr, bus)
+        if ident is not None:
+            if ident[0] != uid_hex or ident[1] != type_code:
+                return ("other", None)
+            for attempt in range(3):                # identity proven; get its version
+                proto, ver = self.read_version(addr, bus)
+                if proto == self.PROTOCOL_VERSION:
+                    break
+                time.sleep(0.02)
+            return ("same", (proto, ver))
+        since = self.GET_ID_SINCE.get(type_code)
+        saved = self._vtuple(saved_fw)
+        if since is not None and saved is not None and saved >= since:
+            return ("foreign", None)     # it answered 0xB4 before: silence = not it
         for attempt in range(3):
             proto, ver = self.read_version(addr, bus)
             if proto == self.PROTOCOL_VERSION:
-                return (proto, ver)
+                return ("legacy", (proto, ver))
             time.sleep(0.02)
-        return None
+        return ("foreign", None)
 
     def _adopt_orphan(self, addr, bus, bus_name):
         """DEV-188: make a noknok module that the Store does not know (it kept its
@@ -2656,17 +2811,25 @@ class Conductor:
                 continue   # that bus is off this boot - keep the entry, try next time
             if self._read(addr, 1, bus) is None:
                 continue   # module not responding (or moved to the other bus: the 0x7F sweep finds it)
-            version = self._restore_identity(addr, bus, type_code)
-            if version is None:
-                # Something answers, but not as a noknok module: a foreign board
-                # now sits on the old address (DEV-119). No object for it; the
-                # entry stays (rescue may still need UID -> type) and enumerate()'s
-                # scan keeps the address from being handed out.
-                _print("  state: 0x%02X (bus %s) answers but not as a noknok module - "
-                      "%s not restored" % (addr, bus_name, uid_hex))
-                continue
             saved_fw = info.get("fw")
-            if saved_fw and version[1] != saved_fw:
+            verdict, version = self._restore_identity(addr, bus, type_code, uid_hex, saved_fw)
+            if verdict == "foreign":
+                # Something answers, but not as the saved noknok module: a foreign
+                # board now sits on the old address (DEV-119, DEV-21). No object for
+                # it; the entry stays (rescue may still need UID -> type) and
+                # enumerate()'s scan keeps the address from being handed out.
+                _event("[MODULE] 0x%02X (bus %s) answers but not as a noknok module "
+                       "(saved %s) - not restored" % (addr, bus_name, uid_hex))
+                continue
+            if verdict == "other":
+                # DEV-21: a different noknok module answers 0xB4 at this address (a
+                # stale entry). Never restore it under the saved UID; send it through
+                # the bootloader round trip so it re-enumerates at 0x7F as itself.
+                _event("[MODULE] 0x%02X (bus %s) is another noknok module, not saved %s - "
+                       "not restored, re-enumerating it" % (addr, bus_name, uid_hex))
+                self._adopt_orphan(addr, bus, bus_name)
+                continue
+            if verdict == "legacy" and saved_fw and version[1] != saved_fw:
                 # DEV-204: the device at this address reports another firmware than the
                 # module saved here - it is a different module (a PicoHub at an old Knob
                 # address factory-reset a brain through the boot-hold check). Do not

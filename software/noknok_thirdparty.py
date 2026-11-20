@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """
 noknok_thirdparty - third-party Qwiic / Stemma QT boards on a noknok brain (core).
-DEV-248 (from the RDM-13 exploration). Needs noknok.py 1.28+ (DEV-245: the Conductor clears a
+DEV-248 (from the RDM-13 exploration). Needs noknok.py 1.30+ (DEV-245: the Conductor clears a
 stuck bus before it opens it). Plug boards in with the brain off: hot-plug is not supported.
 
     from noknok import Conductor
