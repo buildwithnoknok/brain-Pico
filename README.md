@@ -533,7 +533,7 @@ if hub:
 
 Products can use some popular third-party boards next to noknok modules. **Plug them in with the
 brain off**: at boot the Conductor scans each bus and gives noknok modules only addresses where
-nothing answers (DEV-119). Hot-plug is not supported. Needs noknok.py 1.27+ (bus clear, DEV-245).
+nothing answers (DEV-119). Hot-plug is not supported. Needs noknok.py 1.28+ (bus clear, DEV-245).
 
 ```python
 from noknok import Conductor
