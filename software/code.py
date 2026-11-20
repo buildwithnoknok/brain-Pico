@@ -1912,6 +1912,50 @@ def _join_failed(ssid, reason, attempts, detail):
     alert_customer()
     _blink_onboard_led()
 
+# ── BLE setup carrier (RDM-24 / RDM-17, exploration draft) ─────────────────────
+# Boards whose CircuitPython has native BLE (ESP32-S3; NOT the Pico W / Pico 2 W)
+# also offer setup over Bluetooth LE: the same Dispatcher ops as POST /rpc, carried
+# over the Nordic UART Service and encrypted (noknok_ble_session: X25519 + optional
+# label PoP, AES-CTR + HMAC; `provision` is refused on a plaintext link). The phone
+# never has to leave its own WiFi. Advertised name = the hotspot name (DEV-260).
+# Started ONLY here, in setup mode: on CircuitPython 10.3.x a soft reload after a
+# BLE service exists hard-faults (adafruit/circuitpython #11552, fixed in 11.0.0-
+# alpha.2), and setup mode is only ever left through nk.hard_reset().
+# settings.toml: NOKNOK_BLE = 0 turns it off; NOKNOK_BLE_POP = "<code>" sets the PoP.
+_ble = None
+
+def _start_ble_setup():
+    global _ble
+    if _ble is not None or str(nk.env("NOKNOK_BLE", "1")).strip() == "0":
+        return
+    try:
+        import noknok_ble
+        if not noknok_ble.available():
+            return                                   # Pico: no native BLE, hotspot only
+        pop = str(nk.env("NOKNOK_BLE_POP", "") or "").strip().encode()
+        _ble = noknok_ble.BleCarrier(rpc.dispatcher(), AP_SSID, log, pop=pop)
+        _ble.start()
+        log("[ble] setup over Bluetooth LE as '%s' (PoP %s)" % (AP_SSID, "set" if pop else "not set"))
+    except Exception as e:
+        _ble = None
+        log(f"[ble] setup carrier not started ({e!r}) - hotspot only")
+
+_ble_err_next = 0
+
+def _serve_setup():
+    """One service pass in setup mode: the HTTP /rpc carrier (+ deferred work)
+    and, where present, the BLE carrier."""
+    global _ble_err_next
+    rpc.service(force=True)
+    if _ble is not None:
+        try:
+            _ble.poll()
+        except Exception as e:
+            now = time.monotonic()
+            if now >= _ble_err_next:                 # one line per 10 s at most
+                _ble_err_next = now + 10
+                log(f"[ble] poll error: {e!r}")
+
 def run_ap_provisioning():
     """
     Start a WiFi hotspot + HTTP server and wait for credentials.
@@ -1931,12 +1975,13 @@ def run_ap_provisioning():
         server = rpc.start_http(pool, port=80, logfn=log).server
         register_routes(server)
         log(f"[ap] HTTP server listening — open http://{ap_ip}  (/rpc + legacy routes)")
+        _start_ble_setup()                   # ESP32-S3 only; once; stays up across AP rebuilds
 
         # Reset state and serve requests until credentials arrive
         pending["ready"] = False
         last_beat = time.monotonic()
         while not pending["ready"]:
-            rpc.service(force=True)          # poll + deferred work (reboot etc.)
+            _serve_setup()                   # poll + deferred work (reboot etc.), HTTP + BLE
             now = time.monotonic()
             if now - last_beat > 5:
                 log("[ap] waiting for setup… (server alive)")
@@ -1948,12 +1993,12 @@ def run_ap_provisioning():
         # out (browser form, older app), so a lost frame can be retransmitted.
         end = time.monotonic() + REPLY_GRACE_S
         while time.monotonic() < end and not pending.get("acked"):
-            rpc.service(force=True)
+            _serve_setup()
             time.sleep(0.01)
         if pending.get("acked"):
             log("[ap] App confirmed the reply — dropping the hotspot")
             for _ in range(20):              # ~0.2 s: let the ack's own reply leave
-                rpc.service(force=True)
+                _serve_setup()
                 time.sleep(0.01)
         else:
             log(f"[ap] No ack from the app within {REPLY_GRACE_S} s — continuing")
