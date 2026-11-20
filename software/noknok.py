@@ -161,7 +161,11 @@
 #             = foreign, not restored. Old firmware keeps the DEV-119/DEV-204 0xB1 check.
 #             Rescue asks 0xB4 at 0x7E for a UID the state does not know, only from a
 #             stage-1 newer than 1.2.0 (DEV-22). No bus scanning: saved addresses only.
-# v1.29 (Sam, exploration, DEV-245): I2C bus clear in _init_i2c(). A third-party
+# v1.29 (Sue): DEV-21 (Sam's review) — the rescue gate is per flash layout (0xB1 byte 4):
+#             V003 (layout 2) from stage-1 1.3.0, X035 (layout 3, PicoHub) from 1.1.0
+#             (_BL_GET_ID_SINCE). 1.28 compared versions across chip families and shut
+#             the X035 1.1.0 out. Unknown layouts never get 0xB4.
+# v1.30 (Sam, exploration, DEV-245): I2C bus clear in _init_i2c(). A third-party
 #             chip interrupted mid-read holds SDA low through a Pico reset (PicoHub keeps
 #             the bus powered); busio.I2C then failed and the whole bus was skipped.
 #             _bus_clear() clocks SCL (max 9) until SDA is free, then sends a STOP. A bus
@@ -187,7 +191,7 @@ import json
 import os
 import struct
 
-__version__ = "1.29"
+__version__ = "1.30"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -2205,9 +2209,11 @@ class Conductor:
                 return res
         return None                                       # nothing at 0x7E — normal
 
-    # Newest stage-1 (V003) that does NOT answer 0xB4 at 0x7E: never send it the
-    # new command (DEV-21 rescue; DEV-22 stage-1 answers it with the type it kept).
-    _BL_NO_GET_ID = (1, 2, 0)
+    # First stage-1 per flash layout (0xB1 byte 4) that answers 0xB4 at 0x7E (DEV-21
+    # rescue; DEV-22): V003 (layout 2) from 1.3.0 with the type it kept, X035 (layout 3,
+    # PicoHub) from 1.1.0 with its fixed 0x07. Older stage-1s and unknown layouts never
+    # get the new command. Versions are per chip family: never compare across layouts.
+    _BL_GET_ID_SINCE = {2: (1, 3, 0), 3: (1, 1, 0)}
 
     def _rescue_on(self, f, st, bus_name, get_image, logfn, bus=None):
         """rescue_parked_module() for the module parked at 0x7E on one bus."""
@@ -2232,7 +2238,8 @@ class Conductor:
         saved = self._state_map()
         info = saved.get(uid)
         mf_key = self._TYPE_TO_MF_KEY.get(info.get("type", 0)) if info else None
-        if not mf_key and bus is not None and tuple(ver[1:4]) > self._BL_NO_GET_ID:
+        since = self._BL_GET_ID_SINCE.get(self.layout_of(ver))
+        if not mf_key and bus is not None and since is not None and tuple(ver[1:4]) >= since:
             # DEV-21: never seen on this brain (or the state was lost). A DEV-22
             # stage-1 keeps the module type in its metadata and answers 0xB4 at 0x7E;
             # type 0 (unknown) or another UID = no help, fall through as before.

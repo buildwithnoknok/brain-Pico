@@ -587,16 +587,23 @@ class IdBus:
 NEVER = "cdab99887766554f"
 images = []
 lines = []
-for ver, want in (((1, 1, 3, 0, 2), "reflashed"), ((1, 1, 2, 0, 2), "none")):
-    b = IdBus(NEVER, 0x02)
+CASES = (  # (0xB1 reply = proto, maj, min, patch, layout), type at 0x7E, expected mf key / None
+    ("V003 stage-1 1.3.0 (layout 2)", (1, 1, 3, 0, 2), 0x02, "knob"),
+    ("V003 stage-1 1.2.0 (layout 2)", (1, 1, 2, 0, 2), 0x02, None),
+    ("X035 stage-1 1.1.0 (layout 3, PicoHub)", (1, 1, 1, 0, 3), 0x07, "picohub"),
+    ("X035 stage-1 1.0.0 (layout 3)", (1, 1, 0, 0, 3), 0x07, None),
+    ("unknown layout 9, stage-1 2.0.0", (1, 2, 0, 0, 9), 0x02, None),
+)
+for name, ver, mtype, want in CASES:
+    b = IdBus(NEVER, mtype)
     f = FakeFlasher(NEVER, ver)
     r = c._rescue_on(f, (0, 0), "A", lambda e: images.append(e["type"]) or b"img", lines.append, b)
     sent_b4 = any(cmd == 0xB4 for _, cmd in b.cmds)
-    if want == "reflashed":
-        check("stage-1 1.3.0: never-seen UID identified via 0xB4 -> knob app pushed",
-              r["action"] == "reflashed" and r["type"] == "knob" and sent_b4, repr(r) + repr(lines))
+    if want:
+        check("%s: never-seen UID identified via 0xB4 -> %s app pushed" % (name, want),
+              r["action"] == "reflashed" and r["type"] == want and sent_b4, repr(r) + repr(lines))
     else:
-        check("stage-1 1.2.0: no 0xB4 sent, 'unknown UID' as before",
+        check("%s: no 0xB4 sent, 'unknown UID' as before" % name,
               r["action"] == "none" and r["detail"] == "unknown UID" and not sent_b4, repr(r))
 
 print("\n%s (%d failure%s)" % ("PASS" if not fails else "FAIL", fails, "" if fails == 1 else "s"))
