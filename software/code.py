@@ -1,5 +1,11 @@
 # code.py — noknok Pico W provisioning + launcher
-# Version: 0.49 (brain capabilities in hello + provision check — DEV-268)
+# Version: 0.50 (third-party boards in status + thirdparty.* ops — DEV-249)
+#
+# v0.50 (Sue): DEV-249 — `status.modules` also lists third-party boards (rows cached by
+#   noknok_thirdparty.attach(), `thirdparty: true`); new ops thirdparty.assign / .set / .forget /
+#   .check (naming + OLED height saved in the Store, never the FAT; pull-up check with warnings).
+#   code.py never imports the library: the ops answer "no library" unless the product loaded it.
+#   With third-party rows, status drops events (never rows) to stay under rpc.MAX_REPLY.
 #
 # v0.49 (Sue): DEV-268 — `hello` returns `capabilities` (i2c, i2c_b, usb_host from the pins in
 #   settings.toml and the build) and `provision` takes an optional `requires` list (the
@@ -519,7 +525,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.49"
+CODE_VERSION = "0.50"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -1389,13 +1395,17 @@ def _h_status(args, msg):
                             "uid": getattr(m, "_uid_hex", None) or getattr(m, "serial", None),
                             "fw": getattr(m, "firmware_version", None),
                             "bus": getattr(m, "i2c_bus", None) or "usb"})   # "A"/"B"/"usb" (DEV-74)
+        # DEV-249: third-party boards, rows cached by tp.attach()/assign() ([] without the
+        # library). Never tp.describe() here: it imports a helper on every poll.
+        tp_rows = getattr(c, "thirdparty_rows", None) or []
+        modules.extend(tp_rows)
         hub = getattr(c, "picohub", None)
         if hub is not None:              # DEV-123: the PicoHub's power manager, one I2C read
             try:
                 power = hub.status()
             except Exception as e:
                 power = {"error": str(e)}
-    return {
+    out = {
         "state": _device_state(),
         "strikes": _crash_count(),
         "store": nk.store().backend,
@@ -1411,6 +1421,23 @@ def _h_status(args, msg):
         "events_since": since,
         "events_total": len(ev),
     }
+    if any(r.get("thirdparty") for r in modules):
+        _fit_status(out, args.get("since") is None)
+    return out
+
+def _fit_status(out, newest):
+    """DEV-249: third-party rows (~110 bytes each) can push `status` past rpc.MAX_REPLY
+    (DEV-169: a bigger reply does not get out). Drop events, never module rows: without
+    `since` the oldest of the page go (events_since moves up), with `since` the page gets
+    shorter at its end, so the app's paging stays correct. Only runs with third-party rows."""
+    limit = rpc.MAX_REPLY - 100          # envelope: id, ok
+    page = out["events"]
+    while page and len(json.dumps(out)) > limit:
+        if newest:
+            page.pop(0)
+            out["events_since"] += 1
+        else:
+            page.pop()
 
 def _h_reboot(args, msg):
     """Reply first, reset after the response has gone out (deferred).
@@ -1493,6 +1520,118 @@ def _h_settings_reset(args, msg):
     values = s.reset()                  # queues the differences for on_change
     log("[rpc] settings.reset %s" % scope)
     return {"scope": scope, "values": values, "seq": s.seq}
+
+# ── Third-party boards (DEV-249) ───────────────────────────────────────────────
+# The app names boards the brain cannot identify, sets options a chip cannot report
+# (OLED height) and runs the pull-up check. Spec: exploration repo
+# rdm-13-third-party/proposal/APP-WORK-Sue.md; library: noknok_thirdparty (DEV-248).
+# IMPORT RULE: code.py never imports noknok_thirdparty. Only a product whose manifest
+# lists a third-party board imports it (6 KB + 1-2 KB per board); the ops below use the
+# copy the product already loaded and answer "no library" otherwise.
+# What the user names is saved in the Store (key "thirdparty", nvm/FRAM, ADR-003), never
+# the FAT; tp.attach() applies it on every boot, so it survives a reboot and an OTA.
+
+TP_BUSES = ("A", "B")
+
+def _tp_or_error():
+    """(library, Conductor) of the running product, or an RpcError for the app."""
+    c = nk.conductor()
+    if c is None:
+        raise rpc.RpcError("no conductor")
+    tp = sys.modules.get("noknok_thirdparty")
+    if tp is None or not hasattr(c, "thirdparty"):
+        raise rpc.RpcError("no library")
+    return tp, c
+
+def _tp_target(args):
+    """Validated (bus, address) from the op args."""
+    bus = args.get("bus")
+    if bus not in TP_BUSES:
+        raise rpc.RpcError("bad bus", bus)
+    addr = args.get("address")
+    if isinstance(addr, bool) or not isinstance(addr, int) or not 0x08 <= addr <= 0x77:
+        raise rpc.RpcError("bad address", addr)
+    return bus, addr
+
+def _tp_row(c, bus, addr):
+    for r in getattr(c, "thirdparty_rows", None) or []:
+        if r.get("bus") == bus and r.get("address") == addr:
+            return r
+    return None
+
+def _h_tp_assign(args, msg):
+    """Name a board: {bus, address, type}. Any registered type is allowed, not only the
+    candidates (the user may know better). Saved only after the board answered."""
+    tp, c = _tp_or_error()
+    bus, addr = _tp_target(args)
+    typ = args.get("type")
+    if typ not in tp.TYPES:
+        raise rpc.RpcError("unknown type", typ)
+    if addr in tp._noknok_addresses(c, bus):
+        raise rpc.RpcError("noknok module", "%s 0x%02x" % (bus, addr))
+    m = tp.assign(c, typ, bus, addr, log=log)
+    if m is None:
+        raise rpc.RpcError("no answer", "%s 0x%02x" % (bus, addr))
+    saved = True
+    try:
+        tp.remember(bus, addr, type=typ)
+    except Exception as e:               # board works now, but would be unknown after a reboot
+        log("[3p] remember failed: %r" % (e,))
+        saved = False
+    event("[3P] %s 0x%02x named %s" % (bus, addr, typ))
+    return {"row": _tp_row(c, bus, addr), "saved": saved}
+
+def _h_tp_set(args, msg):
+    """Options the chip cannot report. Today only the SSD1306 panel height (32 / 64)."""
+    tp, c = _tp_or_error()
+    bus, addr = _tp_target(args)
+    m = None
+    for o in c.thirdparty:
+        if o.i2c_bus == bus and o.address == addr:
+            m = o
+            break
+    if m is None:
+        raise rpc.RpcError("not found", "%s 0x%02x" % (bus, addr))
+    opts = [k for k in args if k not in ("bus", "address")]
+    if opts != ["height"] or m.TYPE != "ssd1306":
+        raise rpc.RpcError("not supported", ",".join(opts) or None)
+    h = args.get("height")
+    if isinstance(h, bool) or h not in (32, 64):
+        raise rpc.RpcError("bad value", h)
+    if h != m.HEIGHT:
+        m.set_size(h)
+    saved = True
+    try:
+        tp.remember(bus, addr, height=h)
+    except Exception as e:
+        log("[3p] remember failed: %r" % (e,))
+        saved = False
+    c.thirdparty_rows = tp.describe(c)
+    return {"row": _tp_row(c, bus, addr), "saved": saved}
+
+def _h_tp_forget(args, msg):
+    """Drop what was saved for one board and re-detect, so it falls back to auto-detect
+    (or unknown) at once."""
+    tp, c = _tp_or_error()
+    bus, addr = _tp_target(args)
+    had = tp.forget(bus, addr)
+    if had:
+        tp.attach(c, log=log)
+        event("[3P] %s 0x%02x naming forgotten" % (bus, addr))
+    return {"forgotten": had}
+
+def _h_tp_check(args, msg):
+    """Pull-up load per bus + what to change (move a board, cut a jumper). pass = no bus
+    below the 1000 ohm limit (3 mA sink at 3.3 V)."""
+    tp, c = _tp_or_error()
+    budget = tp.pullup_budget(c)
+    warnings = tp.pullup_warnings(c)
+    buses = {}
+    for name, b in budget.items():
+        buses[name] = {"total_ohms": b["total_ohms"], "unknown": b["unknown"],
+                       "boards": [list(x) for x in b["boards"]]}
+    return {"pass": all(b["total_ohms"] >= 1000 for b in budget.values()),
+            "buses": buses, "warnings": warnings}
 
 # ── Setup join feedback (DEV-100) ──────────────────────────────────────────────
 # The phone loses the hotspot while the brain tries the home WiFi, so the brain
@@ -1742,6 +1881,10 @@ def register_ops():
         a.get("module_firmware"), a.get("product_id"), a.get("config_defaults"),
         bool(a.get("force")), a.get("join_id"), a.get("requires")))
     d.register("wifi.scan", _h_wifi_scan)          # DEV-100
+    d.register("thirdparty.assign", _h_tp_assign)  # DEV-249
+    d.register("thirdparty.set", _h_tp_set)
+    d.register("thirdparty.forget", _h_tp_forget)
+    d.register("thirdparty.check", _h_tp_check)
 
 def _json(request, obj):
     return Response(request, json.dumps(obj), content_type="application/json")

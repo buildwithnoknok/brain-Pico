@@ -25,6 +25,7 @@ This page is written from the code (`software/noknok_rpc.py` 0.7.0, `software/co
 |------|-------|
 | `POST /rpc` carrier (setup hotspot and home WiFi), dispatcher | Shipped |
 | `hello`, `status`, `mem`, `settings.get/set/reset`, `roles.assign`, `provision`, `wifi.scan`, `reboot`, `factory_reset` | Shipped |
+| `thirdparty.assign/set/forget/check`, third-party rows in `status` | Shipped (code.py 0.50, DEV-249) |
 | `config_schema` v2 and `c.settings` (product and device scope) | Shipped |
 | Authorisation of `/rpc` | **Not built.** `Dispatcher.authorize` exists as a hook and nothing sets it (see section 5) |
 | `status`: per-module installed-vs-published firmware state | **Not built** (the op returns modules, events, strikes and link state only) |
@@ -88,13 +89,15 @@ Names and one-line purpose. Arguments and reply fields: [provisioning-http-api.m
 | op | Purpose |
 |----|---------|
 | `hello` | Device id, name, state (`unprovisioned` / `provisioned` / `parked`), product, component versions, pin configuration, last setup-join result, op list. Open and cheap: call it first |
-| `status` | State, crash strikes, Store backend, free memory, IP, modules, power-manager status (PicoHub only), recent events, link counters |
+| `status` | State, crash strikes, Store backend, free memory, IP, modules (incl. third-party boards, `thirdparty: true`), power-manager status (PicoHub only), recent events, link counters |
 | `mem` | Tiny reply (about 100 bytes: `mem_free`, `mem_alloc`, `uptime`, `strikes`) for bench watchers; use it instead of `status` under load (code.py 0.47, DEV-187) |
 | `settings.get` / `settings.set` / `settings.reset` | Read, merge, reset to defaults; `scope` is `product` (default) or `device` |
 | `roles.assign` | Wait up to 20 s for the customer to touch a module, save it under a role id |
 | `wifi.scan` | List visible networks (on the hotspot: the list scanned before the hotspot started) |
 | `provision` | On the hotspot: hand over home-WiFi credentials and the product. On home WiFi: switch product (downloads and compiles before replacing anything) |
 | `reboot`, `factory_reset` | Flush settings and reset; wipe everything including both settings scopes |
+| `thirdparty.assign` / `.set` / `.forget` | Name a third-party board the brain cannot identify, set the OLED panel height, undo either. Saved in the Store (never a file) and applied at every boot. Only while a product that uses third-party boards runs (else `no library`) |
+| `thirdparty.check` | Pull-up load per bus, `pass`, and what to change (move a board to the other bus, cut a pull-up jumper) |
 
 ## 5. Authorisation: none today
 

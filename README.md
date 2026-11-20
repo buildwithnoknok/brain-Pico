@@ -570,6 +570,14 @@ to the other bus or use its address jumper); a driver whose chip stops answering
 Add a driver: a `noknok_tp_<type>.py` with a `ThirdPartyModule` subclass (`identify()` read-only,
 `setup()`, `verify()`, `read()`) and one `REGISTRY` line in the core.
 
+**From the app (code.py 0.50, DEV-249):** `status` lists the boards next to the noknok modules
+(`thirdparty: true`), and the ops `thirdparty.assign` / `.set` / `.forget` / `.check` name a
+board, set the OLED height, undo it, and run the pull-up check. The namings are saved in the
+Store (key `thirdparty`, never a file), applied by `attach()` at every boot and wiped by a factory
+reset (noknok.py 1.31). **Import rule:** only a product whose manifest lists a third-party board
+imports `noknok_thirdparty`; `code.py` never does, and the ops answer `no library` for every
+other product. Op reference: [docs/provisioning-http-api.md](docs/provisioning-http-api.md).
+
 ### Required CircuitPython libs (/lib)
 - `adafruit_httpserver/`
 - `adafruit_requests.mpy`
