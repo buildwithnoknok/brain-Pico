@@ -71,7 +71,7 @@ CODE_FILES = ("code.py", "boot.py", "safemode.py")   # safemode.py: DEV-154
 # at boot": code.py imports the first five, products the rest (DEV-248, RAM rule ADR-011).
 LIBS = ("noknok", "noknok_rpc", "noknok_usb", "module_flasher", "noknok_fetch",
         # DEV-248: third-party boards library (core + drivers), only products that use it import it
-        "noknok_thirdparty", "noknok_tp_info", "noknok_tp_veml7700", "noknok_tp_tmp102", "noknok_tp_lsm6dsox", "noknok_tp_ads1115", "noknok_tp_msa311", "noknok_tp_ssd1306", "noknok_tp_soldered_pir")
+        "noknok_thirdparty", "noknok_tp_rpc", "noknok_tp_info", "noknok_tp_veml7700", "noknok_tp_tmp102", "noknok_tp_lsm6dsox", "noknok_tp_ads1115", "noknok_tp_msa311", "noknok_tp_ssd1306", "noknok_tp_soldered_pir")
 
 UF2_MAGIC0, UF2_MAGIC1, UF2_MAGIC_END = 0x0A324655, 0x9E5D5157, 0x0AB16F30
 UF2_FLAG_FAMILY = 0x00002000
