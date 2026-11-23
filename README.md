@@ -144,7 +144,7 @@ shows up on a PC as a drive again (fail-open, below), so recovery is always poss
    `noknok.writable()` / `noknok.write_atomic()` are the only way to write, and they are
    for these moments only.
 5. **Fail open.** If `settings.toml` has no `NOKNOK_USB_DRIVE` key, or `code.py` / a
-   library `code.py` always imports (`noknok`, `noknok_rpc` — as `.mpy` **or** `.py`) is
+   library `code.py` always imports (`noknok_main`, `noknok`, `noknok_rpc` — as `.mpy` **or** `.py`) is
    missing, or `boot.py` raises, the drive stays visible. `boot.py` can never lock a brain
    out. **A visible drive means the program cannot write**: provisioning then fails to save the
    downloaded product. If saves fail, read `boot_out.txt` — `fail-open` names the reason.
@@ -593,8 +593,13 @@ first had fragmented the heap) and the brain never started its setup AP. A `.mpy
 compiled — `noknok.py` 184 KB → `noknok.mpy` 45 KB — so it loads with a fraction of the RAM.
 
 - Build: `tools/build_mpy.ps1` → `C:\Users\chris\noknok\pico-deploy\mpy\` (`noknok`,
-  `noknok_rpc`, `noknok_usb`, `module_flasher`, `noknok_fetch`, and the DEV-248
+  `noknok_rpc`, `noknok_usb`, `module_flasher`, `noknok_fetch`, `noknok_main`, and the DEV-248
   `noknok_thirdparty` + `noknok_tp_*`). `code.py` and `boot.py` stay `.py`.
+- **`code.py` is a stub** (DEV-283, code 0.52): it only does `import noknok_main` and calls
+  `noknok_main.main()`. CircuitPython compiles `code.py` from source at every boot; near 170 KB
+  that compile left the brain joined to WiFi but deaf (no ARP / ping / HTTP). The program lives
+  in `software/noknok_main.py` and ships as `noknok_main.mpy`. Never add code to `code.py`;
+  `CODE_VERSION` (what `hello` reports as `code`) is in `noknok_main.py`.
 - **`mpy-cross` must match the Pico's CircuitPython version** (10.3.1 → mpy v6.3). Official
   builds: `adafruit-circuit-python.s3.amazonaws.com` → `bin/mpy-cross/`. Upgrading
   CircuitPython means rebuilding.
@@ -604,8 +609,8 @@ compiled — `noknok.py` 184 KB → `noknok.mpy` 45 KB — so it loads with a fr
 - Safety net: `code.py` imports `noknok` first, while the heap is still unfragmented.
 
 ### Flash / test
-1. Build the `.mpy` set (above). Copy `boot.py` + `settings.toml` + `code.py` + the four
-   `.mpy` files + the libs to the Pico. On a fresh CircuitPython (no `boot.py` yet) the
+1. Build the `.mpy` set (above). Copy `boot.py` + `settings.toml` + `code.py` (the stub) + the
+   `.mpy` files (incl. `noknok_main.mpy`) + the libs to the Pico. On a fresh CircuitPython (no `boot.py` yet) the
    CIRCUITPY drive is visible — drag and drop. Afterwards the drive is hidden: push files over
    the REPL (`tools/pico.py put`, Thonny) or set `NOKNOK_USB_DRIVE = 1` first. If the drive
    is visible *and* you need the program to write (the drive stayed visible by mistake), mount

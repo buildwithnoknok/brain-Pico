@@ -159,7 +159,7 @@ check("partial first download leaves NO cache entry", err is not None and cache(
       and not os.path.exists(BIN + ".tmp"))
 
 print("code.py uses it")
-src = open(os.path.join(SW, "code.py"), encoding="utf-8").read()
+src = open(os.path.join(SW, "noknok_main.py"), encoding="utf-8").read()
 top = [l for l in src.splitlines() if l.startswith(("import noknok_fetch", "from noknok_fetch"))]
 check("OTA cache loop imports noknok_fetch only there and calls it",
       src.count("from noknok_fetch import fetch_to_cache") == 1 and not top
@@ -189,7 +189,7 @@ try:
 except ValueError as e:
     bad = e
 check("no sidecar: rejected", bad is not None, repr(bad))
-src_cp = open(os.path.join(SW, "code.py"), encoding="utf-8").read()
+src_cp = open(os.path.join(SW, "noknok_main.py"), encoding="utf-8").read()
 check("code.py get_image flashes I2C modules from the file",
       "from noknok_fetch import open_cached" in src_cp and 'entry.get("bus") == "i2c"' in src_cp)
 

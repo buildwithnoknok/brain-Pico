@@ -65,10 +65,10 @@ import gc                                  # noqa: E402  CircuitPython extras
 gc.mem_free = lambda: 100000
 gc.mem_alloc = lambda: 50000
 
-src = open(os.path.join(SW, "code.py"), encoding="utf-8").read().rstrip()
-assert src.endswith("main()"), "code.py no longer ends with main() - update this test"
+src = open(os.path.join(SW, "noknok_main.py"), encoding="utf-8").read().rstrip()
+assert not src.endswith("main()"), "noknok_main.py must not call main() itself: the code.py stub does (DEV-283)"
 ns = {"__name__": "code_under_test"}
-exec(compile(src[: -len("main()")], "code.py", "exec"), ns)
+exec(compile(src, "noknok_main.py", "exec"), ns)
 ns["log"] = lambda msg: None
 ns["register_ops"]()
 rpc, nk = ns["rpc"], ns["nk"]

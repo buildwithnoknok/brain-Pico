@@ -16,10 +16,10 @@ import sys
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-src = open(os.path.join(HERE, "..", "software", "code.py"), encoding="utf-8").read()
+src = open(os.path.join(HERE, "..", "software", "noknok_main.py"), encoding="utf-8").read()
 m = re.search(r'^SCRIPT_URL\s*=\s*"([^"]+)"', src, re.M)
 if not m:
-    print("FAIL: SCRIPT_URL not found in software/code.py")
+    print("FAIL: SCRIPT_URL not found in software/noknok_main.py")
     sys.exit(1)
 url = m.group(1)
 print("fallback SCRIPT_URL:", url)
