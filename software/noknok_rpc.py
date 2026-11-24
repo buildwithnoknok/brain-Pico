@@ -197,8 +197,18 @@ def _safe_server_class():
             try:
                 return self.conn.send(data)
             except OSError as e:
-                if (e.args[0] if e.args else None) == 11:
-                    time.sleep(0.005)            # not now: the library will retry
+                code = e.args[0] if e.args else None
+                if code in (11, 110, 116):
+                    # Not now (11) AND timed out (110/116: the send buffer is still
+                    # full, the client has not ACKed the first segment yet) both mean
+                    # "try again while the budget lasts". The library retries 11 only:
+                    # a timeout used to escape it, the socket was closed after the
+                    # first 1460-byte segment, and the cut never counted (DEV-286).
+                    time.sleep(0.005)
+                    raise OSError(11, "try again")
+                self.cut = True                  # any other error ends the reply: count it
+                _poll_stats["send_err"] += 1
+                _poll_stats["last_err"] = code
                 raise
 
         def recv_into(self, buf, n=0):
@@ -689,7 +699,8 @@ def _restart_http():
         _logfn("[rpc] carrier restart failed: %r" % (e,))
 
 _poll_stats = {"max_ms": 0, "slow": 0, "n": 0, "cut": 0,
-               "req": 0, "reused": 0, "evicted": 0}      # DEV-198 keep-alive counters
+               "req": 0, "reused": 0, "evicted": 0,      # DEV-198 keep-alive counters
+               "send_err": 0, "last_err": None}          # DEV-286: replies a send error ended
 
 def link_stats():
     """WiFi link counters + how long the app channel held the product loop:
@@ -700,6 +711,7 @@ def link_stats():
           "slow_polls": _poll_stats["slow"], "polls": _poll_stats["n"],
           "cut_replies": _poll_stats["cut"], "requests": _poll_stats["req"],
           "reused": _poll_stats["reused"], "ka_evicted": _poll_stats["evicted"],
+          "send_errors": _poll_stats["send_err"], "last_send_err": _poll_stats["last_err"],
           "gw_miss": _link["gw_miss"],
           "gw_ok": _link["gw_ok"]}
     _poll_stats["max_ms"] = 0
