@@ -1,4 +1,4 @@
-# noknok_rpc.py  v0.6 — Device Protocol v1: message dispatcher + carriers (DEV-34)
+# noknok_rpc.py  v0.7.1 — Device Protocol v1: message dispatcher + carriers (DEV-34)
 #
 # v0.2 (Sue): DEV-79 — an offline brain rejoins WiFi without stalling the
 #   product: most rejoin attempts only START the join (LINK_KICK_S, 0.5 s) and
@@ -19,6 +19,10 @@
 #   KEEPALIVE_MAX connections, KEEPALIVE_IDLE s idle, KEEPALIVE_REQS requests each;
 #   an idle kept connection makes room when a new client waits. status.link
 #   counts `requests` and `reused` so a test can see whether reuse happens.
+# v0.7.1 (Sue): DEV-286 — a send() that times out (110/116: the client has not ACKed the
+#   first segment yet) is retried like EAGAIN within SEND_BUDGET; the library retried EAGAIN
+#   only, so the timeout ended the reply after its headers, uncounted. Every reply a send
+#   error ends now counts in cut_replies; status.link adds send_errors / last_send_err.
 #
 # One JSON message protocol, transport-agnostic (Confluence 113868802 §2):
 #
@@ -62,7 +66,7 @@ import gc
 import json
 import time
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 SERVICE_INTERVAL = 0.05     # s between carrier polls from the implicit hook
 SOCKET_TIMEOUT   = 1.0      # s a stalled client may hold poll(). 0.2 s dropped the
@@ -321,6 +325,7 @@ def _safe_server_class():
             that came after this request (the start of the next one). DEV-198:
             a /rpc connection the client keeps open goes back to the pending list
             as idle instead of being closed."""
+            link = None
             try:
                 # Free Python memory BEFORE the handler and the reply allocate theirs.
                 # CircuitPython 10 grows the Python heap on demand, and on the bench
@@ -365,6 +370,8 @@ def _safe_server_class():
                                  False, not rest, served + 1])
                 return REQUEST_HANDLED_RESPONSE_SENT
             except Exception:
+                if link is not None and link.cut:
+                    _poll_stats["cut"] += 1      # DEV-286: a reply a send error ended is a cut too
                 try:
                     conn.close()
                 except Exception:

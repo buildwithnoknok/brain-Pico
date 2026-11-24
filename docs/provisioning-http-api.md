@@ -271,6 +271,11 @@ the settings page, a new connection per `settings.set`) cost 44-72 % ping loss b
 `status.link` counts `requests` (answered since boot), `reused` (of those, on a kept
 connection) and `ka_evicted` (idle kept connections closed for a new client), so a test can
 see whether a client reuses its connection.
+**Cut replies (noknok_rpc 0.7.1, DEV-286):** a reply that does not go out completely within
+0.5 s counts in `cut_replies`. Since 0.7.1 a send that times out (the client has not
+acknowledged the first part yet) is retried within that budget instead of ending the reply after
+its headers, and a reply that a network error ends is counted too: `send_errors` (how many) and
+`last_send_err` (the errno of the last one, e.g. 113 = no route).
 
 `product_id` (the manifest id) is new and optional on `/connect` and `provision`; it is
 stored with the credentials so the app can fetch the right `config_schema` later.
