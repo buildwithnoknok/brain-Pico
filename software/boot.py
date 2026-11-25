@@ -45,7 +45,8 @@ try:
     # either counts. Checking only noknok.py made an .mpy brain fail open:
     # drive visible, every program write refused, the product download saved
     # nowhere (2 Oct 2026).
-    for lib in ("noknok", "noknok_rpc"):
+    # DEV-283: noknok_main = the program body (code.py is only a stub that imports it).
+    for lib in ("noknok", "noknok_rpc", "noknok_main"):
         found = False
         for ext in (".mpy", ".py"):
             try:

@@ -50,12 +50,11 @@ acm = stub("adafruit_connection_manager",
            get_radio_ssl_context=lambda r: object())
 stub("adafruit_httpserver", Server=_Any, Request=_Any, Response=_Any, POST="POST")
 
-src = open(os.path.join(SW, "code.py"), encoding="utf-8").read()
+src = open(os.path.join(SW, "noknok_main.py"), encoding="utf-8").read()
 src = src.rstrip()
-assert src.endswith("main()"), "code.py no longer ends with main() - update this test"
-src = src[: -len("main()")]
+assert not src.endswith("main()"), "noknok_main.py must not call main() itself: the code.py stub does (DEV-283)"
 ns = {"__name__": "code_under_test"}
-exec(compile(src, "code.py", "exec"), ns)
+exec(compile(src, "noknok_main.py", "exec"), ns)
 
 fails = 0
 

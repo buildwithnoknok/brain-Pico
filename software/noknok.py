@@ -171,6 +171,8 @@
 #             _bus_clear() clocks SCL (max 9) until SDA is free, then sends a STOP. A bus
 #             that is switched off (SDA and SCL both low) is left alone. Never raises;
 #             also run before the Store's temporary FRAM bus (every bus open, ADR-011).
+# v1.31 (Sue): DEV-249 — factory reset also wipes the Store key "thirdparty" (third-party
+#             board namings + OLED height the app saved), like roles and settings.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -191,7 +193,7 @@ import json
 import os
 import struct
 
-__version__ = "1.30"
+__version__ = "1.31"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -3246,7 +3248,8 @@ class Conductor:
     # the UID -> type map. The restore logic self-heals if hardware changed.
     _RESET_FILES = (DATA_DIR + "/wifi.json", DATA_DIR + "/product.py", ROLES_FILE,
                     "wifi.json", "product.py", "noknok_roles.json")
-    _RESET_KEYS  = ("wifi", "roles", SETTINGS_KEY, DEVICE_SETTINGS_KEY)
+    # "thirdparty" = noknok_thirdparty.STORE_KEY (board namings, DEV-249); not imported here.
+    _RESET_KEYS  = ("wifi", "roles", SETTINGS_KEY, DEVICE_SETTINGS_KEY, "thirdparty")
 
     def check_factory_reset(self, knob_status, hold_seconds=5.0):
         """

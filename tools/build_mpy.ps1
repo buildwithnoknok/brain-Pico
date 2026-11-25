@@ -10,7 +10,8 @@
 # Rules:
 #   - mpy-cross MUST match the CircuitPython version on the Pico (10.3.1 = mpy v6.3).
 #     Official builds: https://adafruit-circuit-python.s3.amazonaws.com/index.html?prefix=bin/mpy-cross/
-#   - code.py and boot.py stay .py (CircuitPython only runs those by name).
+#   - code.py and boot.py stay .py (CircuitPython only runs those by name). code.py is a
+#     stub; the program is noknok_main.py, built here like a library (DEV-283).
 #   - On the Pico a .py beats a .mpy of the same name - delete/rename the .py there.
 #   - The repo keeps only the .py sources; .mpy files are build output (pico-deploy).
 #
@@ -28,8 +29,10 @@ $src = Join-Path $PSScriptRoot "..\software"
 
 # The libraries code.py and products import. Add new library files here.
 $libs = @("noknok.py", "noknok_rpc.py", "noknok_usb.py", "module_flasher.py", "noknok_fetch.py",
+          # DEV-283: the body of code.py (code.py itself is a stub that imports it)
+          "noknok_main.py",
           # DEV-248: third-party boards library (core + drivers), imported by products that use it
-          "noknok_thirdparty.py", "noknok_tp_info.py", "noknok_tp_veml7700.py", "noknok_tp_tmp102.py", "noknok_tp_lsm6dsox.py", "noknok_tp_ads1115.py", "noknok_tp_msa311.py", "noknok_tp_ssd1306.py", "noknok_tp_soldered_pir.py")
+          "noknok_thirdparty.py", "noknok_tp_rpc.py", "noknok_tp_info.py", "noknok_tp_veml7700.py", "noknok_tp_tmp102.py", "noknok_tp_lsm6dsox.py", "noknok_tp_ads1115.py", "noknok_tp_msa311.py", "noknok_tp_ssd1306.py", "noknok_tp_soldered_pir.py")
 
 if (-not (Test-Path $MpyCross)) { throw "mpy-cross not found: $MpyCross" }
 Write-Output ("Compiler: " + (& $MpyCross --version))
