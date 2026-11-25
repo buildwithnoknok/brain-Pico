@@ -161,7 +161,7 @@ import noknok_thirdparty as tp            # noqa: E402  (what product.py does)
 tp.attach(c, log=lambda m: None)
 
 print("\nDEV-249: status rows")
-st = ns["_h_status"]({}, {})
+st = ns["_h_status"]({"full": True}, {})
 rows = [m for m in st["modules"] if m.get("thirdparty")]
 check("status lists noknok module + 2 third-party rows", len(st["modules"]) == 3, st["modules"])
 oled = [r for r in rows if r["type"] == "ssd1306"]
@@ -175,17 +175,39 @@ check("unknown at 0x30 with candidates [soldered_pir]",
 # status size cap: many long events + rows -> events dropped, rows kept, under MAX_REPLY
 saved_events = ns["events"]
 ns["events"] = lambda: ["[EVT] %03d %s" % (i, "x" * 280) for i in range(30)]
-st = ns["_h_status"]({}, {})
+st = ns["_h_status"]({"full": True}, {})
 n = len(json.dumps(st))
 check("big events + rows: reply under rpc.MAX_REPLY (%d bytes)" % n, n <= rpc.MAX_REPLY - 100)
 check("... rows kept, events dropped, newest kept",
       len(st["modules"]) == 3 and 0 < len(st["events"]) < 10
       and st["events"][-1].startswith("[EVT] 029")
       and st["events_since"] == 30 - len(st["events"]), (len(st["events"]), st["events_since"]))
-st = ns["_h_status"]({"since": 5}, {})
+st = ns["_h_status"]({"since": 5, "full": True}, {})
 check("with since: page starts at since, shorter at its end",
       st["events_since"] == 5 and st["events"][0].startswith("[EVT] 005")
       and len(json.dumps(st)) <= rpc.MAX_REPLY - 100, (st["events_since"], len(st["events"])))
+ns["events"] = saved_events
+
+print("\nDEV-286: compact status (default, one TCP segment)")
+st = ns["_h_status"]({}, {})
+check("default status: no third-party rows, thirdparty_total 2",
+      [m["type"] for m in st["modules"]] == ["mod"] and st["thirdparty_total"] == 2, st["modules"])
+ns["events"] = lambda: ["[EVT] %03d %s" % (i, "x" * 280) for i in range(30)]
+st = ns["_h_status"]({}, {})
+n = len(json.dumps(st))
+check("big events: default reply <= STATUS_BUDGET (%d bytes)" % n, n <= ns["STATUS_BUDGET"])
+check("... newest kept, events_since consistent",
+      st["events"] and st["events"][-1].startswith("[EVT] 029")
+      and st["events_since"] == 30 - len(st["events"]), (len(st["events"]), st["events_since"]))
+st = ns["_h_status"]({"since": 5}, {})
+check("... with since: page starts at since, under budget",
+      st["events_since"] == 5 and st["events"][0].startswith("[EVT] 005")
+      and len(json.dumps(st)) <= ns["STATUS_BUDGET"], (st["events_since"], len(st["events"])))
+check("... event page carries no modules / power", "modules" not in st and "power" not in st, list(st))
+ns["events"] = lambda: ["[EVT] %03d short" % i for i in range(30)]
+st = ns["_h_status"]({"since": 0}, {})
+check("short events, since 0: a full page of 10", len(st["events"]) == 10 and st["events_since"] == 0,
+      len(st["events"]))
 ns["events"] = saved_events
 
 # ── no FAT writes from here on ─────────────────────────────────────────────────
@@ -216,7 +238,7 @@ check("name 0x30 soldered_pir -> ok, row confidence user, saved",
       r.get("ok") and r["saved"] and r["row"]["type"] == "soldered_pir"
       and r["row"]["confidence"] == "user" and r["row"]["uid"] == "tp-soldered_pir-A-30", r)
 check("Store holds the naming", tp.saved().get("A-30") == {"type": "soldered_pir"}, tp.saved())
-st = ns["_h_status"]({}, {})
+st = ns["_h_status"]({"full": True}, {})
 check("status: no unknown row left, soldered_pir row present",
       [m["type"] for m in st["modules"] if m.get("thirdparty")].count("unknown") == 0
       and any(m["type"] == "soldered_pir" for m in st["modules"]), st["modules"])
@@ -245,7 +267,7 @@ check("Store backend is nvm (not the FAT)", nk.store().backend in ("nvm", "fram"
 print("\nDEV-249: thirdparty.forget")
 r = call("thirdparty.forget", bus="A", address=0x30)
 check("forget 0x30 -> forgotten true", r.get("ok") and r["forgotten"] is True, r)
-st = ns["_h_status"]({}, {})
+st = ns["_h_status"]({"full": True}, {})
 check("... board is unknown again at once",
       any(m["type"] == "unknown" and m["address"] == 0x30 for m in st["modules"]), st["modules"])
 check("... OLED height kept (other entry untouched)",
