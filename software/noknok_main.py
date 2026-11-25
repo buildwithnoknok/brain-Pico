@@ -1,5 +1,14 @@
 # noknok_main.py — noknok Pico W provisioning + launcher (the body of code.py)
-# Version: 0.52 (code.py is a stub; this file ships precompiled as noknok_main.mpy — DEV-283)
+# Version: 0.53 (code.py is a stub; this file ships precompiled as noknok_main.mpy — DEV-283)
+#
+# v0.53 (Explorer Sue): DEV-286 — `status` fits in one TCP segment by default (STATUS_BUDGET 1100
+#   bytes): third-party rows leave `modules` (count in `thirdparty_total`) and events are dropped
+#   until it fits (events_since / events_total page as before). A 2.4-2.9 KB status reply while a
+#   second client was connected stalled the brain's network path (84 % ping loss). `link` and
+#   `last_bad_request` leave the default reply too (`link` is also in `mem`); with `since` the
+#   reply is an event page without `modules` / `power` (so the page is never empty). `status
+#   {"full": true}` returns the old reply (all rows, up to rpc.MAX_REPLY). _fit_status no longer
+#   re-serialises the whole reply per dropped event.
 #
 # v0.52 (Explorer Sue): DEV-283 — code.py is now a 1 KB stub that imports this module and calls
 #   main(). CircuitPython compiles code.py from SOURCE at every boot; at ~170 KB that compile left
@@ -537,7 +546,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.52"
+CODE_VERSION = "0.53"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -1378,24 +1387,33 @@ def _h_hello(args, msg):
 STATUS_EVENTS = 10      # events per `status` reply (keeps it under rpc.MAX_REPLY)
 
 def _h_mem(args, msg):
-    """DEV-187: a reply far below one TCP segment (~100 bytes) for bench watchers: heap in use /
-    free, uptime, crash strikes. No events, no module list, no I2C read: nothing here can block."""
+    """DEV-187: a reply far below one TCP segment (~450 bytes) for bench watchers: heap in use /
+    free, uptime, crash strikes, link counters (code.py 0.53, DEV-286). No events, no module list, no I2C read: nothing here can block."""
     import gc
     return {"mem_free": gc.mem_free(), "mem_alloc": gc.mem_alloc(),
-            "uptime": int(time.monotonic()), "strikes": _crash_count()}
+            "uptime": int(time.monotonic()), "strikes": _crash_count(),
+            "link": rpc.link_stats()}           # DEV-286: moved out of the default `status`
 
 def _h_status(args, msg):
     """Phase-1 subset of `status` (DEV-36 adds per-module firmware state):
     event history, crash strikes, storage mode, memory. At most STATUS_EVENTS
     events per reply (DEV-169: a bigger reply did not get out): without `since`
     the newest ones, with `since` (int) ev[since:since+STATUS_EVENTS] so the app
-    can page; `events_total` says how many there are."""
+    can page; `events_total` says how many there are.
+    DEV-286: by default the reply stays under STATUS_BUDGET (one TCP segment): no third-party
+    rows (their count is `thirdparty_total`), no `link` / `last_bad_request` (diagnostics: `full`,
+    `link` also in `mem`), fewer events if needed (often none with a PicoHub and many modules:
+    `events_total` > 0 with an empty list means "page with since"). With `since` the compact
+    reply is an event page: no `modules` / `power`, so up to STATUS_EVENTS events fit. args.full = true gives the
+    pre-0.53 reply with every row, up to rpc.MAX_REPLY."""
     import gc
     ev = events()
     if args.get("since") is None:
         since = max(0, len(ev) - STATUS_EVENTS)
     else:
         since = max(0, int(args.get("since") or 0))
+    full = args.get("full") is True      # DEV-286: the pre-0.53 reply, up to rpc.MAX_REPLY
+    tp_total = 0
     c = nk.conductor()
     modules = []
     power = None
@@ -1409,8 +1427,12 @@ def _h_status(args, msg):
                             "bus": getattr(m, "i2c_bus", None) or "usb"})   # "A"/"B"/"usb" (DEV-74)
         # DEV-249: third-party boards, rows cached by tp.attach()/assign() ([] without the
         # library). Never tp.describe() here: it imports a helper on every poll.
+        # DEV-286: only in the full reply; the compact one carries `thirdparty_total`.
         tp_rows = getattr(c, "thirdparty_rows", None) or []
-        modules.extend(tp_rows)
+        if full:
+            modules.extend(tp_rows)
+        else:
+            tp_total = len(tp_rows)
         hub = getattr(c, "picohub", None)
         if hub is not None:              # DEV-123: the PicoHub's power manager, one I2C read
             try:
@@ -1425,31 +1447,48 @@ def _h_status(args, msg):
         "mem_free": gc.mem_free(),
         "mem_alloc": gc.mem_alloc(),     # DEV-181: in use; free + in use = heap size
         "ip": str(wifi.radio.ipv4_address) if wifi.radio.connected else None,
-        "link": rpc.link_stats(),
-        "last_bad_request": rpc._last_bad,
         "modules": modules,
         "power": power,                  # PicoHub power status or null (DEV-123)
         "events": ev[since:since + STATUS_EVENTS],
         "events_since": since,
         "events_total": len(ev),
     }
-    if any(r.get("thirdparty") for r in modules):
-        _fit_status(out, args.get("since") is None)
+    if full:
+        out["link"] = rpc.link_stats()          # diagnostics: only in the full reply (DEV-286)
+        out["last_bad_request"] = rpc._last_bad
+        _fit_status(out, args.get("since") is None, rpc.MAX_REPLY - 100)   # envelope: id, ok
+    elif args.get("since") is not None:
+        # DEV-286: an event page (history screen) carries no modules / power, so its events fit;
+        # power + 7 module rows alone fill most of the budget and the page would stay empty.
+        del out["modules"], out["power"]
+        _fit_status(out, False, STATUS_BUDGET)
+    else:
+        out["thirdparty_total"] = tp_total
+        _fit_status(out, True, STATUS_BUDGET)
     return out
 
-def _fit_status(out, newest):
-    """DEV-249: third-party rows (~110 bytes each) can push `status` past rpc.MAX_REPLY
-    (DEV-169: a bigger reply does not get out). Drop events, never module rows: without
+# DEV-286: the default `status` reply stays inside one TCP segment (MSS 1460; the HTTP
+# headers go in their own send). A multi-segment status reply while a second client is
+# connected stalled the brain's network path (84 % ping loss on Pi4RFID, 25 Nov 2026).
+# Bench 25 Nov: 1157 bytes 0 % ping loss, 1459 and 2920 bytes 85-90 % (with or without the PicoHub
+# I2C read): the size is the trigger. 1100 leaves room for the envelope (id, ok).
+STATUS_BUDGET = 1100
+
+def _fit_status(out, newest, limit):
+    """Drop events, never module rows, until `out` serialises to <= limit bytes. Without
     `since` the oldest of the page go (events_since moves up), with `since` the page gets
-    shorter at its end, so the app's paging stays correct. Only runs with third-party rows."""
-    limit = rpc.MAX_REPLY - 100          # envelope: id, ok
+    shorter at its end, so the app's paging stays correct. Serialises once, then subtracts
+    each dropped event's own size (DEV-286: no full re-dump per dropped event), and checks
+    once more at the end."""
     page = out["events"]
-    while page and len(json.dumps(out)) > limit:
-        if newest:
-            page.pop(0)
-            out["events_since"] += 1
-        else:
-            page.pop()
+    size = len(json.dumps(out))
+    while page and size > limit:
+        while page and size > limit:
+            e = page.pop(0) if newest else page.pop()
+            if newest:
+                out["events_since"] += 1
+            size -= len(json.dumps(e)) + 2      # the item and its ", " separator
+        size = len(json.dumps(out))             # exact again (events_since may have grown)
 
 def _h_reboot(args, msg):
     """Reply first, reset after the response has gone out (deferred).

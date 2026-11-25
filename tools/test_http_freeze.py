@@ -270,6 +270,66 @@ check("a reply that never goes out ('try again' forever) -> cut after SEND_BUDGE
       sp.closed and longest <= noknok_rpc.SEND_BUDGET * 1000 + FAST, (round(longest), sp.closed))
 check("... and counted in link_stats() cut_replies", noknok_rpc.link_stats()["cut_replies"] >= 1)
 
+
+class Hiccup(Client):
+    """DEV-286: the first segment goes out, then ONE send times out (116: the ACK is late),
+    then the rest goes out - a busy WiFi link. The library retries 11 only."""
+    def __init__(self, script):
+        super().__init__(script)
+        self.hiccups = 1
+
+    def send(self, data):
+        if self.sent and self.hiccups:
+            self.hiccups -= 1
+            raise OSError(116, "timed out")
+        n = min(len(data), 1460)
+        self.sent += bytes(data[:n])
+        return n
+
+
+class Broken(Client):
+    """DEV-286: the link breaks after the first segment (113, no route to host)."""
+    def send(self, data):
+        if self.sent:
+            raise OSError(113, "no route")
+        self.sent += bytes(data[:1460])
+        return min(len(data), 1460)
+
+
+def _drive(srv, cl, limit=3):
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < limit and not cl.closed:
+        try:
+            srv.poll()
+        except OSError:
+            pass                                  # the carrier logs and goes on
+        time.sleep(0.01)
+
+
+cut0 = noknok_rpc.link_stats()["cut_replies"]
+srv, _ = make(Safe)
+srv._routes = []
+srv.route("/rpc", POST)(_big)
+hc = Hiccup([(0, HEAD + BODY)])
+srv._sock = Listener([(0, hc)])
+_drive(srv, hc)
+check("DEV-286: a send timeout after the first segment -> retried, the whole reply goes out",
+      hc.sent.endswith(b'"}') and len(hc.sent) > 3000 and not hc.hiccups, len(hc.sent))
+check("... and it is not counted as cut", noknok_rpc.link_stats()["cut_replies"] == cut0)
+
+st0 = noknok_rpc.link_stats()
+srv, _ = make(Safe)
+srv._routes = []
+srv.route("/rpc", POST)(_big)
+br = Broken([(0, HEAD + BODY)])
+srv._sock = Listener([(0, br)])
+_drive(srv, br)
+st1 = noknok_rpc.link_stats()
+check("DEV-286: a reply a send error ends -> counted (cut_replies, send_errors, last_send_err)",
+      br.closed and st1["cut_replies"] == st0["cut_replies"] + 1
+      and st1["send_errors"] == st0["send_errors"] + 1 and st1["last_send_err"] == 113,
+      (st0, st1))
+
 print("\nnoknok_rpc._SafeServer: two clients at once (the DEV-169 case)")
 slow = Client([(0, HEAD), (1.0, BODY)])
 fast = Client([(0, HEAD + BODY)])

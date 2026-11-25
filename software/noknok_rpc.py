@@ -1,4 +1,4 @@
-# noknok_rpc.py  v0.6 — Device Protocol v1: message dispatcher + carriers (DEV-34)
+# noknok_rpc.py  v0.7.1 — Device Protocol v1: message dispatcher + carriers (DEV-34)
 #
 # v0.2 (Sue): DEV-79 — an offline brain rejoins WiFi without stalling the
 #   product: most rejoin attempts only START the join (LINK_KICK_S, 0.5 s) and
@@ -19,6 +19,10 @@
 #   KEEPALIVE_MAX connections, KEEPALIVE_IDLE s idle, KEEPALIVE_REQS requests each;
 #   an idle kept connection makes room when a new client waits. status.link
 #   counts `requests` and `reused` so a test can see whether reuse happens.
+# v0.7.1 (Sue): DEV-286 — a send() that times out (110/116: the client has not ACKed the
+#   first segment yet) is retried like EAGAIN within SEND_BUDGET; the library retried EAGAIN
+#   only, so the timeout ended the reply after its headers, uncounted. Every reply a send
+#   error ends now counts in cut_replies; status.link adds send_errors / last_send_err.
 #
 # One JSON message protocol, transport-agnostic (Confluence 113868802 §2):
 #
@@ -62,7 +66,7 @@ import gc
 import json
 import time
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 SERVICE_INTERVAL = 0.05     # s between carrier polls from the implicit hook
 SOCKET_TIMEOUT   = 1.0      # s a stalled client may hold poll(). 0.2 s dropped the
@@ -197,8 +201,18 @@ def _safe_server_class():
             try:
                 return self.conn.send(data)
             except OSError as e:
-                if (e.args[0] if e.args else None) == 11:
-                    time.sleep(0.005)            # not now: the library will retry
+                code = e.args[0] if e.args else None
+                if code in (11, 110, 116):
+                    # Not now (11) AND timed out (110/116: the send buffer is still
+                    # full, the client has not ACKed the first segment yet) both mean
+                    # "try again while the budget lasts". The library retries 11 only:
+                    # a timeout used to escape it, the socket was closed after the
+                    # first 1460-byte segment, and the cut never counted (DEV-286).
+                    time.sleep(0.005)
+                    raise OSError(11, "try again")
+                self.cut = True                  # any other error ends the reply: count it
+                _poll_stats["send_err"] += 1
+                _poll_stats["last_err"] = code
                 raise
 
         def recv_into(self, buf, n=0):
@@ -311,6 +325,7 @@ def _safe_server_class():
             that came after this request (the start of the next one). DEV-198:
             a /rpc connection the client keeps open goes back to the pending list
             as idle instead of being closed."""
+            link = None
             try:
                 # Free Python memory BEFORE the handler and the reply allocate theirs.
                 # CircuitPython 10 grows the Python heap on demand, and on the bench
@@ -355,6 +370,8 @@ def _safe_server_class():
                                  False, not rest, served + 1])
                 return REQUEST_HANDLED_RESPONSE_SENT
             except Exception:
+                if link is not None and link.cut:
+                    _poll_stats["cut"] += 1      # DEV-286: a reply a send error ended is a cut too
                 try:
                     conn.close()
                 except Exception:
@@ -689,7 +706,8 @@ def _restart_http():
         _logfn("[rpc] carrier restart failed: %r" % (e,))
 
 _poll_stats = {"max_ms": 0, "slow": 0, "n": 0, "cut": 0,
-               "req": 0, "reused": 0, "evicted": 0}      # DEV-198 keep-alive counters
+               "req": 0, "reused": 0, "evicted": 0,      # DEV-198 keep-alive counters
+               "send_err": 0, "last_err": None}          # DEV-286: replies a send error ended
 
 def link_stats():
     """WiFi link counters + how long the app channel held the product loop:
@@ -700,6 +718,7 @@ def link_stats():
           "slow_polls": _poll_stats["slow"], "polls": _poll_stats["n"],
           "cut_replies": _poll_stats["cut"], "requests": _poll_stats["req"],
           "reused": _poll_stats["reused"], "ka_evicted": _poll_stats["evicted"],
+          "send_errors": _poll_stats["send_err"], "last_send_err": _poll_stats["last_err"],
           "gw_miss": _link["gw_miss"],
           "gw_ok": _link["gw_ok"]}
     _poll_stats["max_ms"] = 0
