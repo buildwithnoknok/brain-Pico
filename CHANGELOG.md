@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## Feeds docs and probes - 2026-11-25
+
+- DEV-281 - bench probe scripts of the Explorer account moved into `tools/bench/feeds_probes/` (app-channel stall, Wi-Fi loss, 60 min soak); README "Data feeds" now points at the architecture repo for the design record and ADR-013. No code change, `noknok_feeds` stays 0.1.1. Breaking: no.
+
 ## noknok_feeds 0.1.1 - 2026-11-25
 
 - DEV-281 - new library `noknok_feeds.py`: public data for products without network code in the product (the poc validator rejects sockets in a product). Providers `departures()` (transport.opendata.ch stationboard with the API's field filter: 25 KB -> 2.5 KB), `weather()` / `geocode()` (Open-Meteo), `power_price()` (Energy-Charts, hourly averages); `get_json()` with a size cap (6 KB), a 6 s timeout, a heap guard (`MIN_FREE` 50 KB) and `FeedError` for every failure; `Feeds` manager (`add`, `update`, `poll` = at most one blocking fetch per call, round robin, backoff 15/30/60/120/240 s, last good data kept, never raises); EU summer-time helpers without `time.localtime`. Not imported by the brain program; added to the three library lists (`tools/build_mpy.ps1`, `tools/image/build_brain_uf2.py`, `tools/restore/restore_brain.sh`). Host test `tools/test_feeds.py` (54 checks, real recorded API answers). **Bench on a Pico 2 W (20 + 23 Nov, weak Wi-Fi):** all three providers work over HTTPS; first connect to a server 4-13 s, later fetches 0.2-0.9 s, 33-70 KB heap per HTTPS server; with the app server up and three servers fetched heap fell 174 -> 26 KB and one fetch blocked 153 s (the connect ignores the timeout), which the heap guard now prevents; recovers by itself ~65 s after a Wi-Fi loss; 60 min soak, one server, 30 s refresh: 103 of 113 fetches ok, no leak, app channel slow or unreachable 8.6% of the hour; `.mpy` 5.9 KB. Breaking: no.
