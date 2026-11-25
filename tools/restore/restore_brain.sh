@@ -57,7 +57,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 SW=$REPO/software
 PICO="python3 $REPO/tools/pico.py"
-LIBS="noknok noknok_rpc noknok_usb module_flasher noknok_fetch noknok_thirdparty noknok_tp_rpc noknok_tp_info noknok_tp_veml7700 noknok_tp_tmp102 noknok_tp_lsm6dsox noknok_tp_ads1115 noknok_tp_msa311 noknok_tp_ssd1306 noknok_tp_soldered_pir"     # what code.py (and DEV-248: products) import, see build_mpy.ps1
+LIBS="noknok noknok_rpc noknok_usb module_flasher noknok_fetch noknok_main noknok_thirdparty noknok_tp_rpc noknok_tp_info noknok_tp_veml7700 noknok_tp_tmp102 noknok_tp_lsm6dsox noknok_tp_ads1115 noknok_tp_msa311 noknok_tp_ssd1306 noknok_tp_soldered_pir"     # what code.py (and DEV-248: products) import, see build_mpy.ps1
 
 DATA=""; MPYDIR=""; SETTINGS=""; ALLOW_SRC=0; YES=0; BACKUP=1; DRY=0
 while [ $# -gt 0 ]; do

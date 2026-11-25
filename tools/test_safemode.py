@@ -135,10 +135,10 @@ sys.modules["wifi"] = types.SimpleNamespace(radio=_Any(), AuthMode=_Any())
 m = types.ModuleType("adafruit_httpserver")
 m.Server, m.Request, m.Response, m.POST = _Any, _Any, _Any, "POST"
 sys.modules["adafruit_httpserver"] = m
-src = open(os.path.join(SW, "code.py"), encoding="utf-8").read().rstrip()
-assert src.endswith("main()"), "code.py no longer ends with main() - update this test"
+src = open(os.path.join(SW, "noknok_main.py"), encoding="utf-8").read().rstrip()
+assert not src.endswith("main()"), "noknok_main.py must not call main() itself: the code.py stub does (DEV-283)"
 ns = {"__name__": "code_under_test"}
-exec(compile(src[: -len("main()")], "code.py", "exec"), ns)
+exec(compile(src, "noknok_main.py", "exec"), ns)
 events, logs, services = [], [], []
 ns["event"] = events.append
 ns["log"] = logs.append
