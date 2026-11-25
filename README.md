@@ -22,6 +22,7 @@ over I2C.
 | `lib/` | Pinned CircuitPython libraries the brain needs (see `lib/README.md`). |
 | `module_flasher.py` | I2C OTA flasher — streams a module application `.bin` to the CH32V003 bootloader (`ModuleFlasher`). Shared by the bench tool and (later) the provisioning flow. |
 | `noknok_thirdparty.py` + `noknok_tp_*.py` | Third-party Qwiic / Stemma QT boards (DEV-248): core + one small driver per chip, imported only by products that use them. See [Third-party boards](#third-party-qwiic--stemma-qt-boards-dev-248). Ships as `.mpy`. |
+| `noknok_feeds.py` | **Public data for products** (exploration draft, 20-23 Nov 2026): reviewed providers for departures (transport.opendata.ch), weather (Open-Meteo) and the day-ahead power price (Energy-Charts), a size-capped HTTPS fetch with a heap guard, a feed manager (`feeds.add()` / `feeds.poll()`, backoff, last good data kept) and local-time helpers. Products must not do network I/O themselves (poc validator); they import this instead. Imported only by products that use it; ships as `.mpy` (5.9 KB). See [Data feeds](#data-feeds-noknok_feeds). |
 | `noknok_fetch.py` | OTA-only helper (DEV-205): streams a module image into the firmware cache in 1 KB chunks (size + CRC32 checked before the rename) and lets the I2C flasher read the cached image page by page (`CachedImage`). Imported only inside the daily OTA pass, so a normal boot loads nothing extra. |
 | `bench_flash.py` | Bench bring-up tool — flashes application firmware onto a blank module (bootloader only) one at a time from the REPL. See [Bench-flashing modules](#bench-flashing-modules-bring-up). |
 | `trio_demo.py` | Light & Sound Controller demo — uses all three I2C modules. |
@@ -579,6 +580,32 @@ Store (key `thirdparty`, never a file), applied by `attach()` at every boot and 
 reset (noknok.py 1.31). **Import rule:** only a product whose manifest lists a third-party board
 imports `noknok_thirdparty`; `code.py` never does, and the ops answer `no library` for every
 other product. Op reference: [docs/provisioning-http-api.md](docs/provisioning-http-api.md).
+
+### Data feeds (`noknok_feeds`)
+
+A product that shows public data (the next buses of a stop, the weather, the electricity price) imports
+`noknok_feeds`; it never opens a socket itself (the poc validator rejects `socketpool`, `ssl`, `adafruit_requests`
+in a product). The providers are a fixed, reviewed list, every request asks the API for only the fields it needs
+(a Swiss stationboard is 25 KB unfiltered, 2.5 KB for 15 departures with the field filter), answers over
+`MAX_BYTES` (6 KB) are refused, a request is refused below `MIN_FREE` (50 KB) free heap, a failed fetch keeps the last
+good data and retries with a backoff, and `poll()` never raises. One blocking request at a time.
+
+```python
+import noknok_feeds as nf
+feeds = nf.attach(c)
+feeds.add("deps", nf.departures, every=30, station="Bern, Bahnhof", limit=15)
+while True:
+    if feeds.poll():                    # at most one due feed per call
+        draw(feeds.get("deps"))         # last good data, None before the first success
+    c.sleep(0.05)
+```
+
+Providers: `departures(station, limit)`, `weather(place, hours)` (+ `geocode(place)`), `power_price(zone)`. Each result has
+`src`, the attribution line the product must show. Time helpers: `clock_ok()`, `utc_offset(epoch, std_hours)`, `local_hm(epoch, std_hours)`.
+**Rules learned on a real Pico 2 W (bench 20 + 23 Nov 2026, exploration repo `data-sources/FEEDS-DESIGN.md` 2b/2c):** the first connect to an HTTPS server
+takes 4-13 s and keeps the app channel dead meanwhile; every server costs 33-70 KB of heap: use ONE server per product, TWO at most; a reconnect
+stalls the app ~4 s every minute or two (worst seen 24 s); keep `every` >= 20 s; never close and reopen connections. Host test: `python tools/test_feeds.py`
+(real API answers recorded in `tools/fixtures/feeds/`).
 
 ### Required CircuitPython libs (/lib)
 - `adafruit_httpserver/`

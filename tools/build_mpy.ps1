@@ -28,7 +28,7 @@ $ErrorActionPreference = "Stop"
 $src = Join-Path $PSScriptRoot "..\software"
 
 # The libraries code.py and products import. Add new library files here.
-$libs = @("noknok.py", "noknok_rpc.py", "noknok_usb.py", "module_flasher.py", "noknok_fetch.py",
+$libs = @("noknok.py", "noknok_rpc.py", "noknok_usb.py", "module_flasher.py", "noknok_fetch.py", "noknok_feeds.py",
           # DEV-283: the body of code.py (code.py itself is a stub that imports it)
           "noknok_main.py",
           # DEV-248: third-party boards library (core + drivers), imported by products that use it
