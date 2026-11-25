@@ -4,6 +4,10 @@ Newest first. One entry per version bump, written in the same commit as the bump
 `## <version> - <date>` then `- DEV-xx - what changed and why. Breaking: yes/no.`
 Convention: Confluence "Development Conventions" (SD space, page 120160257).
 
+## Docs - 2026-11-25
+
+- DEV-248 (docs follow-up) - README third-party RAM figures brought up to the shipped library 0.3.1: core 7.0 KB (was 6.4 KB, measured on 0.3.0), drivers 0.9-2.3 KB, all 7 boards 21.5 KB (was 20.9 KB). Source: bench log `exploration:rdm-13-third-party/bench/logs/2026-11-18-dev248-031/ram_split.txt` (core 6992 B, core + all 21536 B). Docs only. Breaking: no.
+
 ## code.py 0.53 - 2026-11-25
 
 - DEV-286 (part 2) - the default `status` reply now fits in one TCP segment (at most 1100 bytes of JSON before the envelope, `STATUS_BUDGET` in `noknok_main.py`). Why: a reply bigger than one segment while a second client had a connection open stalled the brain's whole network path. Bench Pi4RFID 25 Nov (bench_dev249_product, 7 third-party boards, PicoHub; status poller 1/s + 30 `mem` calls + ping 5/s): 0.52 (2848 bytes) 84 % ping loss, 22/30 calls in 83 s; the split proved size is the trigger, not the PicoHub I2C read (status without the I2C read, 1157 bytes: 0 %; the same padded to 2920 bytes: 90 %; 1459 bytes still 85 %). New default reply: third-party rows leave `modules` (`thirdparty_total` gives their count), `link` and `last_bad_request` leave it too (`link` is now also in `mem`), and events are dropped until the reply fits - with a PicoHub and many modules often all of them; `status {"since": n}` is an event page without `modules` / `power`, so up to 10 events fit. `status {"full": true}` returns the old reply with every row, `link` and `last_bad_request` (up to 3000 bytes) - not for polling next to another client. `_fit_status` serialises the reply once instead of once per dropped event. Breaking: YES - the app reads third-party rows from `status {"full": true}` (DEV-250 boards page and setup), the event history pages with `since`; bench tools that read `status.link` get it from `mem` (or `full`).
