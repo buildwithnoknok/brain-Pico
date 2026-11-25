@@ -10,6 +10,7 @@ built without fetching a bundle. Copy the whole folder to `/lib` on the Pico.
 | `adafruit_httpserver/` | the setup-AP HTTP server (`/connect`, `/roles/*`, `/rpc`) |
 | `adafruit_requests.mpy` + `adafruit_connection_manager.mpy` | HTTPS downloads (product script, firmware index + images) |
 | `adafruit_ntp.mpy` | optional wall-clock sync for log timestamps |
+| `adafruit_ble/` (10.1.5) | BLE setup carrier (`noknok_ble.py`), only used on boards with native BLE (ESP32-S3); unused on the Pico |
 
 Built for CircuitPython 10.x (`.mpy` format is major-version specific — refresh
 these from the matching bundle when CircuitPython is upgraded). Rescued from the
