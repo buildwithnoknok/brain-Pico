@@ -380,24 +380,60 @@ check("... link_stats(): requests +3, reused +2",
       after["requests"] - before["requests"] == 3 and after["reused"] - before["reused"] == 2,
       (after["requests"] - before["requests"], after["reused"] - before["reused"]))
 
-c1 = Client([(0, HEAD + BODY)])
+# DEV-293: after a "Connection: close" reply the CLIENT closes first (curl, urllib and
+# the app do so at once after Content-Length bytes); the brain closes its end when it
+# sees that, so the TIME_WAIT record stays with the client. These clients close 50 ms
+# after their request.
+before = noknok_rpc.link_stats()
+c1 = Client([(0, HEAD + BODY), (0.05, "CLOSE")])
 srv, h = fresh_server([(0, c1)])
 polls(srv, 10)
 check("client sends Connection: close -> closed after the reply, no keep-alive header",
-      len(h) == 1 and c1.closed and b"keep-alive" not in c1.sent)
+      len(h) == 1 and c1.closed and b"keep-alive" not in c1.sent
+      and b"connection: close" in c1.sent.lower())
+check("... the brain waited for the client's close (client_closed +1, brain_closed +0)",
+      noknok_rpc.link_stats()["client_closed"] - before["client_closed"] == 1
+      and noknok_rpc.link_stats()["brain_closed"] == before["brain_closed"])
 
 h10 = REQ_KA.replace(b"HTTP/1.1", b"HTTP/1.0", 1)
-c10 = Client([(0, h10)])
+c10 = Client([(0, h10), (0.05, "CLOSE")])
 srv, h = fresh_server([(0, c10)])
 polls(srv, 10)
 check("HTTP/1.0 without Connection: keep-alive -> closed after the reply", len(h) == 1 and c10.closed)
 
-cget = Client([(0, b"GET / HTTP/1.1\r\nHost: brain\r\n\r\n")])
+cget = Client([(0, b"GET / HTTP/1.1\r\nHost: brain\r\n\r\n"), (0.05, "CLOSE")])
 srv, h = fresh_server([(0, cget)])
 srv.route("/", "GET")(lambda r: Response(r, "page"))
 polls(srv, 10)
 check("legacy page (GET /) -> closed after the reply (keep-alive is /rpc only)",
       cget.closed and b"page" in cget.sent, (cget.closed, cget.sent[:40]))
+
+before = noknok_rpc.link_stats()
+cstay = Client([(0, HEAD + BODY)])            # reads the reply, never closes
+srv, h = fresh_server([(0, cstay)])
+t0 = time.monotonic()
+longest = 0
+while time.monotonic() - t0 < noknok_rpc.LINGER_S + 0.5 and not cstay.closed:
+    t1 = time.monotonic()
+    srv.poll()
+    longest = max(longest, (time.monotonic() - t1) * 1000)
+    time.sleep(0.01)
+check("client that never closes -> the brain closes after LINGER_S (brain_closed +1)",
+      cstay.closed and noknok_rpc.LINGER_S - 0.1 <= cstay.closed_at - t0 <= noknok_rpc.LINGER_S + 0.3
+      and noknok_rpc.link_stats()["brain_closed"] - before["brain_closed"] == 1,
+      round((cstay.closed_at or 0) - t0, 2))
+check("... waiting for it holds the loop <= %d ms" % FAST, longest <= FAST, round(longest))
+
+many = [Client([(0, HEAD + BODY)]) for _ in range(noknok_rpc.LINGER_MAX + 2)]
+fill = [Client([(9.0, HEAD)]) for _ in range(noknok_rpc.MAX_PENDING)]
+srv, h = fresh_server([(0.02 * i, c) for i, c in enumerate(many)]
+                      + [(0.3, c) for c in fill])
+polls(srv, 45)
+check("lingering connections take no MAX_PENDING slot; past LINGER_MAX the oldest is closed",
+      len(h) == len(many) and [c.closed for c in many[:2]] == [True, True]
+      and sum(1 for p in srv._noknok_pending if p[7]) <= noknok_rpc.LINGER_MAX
+      and all(any(p[0] is c for p in srv._noknok_pending) for c in fill),
+      (len(h), [c.closed for c in many], len(srv._noknok_pending)))
 
 cbye = Client([(0, REQ_KA), (0.2, "CLOSE")])
 srv, h = fresh_server([(0, cbye)])
@@ -417,7 +453,7 @@ check("kept connection idle for KEEPALIVE_IDLE -> closed by the server",
       round((cidle.closed_at or 0) - t0, 2))
 noknok_rpc.KEEPALIVE_IDLE = old_idle
 
-kas = [Client([(0, REQ_KA)]) for _ in range(3)]
+kas = [Client([(0, REQ_KA)]) for _ in range(2)] + [Client([(0, REQ_KA), (0.2, "CLOSE")])]
 srv, h = fresh_server([(0, kas[0]), (0.05, kas[1]), (0.1, kas[2])])
 polls(srv, 30)
 check("3 keep-alive clients -> only KEEPALIVE_MAX (2) kept, the 3rd closed after its reply",

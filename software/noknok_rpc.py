@@ -1,4 +1,4 @@
-# noknok_rpc.py  v0.7.1 — Device Protocol v1: message dispatcher + carriers (DEV-34)
+# noknok_rpc.py  v0.7.2 — Device Protocol v1: message dispatcher + carriers (DEV-34)
 #
 # v0.2 (Sue): DEV-79 — an offline brain rejoins WiFi without stalling the
 #   product: most rejoin attempts only START the join (LINK_KICK_S, 0.5 s) and
@@ -23,6 +23,13 @@
 #   first segment yet) is retried like EAGAIN within SEND_BUDGET; the library retried EAGAIN
 #   only, so the timeout ended the reply after its headers, uncounted. Every reply a send
 #   error ends now counts in cut_replies; status.link adds send_errors / last_send_err.
+# v0.7.2 (Sue): DEV-293 — after a "Connection: close" reply the brain no longer closes
+#   first: it waits up to LINGER_S (non-blocking, in poll()) for the client's close. Whoever
+#   closes first keeps the TCP TIME_WAIT record for 2 x 60 s, and on CircuitPython every
+#   lwIP record comes from the same RAM as the Python heap. A client opening a connection
+#   per request left ~70 records per minute on the brain; under that load ping and /rpc
+#   stalled for a minute (DEV-286 part 2, DEV-293). mem.link adds client_closed /
+#   brain_closed (who closed first).
 #
 # One JSON message protocol, transport-agnostic (Confluence 113868802 §2):
 #
@@ -66,7 +73,7 @@ import gc
 import json
 import time
 
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 SERVICE_INTERVAL = 0.05     # s between carrier polls from the implicit hook
 SOCKET_TIMEOUT   = 1.0      # s a stalled client may hold poll(). 0.2 s dropped the
@@ -96,6 +103,13 @@ KEEPALIVE_MAX    = 2        # kept-alive connections at once; with MAX_PENDING 3
                             # is always free for a new client (and an idle kept one is
                             # closed to make room when a new client is waiting)
 KEEPALIVE_REQS   = 200      # requests on one connection, then it is closed and renewed
+LINGER_S         = 1.0      # s a "Connection: close" reply waits for the CLIENT to close
+                            # first (DEV-293). Whoever closes first keeps the TIME_WAIT
+                            # record (2 x 60 s in lwIP); on the brain each one is lwIP heap
+                            # taken from the same RAM as Python. Clients (curl, urllib, the
+                            # app) close at once after Content-Length bytes; one that does
+                            # not is closed by the brain after LINGER_S, as before
+LINGER_MAX       = 4        # connections waiting for their client's close at once
 SLOW_POLL_MS     = 50      # a poll longer than this counts in slow_polls
 LINK_CHECK_S     = 30       # how often service() looks at the WiFi link
 LINK_JOIN_S      = 5        # blocking budget for a FULL rejoin attempt
@@ -191,6 +205,7 @@ def _safe_server_class():
             self.cut = False
             self.keep = False            # DEV-198: the library's close() after the reply
                                          # is skipped when the connection is kept alive
+            self.linger = False          # DEV-293: ... and when the client is to close first
 
         def send(self, data):
             left = self.end - time.monotonic()
@@ -222,8 +237,9 @@ def _safe_server_class():
             self.conn.settimeout(t)
 
         def close(self):
-            if self.keep and not self.cut:
-                return                   # kept alive: the server reads its next request
+            if (self.keep or self.linger) and not self.cut:
+                return                   # kept alive: the server reads its next request;
+                                         # linger: the server waits for the client's close
             self.conn.close()
 
     def _may_keep(request, served, kept):
@@ -246,9 +262,10 @@ def _safe_server_class():
         return served + 1 < KEEPALIVE_REQS and kept < KEEPALIVE_MAX
 
     class SafeServer(Server):
-        # [[conn, addr, bytes, deadline, fresh, idle, served], ...] being read.
+        # [[conn, addr, bytes, deadline, fresh, idle, served, linger], ...] being read.
         # idle = a kept-alive connection waiting for its next request (DEV-198);
-        # served = requests already answered on this connection.
+        # served = requests already answered on this connection; linger = answered
+        # with "Connection: close", waiting for the client to close first (DEV-293).
         _noknok_pending = None
 
         @staticmethod
@@ -266,15 +283,22 @@ def _safe_server_class():
                 self._noknok_pending = []
             pend = self._noknok_pending
             now = time.monotonic()
-            idle = [p for p in pend if p[5]]
-            if len(pend) < MAX_PENDING or idle:
+            # Lingering connections (DEV-293) do not take a MAX_PENDING slot: they only
+            # wait for their client's close. Past LINGER_MAX the oldest is closed by us.
+            ling = [p for p in pend if p[7]]
+            while len(ling) > LINGER_MAX:
+                self._drop(pend, ling.pop(0))
+                _poll_stats["ling_closed"] += 1
+            busy = len(pend) - len(ling)
+            idle = [p for p in pend if p[5] and not p[7]]
+            if busy < MAX_PENDING or idle:
                 try:
                     conn, addr = self._sock.accept()
                 except OSError as e:
                     if (e.args[0] if e.args else None) not in (11, 104, 110, 116):
                         raise
                 else:
-                    if len(pend) >= MAX_PENDING:
+                    if busy >= MAX_PENDING:
                         # DEV-198: a new client waits and every slot is taken: the
                         # oldest idle kept-alive connection makes room (its client
                         # simply opens a new one next time).
@@ -285,7 +309,7 @@ def _safe_server_class():
                     # for a second (bench, 29 Oct: 1.15 s per request without this).
                     # Every later read is non-blocking.
                     conn.settimeout(FIRST_WAIT)
-                    pend.append([conn, addr, b"", now + REQUEST_DEADLINE, True, False, 0])
+                    pend.append([conn, addr, b"", now + REQUEST_DEADLINE, True, False, 0, False])
             result = NO_REQUEST
             for p in list(pend):
                 conn = p[0]
@@ -299,6 +323,14 @@ def _safe_server_class():
                 if p[4]:
                     p[4] = False
                     conn.settimeout(READ_POLL)       # from now on: (almost) non-blocking
+                if p[7]:                             # lingering after a "close" reply:
+                    if n is not None:                # the client closed (0) or sent more
+                        self._drop(pend, p)          # (ignored): close our end now
+                        _poll_stats["ling_ok" if n == 0 else "ling_closed"] += 1
+                    elif now > p[3]:
+                        self._drop(pend, p)          # the client did not close: we do
+                        _poll_stats["ling_closed"] += 1
+                    continue
                 if n == 0:
                     self._drop(pend, p)              # the client closed: no request
                     if not p[5]:                     # (an idle kept one closing is normal)
@@ -340,6 +372,7 @@ def _safe_server_class():
                 pend = self._noknok_pending
                 kept = sum(1 for q in pend if q[6] > 0) if pend else 0
                 link.keep = _may_keep(request, served, kept)
+                link.linger = not link.keep          # DEV-293: let the client close first
                 handler = self._find_handler(request.method, request.path)
                 response = self._handle_request(request, handler)
                 _poll_stats["req"] += 1
@@ -358,6 +391,15 @@ def _safe_server_class():
                                                      # (link.close: not when kept)
                 if link.cut:
                     _poll_stats["cut"] += 1
+                elif link.linger:
+                    # The reply said "Connection: close". Wait (LINGER_S, non-blocking)
+                    # for the client to close first, so the TIME_WAIT record is kept by
+                    # the client, not by the brain's lwIP heap (DEV-293).
+                    conn.settimeout(READ_POLL)       # never the send timeout: reads in
+                    if pend is None:                 # poll() must not hold the loop
+                        pend = self._noknok_pending = []
+                    pend.append([conn, addr, b"", time.monotonic() + LINGER_S,
+                                 False, True, served + 1, True])
                 elif link.keep:
                     # Back to the pending list: idle until the client's next request
                     # (or KEEPALIVE_IDLE), at once busy if that request already began.
@@ -367,7 +409,7 @@ def _safe_server_class():
                         pend = self._noknok_pending = []
                     pend.append([conn, addr, rest,
                                  t + (REQUEST_DEADLINE if rest else KEEPALIVE_IDLE),
-                                 False, not rest, served + 1])
+                                 False, not rest, served + 1, False])
                 return REQUEST_HANDLED_RESPONSE_SENT
             except Exception:
                 if link is not None and link.cut:
@@ -707,7 +749,8 @@ def _restart_http():
 
 _poll_stats = {"max_ms": 0, "slow": 0, "n": 0, "cut": 0,
                "req": 0, "reused": 0, "evicted": 0,      # DEV-198 keep-alive counters
-               "send_err": 0, "last_err": None}          # DEV-286: replies a send error ended
+               "send_err": 0, "last_err": None,          # DEV-286: replies a send error ended
+               "ling_ok": 0, "ling_closed": 0}           # DEV-293: who closed first
 
 def link_stats():
     """WiFi link counters + how long the app channel held the product loop:
@@ -719,6 +762,7 @@ def link_stats():
           "cut_replies": _poll_stats["cut"], "requests": _poll_stats["req"],
           "reused": _poll_stats["reused"], "ka_evicted": _poll_stats["evicted"],
           "send_errors": _poll_stats["send_err"], "last_send_err": _poll_stats["last_err"],
+          "client_closed": _poll_stats["ling_ok"], "brain_closed": _poll_stats["ling_closed"],
           "gw_miss": _link["gw_miss"],
           "gw_ok": _link["gw_ok"]}
     _poll_stats["max_ms"] = 0
