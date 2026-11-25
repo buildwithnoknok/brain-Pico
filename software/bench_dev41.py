@@ -5,11 +5,19 @@
 # native text sizes (the v1.9 fix), print(), icons, image, regions. Run from the
 # Pi4 bench host:  python3 pico.py run bench_dev41.py 90
 #
-# Pass = every step prints "ok" with module error 0 and the screen shows what the
-# step says. Nothing here needs firmware beyond display v0.2.0.
-# NOTE: the module's error byte is STICKY on fw 0.5.0 (never cleared), so start
-# from a freshly power-cycled display; a stale non-zero value fails every step.
-# A value of 4 appearing mid-run = the rare I2C lost-command race (DEV-41 notes).
+# Pass = every step prints "ok" with no module error and the screen shows what
+# the step says. Geometry is read from the module, so it runs on the boot default
+# (landscape 160x80, display fw 0.6.0+) and on portrait 80x160 alike; the layouts
+# below adapt to d.width / d.height.
+# Desk check without hardware (DEV-69): python tools/sim_bench_dev41.py [w h]
+# runs this file against tools/display_sim.py's virtual module.
+#
+# Error byte: on display fw 0.7.1+ (DEV-44) it is READ-TO-CLEAR, and the driver
+# reads it in wait_ready() before every draw and drops it. So a plain d.status()
+# after a step only shows the step's LAST command. ErrorTap below records every
+# error byte any read sees, so each step reports all its errors. (On fw <= 0.7.0
+# the byte was sticky: start from a freshly power-cycled module there.)
+# Error 4 mid-run = blit data without a blit (the old lost-command race, DEV-41).
 
 import time
 import board
@@ -31,20 +39,49 @@ if not c.display:
 
 d = c.display[0]
 print("info:", d.info(refresh=True), " fw:", d.firmware_version)
+W, H = d.width, d.height
+LANDSCAPE = W > H
+print("geometry %dx%d (%s)" % (W, H, "landscape" if LANDSCAPE else "portrait"))
 fails = []
+
+
+class ErrorTap:
+    """Wrap d._read_raw so every non-zero error byte the driver reads (its own
+    wait_ready() polls included) is kept. Bench-only; the driver is untouched."""
+    def __init__(self, disp):
+        self.seen = []
+        self._raw = disp._read_raw
+        disp._read_raw = self._read
+
+    def _read(self, n=2):
+        buf = self._raw(n)
+        if buf is not None and n == 2 and buf[1]:
+            self.seen.append(buf[1])
+        return buf
+
+    def take(self):
+        seen, self.seen = self.seen, []
+        return seen
+
+
+tap = ErrorTap(d)
 
 
 def step(name, fn, hold=1.2):
     """Run one step, report the module's error byte, pause so it can be seen."""
     d.clear(BLACK)
+    d.wait_ready()
+    tap.take()                                   # errors from before this step
     t0 = time.monotonic()
     try:
         r = fn()
-        busy, err = d.status()
+        d.wait_ready()
         ms = int((time.monotonic() - t0) * 1000)
-        ok = (err == 0)
-        print("%s %-28s %4d ms  err=%s  %s" % ("ok  " if ok else "FAIL", name, ms, err,
-                                                "" if r is None else r))
+        busy, err = d.status()                   # also lands in the tap
+        errs = tap.take()
+        ok = (err is not None) and not errs
+        print("%s %-28s %4d ms  err=%s  %s" % ("ok  " if ok else "FAIL", name, ms,
+                                                errs or err, "" if r is None else r))
         if not ok:
             fails.append(name)
     except Exception as e:
@@ -54,11 +91,14 @@ def step(name, fn, hold=1.2):
 
 
 # 1. Native sizes — after the v1.9 fix 16 px must be 16 px tall (was 8).
+#    Portrait: one column. Landscape (80 px tall): 8/16/24 left, 32 top right.
 def s_native():
-    y = 0
+    x = y = 0
     for size in (8, 16, 24, 32):
-        y = d.text("Hi%d" % size, size=size, y=y, color=WHITE, bg=GREEN)
-    return "look: 4 lines, each exactly its size, green boxes touching"
+        if y + size > H:                         # no room below: next column
+            x, y = W // 2, 0
+        y = d.text("%d" % size, size=size, x=x, y=y, color=WHITE, bg=GREEN)
+    return "look: 8/16/24/32 each exactly its height, green boxes, nothing cut off"
 step("native 8/16/24/32", s_native, 2.5)
 
 # 2. Blitted (non-native) size + the Pico 8x16 font.
@@ -81,18 +121,20 @@ step("print + scroll", s_print, 2.5)
 # 4. Every icon in a grid.
 def s_icons():
     names = icon_names()
+    cols = (W - 4) // 19
     for i, name in enumerate(names):
-        d.icon(name, x=4 + (i % 4) * 19, y=4 + (i // 4) * 19, color=CYAN)
-    return "%d icons" % len(names)
+        d.icon(name, x=4 + (i % cols) * 19, y=4 + (i // cols) * 19, color=CYAN)
+    return "%d icons, %d per row, none cut off" % (len(names), cols)
 step("icon grid", s_icons, 2.5)
 
 # 5. Scaled icons + transparent bg.
 def s_scaled():
     d.icon("wifi", x=0, y=0, size=24, color=NOKNOK)
     d.icon("wifi", x=28, y=0, size=48, color=NOKNOK)
-    d.fill_rect(0, 60, 80, 70, YELLOW)
-    d.icon("heart", x=8, y=64, size=64, color=RED, bg=None)
-    return "look: 24/48 px wifi, red heart on yellow (transparent)"
+    bx, by = (80, 0) if LANDSCAPE else (0, 60)   # yellow box right / below
+    d.fill_rect(bx, by, 80, 80, YELLOW)
+    d.icon("heart", x=bx + 8, y=by + 8, size=64, color=RED, bg=None)
+    return "look: 24/48 px wifi, whole red heart on yellow (transparent)"
 step("icon scale + transparent", s_scaled, 2.5)
 
 # 6. image() from an in-memory Bitmap (ASCII art) resized to 64 wide.
@@ -135,15 +177,15 @@ def s_bmp():
     except ValueError as e:
         if "too big" not in str(e):
             raise
-    d.image(bm, x=0, y=0, w=80, color=CYAN)               # 10x6 -> 80x48
+    d.image(bm, x=0, y=0, w=80, color=CYAN)               # 10x6 -> 80x48 (fits both)
     return "bmp decoded + size cap ok; look: cyan X"
 step("bmp decode on Pico", s_bmp, 2.0)
 
 # 7. Regions: a live value, an icon slot, right/center alignment.
 def s_regions():
-    d.region("title", 0, 0, 80, 16, size=16, align="center")
-    d.region("val", 0, 40, 80, 32, size=32, align="right", color=YELLOW)
-    d.region("net", 62, 140, 18, 18)
+    d.region("title", 0, 0, W, 16, size=16, align="center")
+    d.region("val", 0, 40, W - 20, 32, size=32, align="right", color=YELLOW)
+    d.region("net", W - 18, H - 18, 18, 18)     # bottom-right corner
     d.set("title", text="counter")
     d.set("net", icon="wifi")
     t0 = time.monotonic()
@@ -151,7 +193,7 @@ def s_regions():
         d.set("val", text=str(n * 5))
     per = int((time.monotonic() - t0) * 1000 / 21)
     d.set("net", icon="check", color=GREEN)
-    return "look: counter to 100 right-aligned, no flicker; %d ms/update" % per
+    return "look: counter to 100 right-aligned, icon bottom right, no flicker; %d ms/update" % per
 step("regions", s_regions, 2.5)
 
 d.clear(BLACK)

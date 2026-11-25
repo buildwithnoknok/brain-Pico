@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: MIT
 #
 # status_probe.py — print the display module's (busy, last_err) without drawing.
-# last_err is STICKY in firmware v0.5.0 (never cleared) — power-cycle the module
-# to reset it. Pi4RFID bench pins GP20/21.
+# Display fw 0.7.1+ (DEV-44): last_err is read-to-clear, so this shows the errors
+# since the previous status read (the driver's own polls count). On fw <= 0.7.0
+# it was sticky until a power cycle. I2C pins come from settings.toml (DEV-74).
 import board
 from noknok import Conductor
 c = Conductor()      # pins from settings.toml (DEV-74)

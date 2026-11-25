@@ -31,8 +31,9 @@ over I2C.
 | `keyboard_test.py` | LED button module standalone test. |
 | `ledbutton_color_test.py` | Test one or many LED Buttons at once: a button press cycles that button's colour; number keys 1-9 set all to a colour (0 = off). Quick "is this module alive?" check + brightness comparison. |
 | `display_test.py` | Interactive Display bench tool: type text to draw it; `p` = print(), `icon`, `image`, `region`/`set`, `demo`/`demo2`. See *noknok Display* under *Current versions*. |
-| `bench_dev41.py` | Display hardware check (DEV-41): native sizes, print, icons, image, regions — 8 steps, prints timings + module error byte. Pins GP20/21 (Pi4RFID bench). |
-| `../tools/display_sim.py` | Desktop simulator for the Display driver — a virtual module that decodes the I²C stream like the firmware and dumps the panel as ASCII art (71 checks). Needs `module-I2C-1.42-display` cloned next to this repo for the font. |
+| `bench_dev41.py` | Display hardware check (DEV-41): native sizes, print, icons, image, regions — 8 steps, prints timings + every module error byte seen (fw 0.7.1 clears it on read). Layouts follow the module's geometry (landscape boot default or portrait). Pins from `settings.toml`. |
+| `../tools/display_sim.py` | Desktop simulator for the Display driver — a virtual module that decodes the I²C stream like the firmware and dumps the panel as ASCII art (76 checks; boots 160×80 landscape like the module, `make_display(80, 160)` for portrait). Needs `module-I2C-1.42-display` cloned next to this repo for the font. |
+| `../tools/sim_bench_dev41.py` | Runs `bench_dev41.py` against `display_sim.py` on the PC (`160 80` landscape default, `80 160` portrait, `--dump` for ASCII art): layouts and error checks without a rig (DEV-69). |
 | `../tools/test_display_fallback.py` | Host test (DEV-108): lost `GET_INFO` replies, the 160×80 fallback, back-off, fallback after `rotation()` (9 checks). |
 | `bench_dev46.py` | LEDs 8× + 16× on one hub behind the Pico (DEV-46): driver dispatch, white channel, `status()`, 300-frame burst, firmware report + roles. |
 | `bench_info_settings.py` | Read-only `info` settings on the Pico (live temperature, read-only rejects, no Store writes). |
@@ -446,7 +447,7 @@ Core:
 
 **noknok Display — `c.display[0]` (v1.9, DEV-41).** The module is a small GPU with no frame
 buffer and a 12 KB flash; everything beyond its own 8×8 font is rendered on the Pico and streamed
-as a 1-bit-per-pixel blit, so nothing below needs firmware support (v0.2.0+; v0.7.0 current).
+as a 1-bit-per-pixel blit, so nothing below needs firmware support (v0.2.0+; current: the display repo's `firmware/index.json`, 0.7.1 in Nov 2026). The module boots landscape 160×80.
 - **`d.print(...)`** — the display as a terminal, same arguments as Python's `print()` (`sep`,
   `end=""` to continue a line) plus `size`/`color`. Wraps, scrolls in place when full (no
   blank-out), `d.clear()` restarts at the top. Defaults `d.print_size`/`print_color`/`print_x`.
@@ -486,11 +487,12 @@ as a 1-bit-per-pixel blit, so nothing below needs firmware support (v0.2.0+; v0.
   driver's drawing rules, diffed against `tools/display_sim.py` on every change
   ([source](https://github.com/buildwithnoknok/Ecosystem/tree/main/software/display-planner)).
 - Bench: `display_test.py` (`p <text>`, `icon`, `icons`, `image`, `region`, `set`, `demo2`);
-  `bench_dev41.py` = the 8-step hardware check (passed on Pi4RFID in Sep 2026, fw 0.5.0:
-  15 ms per region update, ≈75 ms per scrolling print() line, 16 ms per 16×16 icon).
+  `bench_dev41.py` = the 8-step hardware check, geometry-aware since DEV-69 (Pi4RFID, 25 Nov 2026,
+  rev 1.1 + fw 0.7.1, landscape 160×80: 8/8, no module error; 21 ms per region update, ≈90 ms per
+  scrolling print() line, ≈17 ms per 16×16 icon. Sep 2026, fw 0.5.0 portrait: 15 / ≈75 / 16 ms).
   Desktop: `tools/display_sim.py` runs the driver against a virtual module that decodes the
   I²C stream exactly like the firmware (its `font8x8.h` included) and prints the panel as
-  ASCII art — 71 checks, run it before touching the driver.
+  ASCII art — 76 checks (error codes and read-to-clear error byte as in fw 0.7.1), run it before touching the driver.
 
 **noknok PicoHub power manager — `c.picohub` (v1.16, DEV-123).** The carrier's CH32X035 is an
 ordinary I2C module (type `0x07`) that decides everything inside the board itself: charger contract,

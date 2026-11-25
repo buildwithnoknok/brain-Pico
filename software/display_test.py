@@ -10,18 +10,20 @@
 # short list of commands, "q" to quit.
 #
 # ── Wiring (JST SH 4-pin) ────────────────────────────────────────────────────
-#   Pico GP8  → SDA        Pico 3V3 → 3V3
-#   Pico GP9  → SCL        Pico GND → GND
+#   Plug the display into an I2C bus from settings.toml (DEV-74: no pins in
+#   code; bus A is GP8 SDA / GP9 SCL on a bare Pico).
 #
 #   NOTE: the display module has NO I2C pull-up resistors (noknok standard is
-#   host-side pull-ups only) and the PicoHub isn't built yet — so chain a
-#   buzzer / knob / LED button onto the bus to borrow its pull-ups, otherwise
-#   the bus won't come up at all.
+#   host-side pull-ups only). On a bare Pico, chain a buzzer / knob / LED
+#   button onto the bus to borrow its pull-ups, otherwise the bus won't come
+#   up at all.
 #
 # ── Firmware needed ──────────────────────────────────────────────────────────
-#   Everything here works on display firmware v0.2.0 or later (v0.5.0 is
-#   current). Icons, images, print and regions are rendered on the Pico and
-#   sent over the existing 1bpp blit, so they need no firmware support at all.
+#   Everything here works on display firmware v0.2.0 or later (current: see
+#   firmware/index.json in module-I2C-1.42-display). Icons, images, print and
+#   regions are rendered on the Pico and sent over the existing 1bpp blit, so
+#   they need no firmware support at all. The module boots landscape 160x80
+#   (fw 0.6.0+); the demo below adapts to d.width / d.height.
 
 import time
 from noknok import Conductor, COLORS, rgb565, icon_names   # noqa: F401
@@ -381,9 +383,10 @@ def run_demo2(d):
     # 2. every icon, 16 px, in a grid
     d.clear(COLORS["black"])
     names = icon_names()
+    cols = (d.width - 4) // 19
     for i, name in enumerate(names):
-        d.icon(name, x=4 + (i % 4) * 19, y=4 + (i // 4) * 19, color=COLORS["cyan"])
-    d.text("icons", size=8, x=2, y=90, color=COLORS["grey"])
+        d.icon(name, x=4 + (i % cols) * 19, y=4 + (i // cols) * 19, color=COLORS["cyan"])
+    d.text("icons", size=8, x=2, y=d.height - 9, color=COLORS["grey"])
     time.sleep(1.5)
 
     # 3. one icon at several sizes (host-scaled, no firmware icon store)
@@ -392,14 +395,15 @@ def run_demo2(d):
     for size in (16, 24, 32):
         d.icon("wifi", x=x, y=4, size=size, color=COLORS["noknok"])
         x += size + 4
-    d.icon("heart", x=8, y=48, size=64, color=COLORS["red"])
+    hx, hy = (d.width - 64, 8) if d.width > d.height else (8, 48)
+    d.icon("heart", x=hx, y=hy, size=64, color=COLORS["red"])
     time.sleep(1.5)
 
     # 4. regions: a live value that never flickers
     d.clear(COLORS["black"])
-    d.region("title", 0, 0, 80, 16, size=16, align="center")
-    d.region("value", 0, 40, 80, 32, size=32, align="right", color=COLORS["yellow"])
-    d.region("net", 62, 140, 18, 18)
+    d.region("title", 0, 0, d.width, 16, size=16, align="center")
+    d.region("value", 0, 40, d.width - 20, 32, size=32, align="right", color=COLORS["yellow"])
+    d.region("net", d.width - 18, d.height - 18, 18, 18)    # bottom-right corner
     d.set("title", text="counter")
     d.set("net", icon="wifi")
     for n in range(0, 11):
