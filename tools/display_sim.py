@@ -7,15 +7,23 @@
 # The virtual module decodes the I2C byte stream exactly the way the real
 # firmware does (module-I2C-1.42-display/firmware/src/display_firmware.c):
 # same style-byte layout, same 8x8 font (parsed from the firmware's font8x8.h),
-# same clipping and blit rules. So what you see here is what the panel shows,
-# minus colour. It exists so driver work (DEV-41 and after) can be checked
+# same clipping and blit rules, same error codes (1 = short command, 2 = unknown
+# command, 3 = off-panel rectangle/blit, 4 = blit data without a blit), the
+# read-to-clear error byte of fw 0.7.1 (DEV-44), and SET_ROTATION / SET_ORIENT
+# changing the geometry. So what you see here is what the panel shows, minus
+# colour. Matches display firmware 0.7.1 (re-checked 25 Nov 2026, DEV-69).
+#
+# Geometry: the module boots LANDSCAPE 160x80 (firmware DEFAULT_ROTATION =
+# ROT_LANDSCAPE since v0.6.0), so make_display() defaults to 160x80 too. Pass
+# make_display(80, 160) for portrait (rotation 0/2). It exists so driver work (DEV-41 and after) can be checked
 # without a bench, and so a regression shows up as a diff, not a blank screen.
 #
-#   python tools/display_sim.py            # run the built-in checks + demo
+#   python tools/display_sim.py            # run the built-in checks
+#   python tools/display_sim.py --demo     # ... plus an ASCII-art demo screen
 #
 # From your own script:
 #   from display_sim import make_display
-#   d, panel = make_display()
+#   d, panel = make_display()             # 160x80 landscape, like the module
 #   d.print("Hello"); print(panel.dump())
 
 import os
@@ -25,8 +33,13 @@ import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SOFTWARE_DIR = os.path.join(HERE, "..", "software")
-FONT8X8_H = os.path.join(HERE, "..", "..", "module-I2C-1.42-display",
-                         "firmware", "src", "font8x8.h")
+DISPLAY_FW_SRC = os.path.join(HERE, "..", "..", "module-I2C-1.42-display",
+                              "firmware", "src")
+FONT8X8_H = os.path.join(DISPLAY_FW_SRC, "font8x8.h")
+
+# Boot geometry of the real module (display_firmware.c: PANEL_W/PANEL_H 80x160,
+# DEFAULT_ROTATION = ROT_LANDSCAPE -> width and height swapped).
+DEFAULT_W, DEFAULT_H = 160, 80
 
 
 # ── Stub the CircuitPython-only modules so noknok.py imports on a PC ─────────
@@ -68,11 +81,12 @@ def load_font8x8(path=FONT8X8_H):
 class VirtualPanel:
     """Decodes commands like display_firmware.c and keeps an RGB565 frame."""
 
-    def __init__(self, w=80, h=160):
+    def __init__(self, w=DEFAULT_W, h=DEFAULT_H):
         self.w, self.h = w, h
         self.px = [[0] * w for _ in range(h)]
         self.font = load_font8x8()
-        self.last_err = 0
+        self.last_err = 0                   # the module's error byte (read-to-clear)
+        self.err_log = []                   # every error ever raised, for assertions
         self.log = []                       # every command, for assertions
         self.reads = 0                      # status/info reads, for assertions
         # blit state
@@ -80,9 +94,13 @@ class VirtualPanel:
         self._blit = None
 
     # -- helpers mirroring the C code --
+    def _err(self, code):
+        self.last_err = code
+        self.err_log.append(code)
+
     def fill_rect(self, x, y, w, h, c):
         if x >= self.w or y >= self.h or w == 0 or h == 0:
-            self.last_err = 3
+            self._err(3)
             return
         w = min(w, self.w - x)
         h = min(h, self.h - y)
@@ -107,8 +125,9 @@ class VirtualPanel:
                                fg if on else bg)
 
     def blit_begin(self, x, y, w, h, fg, bg, flags):
-        if w == 0 or h == 0 or x + w > self.w or y + h > self.h:
-            self.last_err = 3
+        if (x >= self.w or y >= self.h or w == 0 or h == 0
+                or x + w > self.w or y + h > self.h):
+            self._err(3)
             self._blit_left = 0
             return
         self._blit = dict(fg=fg, bg=bg, tr=flags & 1, w=w, x0=x, y0=y,
@@ -117,7 +136,7 @@ class VirtualPanel:
 
     def blit_data(self, data):
         if self._blit_left == 0:
-            self.last_err = 4
+            self._err(4)
             return
         b = self._blit
         for byte in data:
@@ -165,10 +184,25 @@ class VirtualPanel:
                             (cmd[5] << 8) | cmd[6], (cmd[7] << 8) | cmd[8], cmd[9])
         elif op == 0x06 and n >= 2:
             self.blit_data(cmd[1:])
-        elif op in (0x10, 0x11, 0x12, 0x14, 0x15, 0xB0, 0xB1):
-            pass
+        elif op == 0x11 and n >= 2:
+            # SET_ROTATION: odd = landscape. The firmware only changes MADCTL and
+            # the geometry (no clear); the driver clears afterwards.
+            w, h = (160, 80) if cmd[1] & 1 else (80, 160)
+            if (w, h) != (self.w, self.h):
+                self.resize(w, h)
+        elif op == 0x14 and n >= 6:
+            # SET_ORIENT (bench calibration): raw MADCTL + offsets + geometry.
+            w, h = cmd[4] or 1, cmd[5] or 1
+            if (w, h) != (self.w, self.h):
+                self.resize(w, h)
+        elif op in (0x10, 0x12) and n >= 2:
+            pass                            # backlight / display on-off: no pixels
+        elif op in (0x15, 0xB0, 0xB1):
+            pass                            # answered by FakeI2C / bootloader
+        elif op in (0x01, 0x02, 0x03, 0x05, 0x06, 0x10, 0x11, 0x12, 0x14):
+            self._err(1)                    # known command, too short
         else:
-            self.last_err = 1
+            self._err(2)                    # unknown command
 
     def dump(self, x=0, y=0, w=None, h=None, palette=None):
         """ASCII art of a window. Background(0) = '.', white = '#', other
@@ -233,10 +267,14 @@ class FakeI2C:
         else:
             for i in range(len(buf)):
                 buf[i] = 0
-            buf[1] = self.panel.last_err if len(buf) > 1 else 0
+            if len(buf) > 1:
+                buf[1] = self.panel.last_err
+                self.panel.last_err = 0     # fw 0.7.1 (DEV-44): read-to-clear
 
 
-def make_display(w=80, h=160):
+def make_display(w=DEFAULT_W, h=DEFAULT_H):
+    """A NoknokDisplay wired to a virtual module. Default = the module's boot
+    geometry (160x80 landscape); make_display(80, 160) for portrait."""
     _stub_modules()
     import noknok
     panel = VirtualPanel(w, h)
@@ -256,7 +294,27 @@ def _checks():
         if not cond:
             fails.append(name)
 
+    # 0. the simulator boots like the module: landscape 160x80
     d, p = make_display()
+    check("default geometry is the module's boot geometry (160x80)",
+          (d.width, d.height, p.w, p.h) == (160, 80, 160, 80),
+          (d.width, d.height, p.w, p.h))
+    fw_c = os.path.join(DISPLAY_FW_SRC, "display_firmware.c")
+    if os.path.exists(fw_c):
+        with open(fw_c, "r", encoding="utf-8", errors="replace") as f:
+            m = re.search(r"#define\s+DEFAULT_ROTATION\s+(\w+)", f.read())
+        check("firmware DEFAULT_ROTATION is still ROT_LANDSCAPE",
+              m and m.group(1) == "ROT_LANDSCAPE", m and m.group(1))
+    # error byte: read-to-clear, unknown command = 2, short command = 1
+    p.command(b"\x42")
+    first, second = d.status()[1], d.status()[1]
+    check("error byte is read-to-clear (fw 0.7.1)", (first, second) == (2, 0),
+          (first, second))
+    p.command(b"\x02\x00")
+    check("short command = error 1", d.status()[1] == 1)
+
+    # The checks below were written for portrait 80x160 and stay there.
+    d, p = make_display(80, 160)
     print("noknok.py", noknok.__version__)
 
     # 1. native text sizes match the firmware: size N draws an N px tall cell
@@ -286,17 +344,18 @@ def _checks():
     # 3. icons: every name renders, right size, blit accepted by the module.
     for name in icon_names():
         d.clear(BLACK)
-        p.last_err = 0
+        p.err_log = []
         y_after = d.icon(name, x=4, y=4)
-        check("icon %-12s draws 16x16 (err=%d)" % (name, p.last_err),
-              p.last_err == 0 and p.count(0xFFFF) > 10 and y_after == 20)
+        check("icon %-12s draws 16x16 (errors %s)" % (name, p.err_log),
+              not p.err_log and p.count(0xFFFF) > 10 and y_after == 20)
     d.clear(BLACK)
     d.icon("wifi", x=0, y=0, scale=3)
     lit_rows = [yy for yy in range(p.h) if any(p.px[yy])]
     check("icon scale=3 -> 48 px tall region", lit_rows[-1] < 48 and lit_rows[0] >= 0)
     d.clear(BLACK)
+    p.err_log = []
     d.icon("check", x=70, y=150, size=32)          # hangs off the panel
-    check("icon clipped at the edge, no module error", p.last_err == 0)
+    check("icon clipped at the edge, no module error", not p.err_log, p.err_log)
     try:
         d.icon("nope")
         check("unknown icon raises", False)
@@ -429,13 +488,12 @@ def _checks():
     d.print("x")
     d.region("keep", 0, 0, 40, 20)
     d.region("edge", 60, 120, 20, 40)             # off-panel in 160x80 landscape
-    p.resize(160, 80)                             # module answers new size
-    dropped = d.rotation(1)
+    dropped = d.rotation(1)                       # sim follows SET_ROTATION
     check("rotation re-reads geometry", d.width == 160 and d.height == 80)
     check("rotation resets print() and drops off-panel regions",
           d._term == [] and dropped == ["edge"] and "keep" in d.regions(), dropped)
-    p.resize(80, 160)
     d.rotation(0)
+    check("rotation(0) back to portrait", (d.width, d.height, p.w, p.h) == (80, 160, 80, 160))
 
     # 7. native_text=False forces the blit path
     d.native_text = False
@@ -454,7 +512,7 @@ def _checks():
 
 def _demo():
     from noknok import BLACK, YELLOW, icon_bitmap, rgb565
-    d, p = make_display()
+    d, p = make_display(80, 160)                  # portrait demo layout
     d.clear(BLACK)
     d.print("Hello World")
     d.print("Temp:", 22.5, "C")
