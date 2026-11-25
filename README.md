@@ -564,8 +564,8 @@ tp.remember("A", 0x30, type="soldered_pir")   # what the app saves (Store); atta
 | `ssd1306` | Adafruit 4440 0.91" OLED and compatibles | 0x3C / 0x3D | status byte (family) | `display`; `text()`, `show()` |
 | `soldered_pir` | Soldered PIR with easyC | 0x30-0x37 | none: `tp.assign()` only | `motion` |
 
-RAM (`.mpy`, 18 Nov 2026): core 6.4 KB; each driver 1.0-2.3 KB, loaded only when its chip is
-present; all 7 boards 20.9 KB. Two identical chips on one address cannot be told apart (move one
+RAM (`.mpy`, library 0.3.1, 18 Nov 2026): core 7.0 KB; each driver 0.9-2.3 KB, loaded only when
+its chip is present; all 7 boards 21.5 KB. Two identical chips on one address cannot be told apart (move one
 to the other bus or use its address jumper); a driver whose chip stops answering returns None.
 Add a driver: a `noknok_tp_<type>.py` with a `ThirdPartyModule` subclass (`identify()` read-only,
 `setup()`, `verify()`, `read()`) and one `REGISTRY` line in the core.
