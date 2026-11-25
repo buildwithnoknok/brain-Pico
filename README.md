@@ -487,9 +487,9 @@ as a 1-bit-per-pixel blit, so nothing below needs firmware support (v0.2.0+; cur
   driver's drawing rules, diffed against `tools/display_sim.py` on every change
   ([source](https://github.com/buildwithnoknok/Ecosystem/tree/main/software/display-planner)).
 - Bench: `display_test.py` (`p <text>`, `icon`, `icons`, `image`, `region`, `set`, `demo2`);
-  `bench_dev41.py` = the 8-step hardware check, geometry-aware since DEV-69 (last bench pass:
-  Pi4RFID, Sep 2026, fw 0.5.0, portrait 80×160: 15 ms per region update, ≈75 ms per scrolling
-  print() line, 16 ms per 16×16 icon; re-run on rev 1.1 + fw 0.7.1 landscape is open in DEV-69).
+  `bench_dev41.py` = the 8-step hardware check, geometry-aware since DEV-69 (Pi4RFID, 25 Nov 2026,
+  rev 1.1 + fw 0.7.1, landscape 160×80: 8/8, no module error; 21 ms per region update, ≈90 ms per
+  scrolling print() line, ≈17 ms per 16×16 icon. Sep 2026, fw 0.5.0 portrait: 15 / ≈75 / 16 ms).
   Desktop: `tools/display_sim.py` runs the driver against a virtual module that decodes the
   I²C stream exactly like the firmware (its `font8x8.h` included) and prints the panel as
   ASCII art — 76 checks (error codes and read-to-clear error byte as in fw 0.7.1), run it before touching the driver.
