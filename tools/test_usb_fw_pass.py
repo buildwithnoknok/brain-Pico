@@ -65,7 +65,8 @@ for n in range(29):
     setattr(board, "GP%d" % n, "GP%d" % n)
 for name in ("busio", "digitalio", "socketpool", "ssl"):
     stub(name)
-stub("microcontroller", nvm=nvm, reset=_hard_reset)
+stub("microcontroller", nvm=nvm, reset=_hard_reset,
+     cpu=types.SimpleNamespace(uid=bytes(range(8))))   # noknok_rpc.device_name() at import
 stub("supervisor", reload=lambda: None, runtime=_Any())
 stub("wifi", radio=_Any())
 stub("adafruit_requests", Session=_Any)
@@ -301,7 +302,8 @@ class FakeC:
     def __init__(self, results, needs):
         self._r, self.usb_needs_reset = results, needs
 
-    def usb_fw_pass(self, get_image, logfn=print):
+    def usb_fw_pass(self, get_image, logfn=print, get_stage1=None):
+        self.got_stage1 = get_stage1        # DEV-298: the cache's stage-1 source
         return self._r
 
 

@@ -173,6 +173,15 @@
 #             also run before the Store's temporary FRAM bus (every bus open, ADR-011).
 # v1.31 (Sue): DEV-249 — factory reset also wipes the Store key "thirdparty" (third-party
 #             board namings + OLED height the app saved), like roles and settings.
+# v1.32 (Sue): DEV-298 — USB stage-1 bootloader update (CH32V203, bootloader 2.0.0 /
+#             flash layout 4). usb_fw_pass() reads 0xB1 of every module it finds in its
+#             bootloader (kept as "bl" in the USB Store record, None = 1.x) and carries
+#             out bootloader visits scheduled with usb_schedule_visit(): "read" (one
+#             dedicated version read per module lifetime, then BOOT) or a stage-1
+#             version (install from get_stage1(layout, version), the module comes back
+#             in its bootloader, the app is pushed on the next boot, verified on the one
+#             after). Caps: 2 installs per published version, 2 read visits. New
+#             usb_bootloader(serial). Needs noknok_usb 1.4.
 #
 # Quick start:
 #   from noknok import Conductor
@@ -193,7 +202,7 @@ import json
 import os
 import struct
 
-__version__ = "1.31"
+__version__ = "1.32"
 
 try:
     import storage            # CircuitPython only; absent on a host Python
@@ -1396,6 +1405,15 @@ def _bus_clear(sda_pin, scl_pin):
                     pass
 
 
+def _semver3(s):
+    """'2.0.1' -> (2, 0, 1); None if it does not parse (DEV-298)."""
+    try:
+        t = tuple(int(x) for x in str(s).split("."))
+    except (ValueError, AttributeError):
+        return None
+    return t[:3] if len(t) >= 3 else None
+
+
 class Conductor:
     """
     I2C master for the noknok ecosystem.
@@ -1846,17 +1864,31 @@ class Conductor:
     USB_MAX_FLASHES      = 2          # flash attempts per serial before giving up
     USB_MAX_ASKS         = 2          # 0xB0 requests per serial before giving up
     _USB_TYPE_TO_MF_KEY  = {0x04: "usb_leds", 0x06: "usb_leds_16x"}
-    USB_STORE_KEY        = "usb"      # serial -> {type, pending, asks, tries, flashed}
-    _USB_CYCLE_KEYS      = ("pending", "asks", "tries", "flashed")
+    USB_STORE_KEY        = "usb"      # serial -> {type, pending, asks, tries, flashed, ...}
+    # One update cycle; cleared when the module is verified (or given up on).
+    #   s1      a bootloader visit is scheduled: "read" (version read only) or the
+    #           target stage-1 version to install (DEV-298)
+    #   s1_done stage-1 installed on the previous boot: check it, then push the app
+    #   app     an app update was asked while a bootloader visit was scheduled
+    _USB_CYCLE_KEYS      = ("pending", "asks", "tries", "flashed", "s1", "s1_done", "app")
+    # Kept for the module's lifetime (DEV-298):
+    #   bl         its bootloader's 0xB1 reply as a list, or None (1.x: no 0xB1);
+    #              absent = never read
+    #   bl_visits  dedicated version-read visits so far (capped)
+    #   s1_ver/s1_n  stage-1 install attempts for that published version (capped)
+    USB_MAX_S1_TRIES     = 2          # stage-1 installs per published version
+    USB_MAX_BL_READS     = 2          # dedicated version-read visits per lifetime
 
     def _usb_records(self):
         data = store().get(self.USB_STORE_KEY)
         return json.loads(json.dumps(data)) if isinstance(data, dict) else {}
 
     def _usb_save(self, recs, before=None):
-        if before is not None and json.dumps(recs) == before:
+        now = json.dumps(recs)
+        if before is not None and now == before:
             return                      # unchanged: no Store write
         store().set(self.USB_STORE_KEY, recs)
+        self._usb_saved = now           # what the Store holds now (usb_fw_pass)
 
     def _remember_usb_types(self, found):
         """serial -> manifest key for every USB app seen, so a module later found
@@ -1875,14 +1907,21 @@ class Conductor:
             self._usb_fl = noknok_usb.UsbModuleFlasher()
         return self._usb_fl
 
-    def usb_fw_pass(self, get_image, logfn=print):
+    def usb_fw_pass(self, get_image, logfn=print, get_stage1=None):
         """Finish pending USB updates and rescue USB modules left in their
         bootloader. Call right after enumerate_all(). `get_image(entry) -> bytes`
         as for update_all() (code.py passes the on-device cache; it may set
         entry["version"] to the image's version for the check one boot later).
 
+        DEV-298: a module found in its bootloader also gets its bootloader
+        version read (0xB1, kept as "bl" in its USB record), and a scheduled
+        bootloader visit (usb_schedule_visit()) is carried out here:
+        `get_stage1(layout, version) -> bytes` gives the stage-1 image (the
+        cache); without it no stage-1 is ever installed.
+
         Returns a list of {uid, type, action, detail}; action is one of
-        flashed, asked, verified, failed, gave_up, unknown. Sets
+        flashed, asked, verified, failed, gave_up, unknown, and for bootloader
+        visits read, stage1, stage1_ok, stage1_failed. Sets
         self.usb_needs_reset = True when the brain must hard-reset before the
         product runs (a module was flashed or asked into its bootloader: this
         host session will not see it come back)."""
@@ -1893,44 +1932,61 @@ class Conductor:
         if not parked and not any(isinstance(r, dict) and r.get("pending")
                                   for r in recs.values()):
             return results              # the normal boot: nothing to do, no write
-        before = json.dumps(recs)
+        self._usb_saved = json.dumps(recs)
 
         for serial in parked:
             rec = recs.setdefault(serial, {})
             mf_key = rec.get("type")
+            # It is in its bootloader anyway: the version read is free here
+            # (DEV-298). Read when unknown, when a visit asked for it, after a
+            # stage-1 install, and while it looks like 1.x (one empty answer
+            # must not decide forever).
+            visit, s1_done = rec.get("s1"), rec.get("s1_done")
+            if visit or s1_done or rec.get("bl", "unread") in ("unread", None):
+                self._usb_read_bl(serial, rec, logfn)
             if not mf_key:
                 logfn("[usb] module %s is in its bootloader, type unknown - "
                       "needs a manual flash" % serial)
                 results.append({"uid": serial, "type": None, "action": "unknown",
                                 "detail": "serial not in the Store"})
                 continue
-            if rec.get("tries", 0) >= self.USB_MAX_FLASHES:
-                logfn("[usb] %s %s still in its bootloader after %d flashes - giving up"
-                      % (mf_key, serial, rec["tries"]))
-                results.append({"uid": serial, "type": mf_key, "action": "gave_up",
-                                "detail": "%d flashes" % rec["tries"]})
-                continue
-            rec["tries"] = rec.get("tries", 0) + 1
-            rec["pending"] = True
-            rec.pop("flashed", None)
-            self._usb_save(recs)        # count the attempt BEFORE flashing
-            before = json.dumps(recs)
-            entry = {"type": mf_key, "bus": "usb", "uid": serial, "address": None}
-            try:
-                image = get_image(entry)
-                if not image:
-                    raise ValueError("no image available for %s" % mf_key)
-                logfn("[usb] %s %s is in its bootloader - flashing %d bytes (attempt %d)"
-                      % (mf_key, serial, len(image), rec["tries"]))
-                self._usb_flasher().flash(image, serial=serial, confirm_app=False)
-                rec["flashed"] = entry.get("version") or "?"
-                self.usb_needs_reset = True
-                results.append({"uid": serial, "type": mf_key, "action": "flashed",
-                                "detail": "%d bytes, version %s" % (len(image), rec["flashed"])})
-            except Exception as e:
-                logfn("[usb] flashing %s %s FAILED: %s" % (mf_key, serial, e))
-                results.append({"uid": serial, "type": mf_key, "action": "failed",
-                                "detail": str(e)})
+            bl = rec.get("bl")
+            have = ".".join(str(x) for x in bl[1:4]) if bl else "1.x"
+
+            if s1_done:
+                # Stage-1 went in on the previous boot; stage-0 installed it and
+                # the module came back here without an app. Check, then push it.
+                ok = bool(bl) and tuple(bl[1:4]) == _semver3(s1_done)
+                logfn("[usb] %s %s stage-1 now %s (installed %s) - %s"
+                      % (mf_key, serial, have, s1_done, "OK" if ok else "MISMATCH"))
+                results.append({"uid": serial, "type": mf_key,
+                                "action": "stage1_ok" if ok else "stage1_failed",
+                                "detail": "bootloader %s, expected %s" % (have, s1_done)})
+                rec.pop("s1_done", None)
+                rec.pop("s1", None)
+            elif visit == "read":
+                rec.pop("s1", None)
+                if not rec.pop("app", None):
+                    # Version read only: nothing was written, start the app again.
+                    for k in ("pending", "asks"):
+                        rec.pop(k, None)
+                    self._usb_save(recs)
+                    try:
+                        self._usb_flasher().boot_only(serial)
+                        self.usb_needs_reset = True
+                        results.append({"uid": serial, "type": mf_key, "action": "read",
+                                        "detail": "bootloader %s" % have})
+                    except Exception as e:
+                        results.append({"uid": serial, "type": mf_key, "action": "failed",
+                                        "detail": "BOOT after the version read: %s" % e})
+                    continue
+            elif visit:
+                if self._usb_stage1_visit(serial, rec, recs, mf_key, visit, get_stage1,
+                                          results, logfn):
+                    continue            # stage-1 armed: the app follows next boot
+                rec.pop("s1", None)     # not installed (or refused): app below
+
+            self._usb_push_app(serial, rec, recs, mf_key, get_image, results, logfn)
 
         for m in list(getattr(self, "leds", [])) + list(getattr(self, "leds16", [])):
             serial = getattr(m, "_uid_hex", None)
@@ -1958,7 +2014,6 @@ class Conductor:
                 continue
             rec["asks"] = rec.get("asks", 0) + 1
             self._usb_save(recs)
-            before = json.dumps(recs)
             try:
                 if self._usb_flasher().request_bootloader(serial):
                     self.usb_needs_reset = True
@@ -1967,8 +2022,164 @@ class Conductor:
             except Exception as e:
                 results.append({"uid": serial, "type": rec.get("type"), "action": "failed",
                                 "detail": "0xB0: %s" % e})
-        self._usb_save(recs, before)
+        self._usb_save(recs, self._usb_saved)
         return results
+
+    def _usb_push_app(self, serial, rec, recs, mf_key, get_image, results, logfn):
+        """Flash the app onto a module in its bootloader (the DEV-133 rescue /
+        pending-update step). Counts the attempt in the Store BEFORE flashing."""
+        if rec.get("tries", 0) >= self.USB_MAX_FLASHES:
+            logfn("[usb] %s %s still in its bootloader after %d flashes - giving up"
+                  % (mf_key, serial, rec["tries"]))
+            results.append({"uid": serial, "type": mf_key, "action": "gave_up",
+                            "detail": "%d flashes" % rec["tries"]})
+            return
+        rec["tries"] = rec.get("tries", 0) + 1
+        rec["pending"] = True
+        rec.pop("flashed", None)
+        rec.pop("app", None)
+        self._usb_save(recs)            # count the attempt BEFORE flashing
+        entry = {"type": mf_key, "bus": "usb", "uid": serial, "address": None}
+        try:
+            image = get_image(entry)
+            if not image:
+                raise ValueError("no image available for %s" % mf_key)
+            logfn("[usb] %s %s is in its bootloader - flashing %d bytes (attempt %d)"
+                  % (mf_key, serial, len(image), rec["tries"]))
+            self._usb_flasher().flash(image, serial=serial, confirm_app=False)
+            rec["flashed"] = entry.get("version") or "?"
+            self.usb_needs_reset = True
+            results.append({"uid": serial, "type": mf_key, "action": "flashed",
+                            "detail": "%d bytes, version %s" % (len(image), rec["flashed"])})
+        except Exception as e:
+            logfn("[usb] flashing %s %s FAILED: %s" % (mf_key, serial, e))
+            results.append({"uid": serial, "type": mf_key, "action": "failed",
+                            "detail": str(e)})
+
+    # ── USB bootloader version + stage-1 install (DEV-298) ────────────────────
+    # A V203 module on bootloader 2.0.0 (flash layout 4) can replace its stage-1
+    # over USB. It answers 0xB1 only IN its bootloader, and every bootloader visit
+    # costs a brain hard reset on the Pico (DEV-45). So: the version is read for
+    # free whenever a module is in its bootloader anyway (app update, rescue), and
+    # once by a dedicated visit if it was never read (usb_schedule_visit("read")).
+    # One stage-1 update = up to 3 extra resets: ask (0xB0) -> install stage-1 ->
+    # push the app -> verify. A 1.x bootloader (no 0xB1 answer) is never offered
+    # a stage-1. Flow + diagram: architecture repo flows/ota-update.md, 6b.
+
+    def _usb_read_bl(self, serial, rec, logfn=print):
+        """0xB1 on a module in its bootloader; the answer goes into rec["bl"]
+        (list, or None = 1.x). A failure to talk to it leaves rec unchanged."""
+        try:
+            v = self._usb_flasher().get_version(serial)
+        except Exception as e:
+            logfn("[usb] %s: bootloader version read failed (%s)" % (serial, e))
+            return
+        v = self._bl_norm(v)
+        rec["bl"] = list(v) if v else None
+        logfn("[usb] %s: bootloader %s" % (serial, ".".join(str(x) for x in v[1:4])
+                                           + " layout %s" % (v[4] if len(v) > 4 else "?")
+                                           if v else "1.x (no 0xB1)"))
+
+    def _usb_stage1_visit(self, serial, rec, recs, mf_key, target, get_stage1,
+                          results, logfn):
+        """Install the stage-1 `target` on a module in its bootloader. True =
+        armed (BOOT sent; the module comes back in its bootloader with the new
+        stage-1 and no app). False = not installed; the caller pushes the app
+        (an ERASE may already have cleared it)."""
+        bl = rec.get("bl")
+        want = _semver3(target)
+        if not bl:
+            logfn("[usb] %s %s: bootloader 1.x - no stage-1 update" % (mf_key, serial))
+            return False
+        lay = self.layout_of(tuple(bl))
+        if want is None or tuple(bl[1:4]) >= want:
+            # Already current, e.g. a power cut after VERIFY_STAGE1: stage-0
+            # installed it at power-on. Counts as done.
+            results.append({"uid": serial, "type": mf_key, "action": "stage1_ok",
+                            "detail": "bootloader already %s" % ".".join(str(x) for x in bl[1:4])})
+            return False
+        if rec.get("s1_ver") != target:
+            rec["s1_ver"], rec["s1_n"] = target, 0
+        if rec.get("s1_n", 0) >= self.USB_MAX_S1_TRIES:
+            results.append({"uid": serial, "type": mf_key, "action": "gave_up",
+                            "detail": "stage-1 %s: %d attempts" % (target, rec["s1_n"])})
+            return False
+        try:
+            if get_stage1 is None:
+                raise ValueError("no stage-1 image source")
+            image = get_stage1(lay, target)
+            if not image:
+                raise ValueError("no stage-1 %s (layout %s) in the cache" % (target, lay))
+        except Exception as e:
+            results.append({"uid": serial, "type": mf_key, "action": "stage1_failed",
+                            "detail": str(e)})
+            return False
+        rec["s1_n"] = rec.get("s1_n", 0) + 1
+        rec["pending"] = True
+        self._usb_save(recs)            # count the attempt BEFORE the ERASE
+        logfn("[usb] %s %s: stage-1 %s -> %s (%d bytes, attempt %d)"
+              % (mf_key, serial, ".".join(str(x) for x in bl[1:4]), target, len(image),
+                 rec["s1_n"]))
+        try:
+            self._usb_flasher().flash_stage1(image, serial=serial)
+        except Exception as e:
+            # Refused (wrong image = error 8, too big = 4) or the link broke. The
+            # old stage-1 is still in place and nothing is armed, but the ERASE
+            # cleared the app: the caller pushes it now, same host session.
+            logfn("[usb] %s %s: stage-1 install FAILED: %s" % (mf_key, serial, e))
+            results.append({"uid": serial, "type": mf_key, "action": "stage1_failed",
+                            "detail": str(e)})
+            return False
+        rec.pop("s1", None)
+        rec["s1_done"] = target
+        self.usb_needs_reset = True
+        results.append({"uid": serial, "type": mf_key, "action": "stage1",
+                        "detail": "%d bytes, %s -> %s"
+                                  % (len(image), ".".join(str(x) for x in bl[1:4]), target)})
+        return True
+
+    def usb_bootloader(self, serial):
+        """(known, version): what the brain knows about a USB module's
+        bootloader. known=False = never read; version None = 1.x (no 0xB1),
+        else the 0xB1 tuple (proto, major, minor, patch, layout)."""
+        rec = self._usb_records().get(serial)
+        if not isinstance(rec, dict) or "bl" not in rec:
+            return False, None
+        bl = rec["bl"]
+        return True, (tuple(bl) if bl else None)
+
+    def usb_schedule_visit(self, serial, purpose, mf_key=None):
+        """Ask a running USB module into its bootloader for a visit on the next
+        boot (DEV-298): purpose "read" (version only) or a stage-1 version to
+        install. Records the visit in the Store BEFORE the 0xB0, so a power cut
+        cannot lose it. Returns (True, "") when asked - the caller must then
+        hard-reset the brain - else (False, why) and nothing is sent."""
+        recs = self._usb_records()
+        rec = recs.setdefault(serial, {})
+        if rec.get("pending"):
+            return False, "another update is pending"
+        if purpose == "read":
+            if rec.get("bl_visits", 0) >= self.USB_MAX_BL_READS:
+                return False, "version read %d times without an answer" % rec["bl_visits"]
+            rec["bl_visits"] = rec.get("bl_visits", 0) + 1
+        elif rec.get("s1_ver") == purpose and rec.get("s1_n", 0) >= self.USB_MAX_S1_TRIES:
+            return False, "stage-1 %s failed %d times" % (purpose, rec["s1_n"])
+        if mf_key:
+            rec["type"] = mf_key
+        rec["s1"] = purpose
+        rec["pending"] = True
+        rec["asks"] = rec.get("asks", 0) + 1
+        for k in ("flashed", "s1_done", "app"):
+            rec.pop(k, None)
+        self._usb_save(recs)            # BEFORE 0xB0
+        if not self._usb_flasher().request_bootloader(serial):
+            for k in ("s1", "pending", "asks"):
+                rec.pop(k, None)
+            if purpose == "read":
+                rec["bl_visits"] -= 1
+            self._usb_save(recs)
+            return False, "running app not found"
+        return True, ""
 
     def _usb_request_update(self, entry):
         """update_module() for a USB module (DEV-133): record, then 0xB0."""
@@ -1977,6 +2188,13 @@ class Conductor:
             raise ValueError("USB update needs the module's serial")
         recs = self._usb_records()
         rec = recs.setdefault(serial, {})
+        if rec.get("s1") and rec.get("pending"):
+            # A bootloader visit is already on its way (DEV-298): it pushes the
+            # current app from the cache, so no second 0xB0.
+            rec["app"] = True
+            rec["type"] = entry.get("type") or rec.get("type")
+            self._usb_save(recs)
+            return "pending"
         if rec.get("asks", 0) >= self.USB_MAX_ASKS:
             raise RuntimeError("asked into its bootloader %d times already - giving up"
                                % rec["asks"])
@@ -2038,7 +2256,8 @@ class Conductor:
         not on every enumeration.
         """
         if entry.get("bus") != "i2c":
-            raise NotImplementedError("bootloader_version: USB modules not yet (V203 port pending)")
+            raise NotImplementedError("bootloader_version: a USB module answers 0xB1 only in its "
+                                      "bootloader - see usb_bootloader() / usb_schedule_visit() (DEV-298)")
         from module_flasher import ModuleFlasher
         f = ModuleFlasher(self._entry_bus(entry))
         f.enter_bootloader(entry["address"])
@@ -2145,7 +2364,8 @@ class Conductor:
         answers -> version read back -> app re-pushed.
         """
         if entry.get("bus") != "i2c":
-            raise NotImplementedError("stage1_update: USB modules not yet (V203 port pending)")
+            raise NotImplementedError("stage1_update: USB modules update around brain hard resets - "
+                                      "usb_schedule_visit() + usb_fw_pass() (DEV-298)")
         from module_flasher import ModuleFlasher
         f = ModuleFlasher(self._entry_bus(entry))
         before, after = f.flash_stage1(stage1_image, runtime_addr=entry.get("address"),
