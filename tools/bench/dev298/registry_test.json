@@ -1,0 +1,52 @@
+{
+  "format": 1,
+  "registry_version": "2.1.0",
+  "updated": "2026-11-26",
+  "_comment": "BENCH ONLY (DEV-298): Ecosystem registry 2.1.0 branch with CH32V203 stage-1 = Sam's TEST 2.0.1 index. Never on a field brain.",
+  "bootloader": {
+    "stage1": {
+      "CH32V003": {
+        "repo": "module-I2C-bootloader",
+        "index": "https://raw.githubusercontent.com/buildwithnoknok/module-I2C-bootloader/main/firmware/index.json"
+      },
+      "CH32X035": {
+        "repo": "module-I2C-bootloader",
+        "index": "https://raw.githubusercontent.com/buildwithnoknok/module-I2C-bootloader/main/firmware/index_x035.json"
+      },
+      "CH32V203": {
+        "repo": "module-USB-bootloader",
+        "index": "https://raw.githubusercontent.com/buildwithnoknok/module-USB-bootloader/dev-237-v203-stage0-stage1/firmware/test/stage1_2.0.1/index_v203_test.json"
+      }
+    }
+  },
+  "modules": {
+    "buzzer": {
+      "repo": "module-I2C-buzzer",
+      "index": "https://raw.githubusercontent.com/buildwithnoknok/module-I2C-buzzer/main/firmware/index.json"
+    },
+    "knob": {
+      "repo": "module-I2C-knob",
+      "index": "https://raw.githubusercontent.com/buildwithnoknok/module-I2C-knob/main/firmware/index.json"
+    },
+    "led_button": {
+      "repo": "module-I2C-ledbutton",
+      "index": "https://raw.githubusercontent.com/buildwithnoknok/module-I2C-ledbutton/main/firmware/index.json"
+    },
+    "usb_leds": {
+      "repo": "module-usb-led",
+      "index": "https://raw.githubusercontent.com/buildwithnoknok/module-usb-led/main/firmware/index.json"
+    },
+    "display": {
+      "repo": "module-I2C-1.42-display",
+      "index": "https://raw.githubusercontent.com/buildwithnoknok/module-I2C-1.42-display/main/firmware/index.json"
+    },
+    "usb_leds_16x": {
+      "repo": "module-usb-led-16x",
+      "index": "https://raw.githubusercontent.com/buildwithnoknok/module-usb-led-16x/main/firmware/index.json"
+    },
+    "picohub": {
+      "repo": "module-I2C-picohub-MOD-0011",
+      "index": "https://raw.githubusercontent.com/buildwithnoknok/module-I2C-picohub-MOD-0011/main/firmware/index.json"
+    }
+  }
+}
