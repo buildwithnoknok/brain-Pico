@@ -261,7 +261,8 @@ setup-time writes into `/data`, `settings.toml` for pins and drive visibility; s
   version is read whenever it is in its bootloader anyway (app update, rescue) and kept per USB
   serial in the Store (`usb` record, `"bl"`; `null` = bootloader 1.x, which never gets a
   stage-1); a module never read gets **one** dedicated read visit (one extra reset in its
-  lifetime). A stage-1 update costs up to 3 extra resets: `0xB0` -> install the stage-1 from the
+  lifetime; again only when it shows up with an app version this brain did not install, e.g. after
+  the one-time layout-4 full image - `bl_app`). A stage-1 update costs up to 3 extra resets: `0xB0` -> install the stage-1 from the
   cache (`ERASE` / `WRITE` / `0x06 VERIFY_STAGE1` / `BOOT`; stage-0 installs it and the module
   comes back in its bootloader without an app) -> check `0xB1`, push the app from the cache ->
   verify. Same layout only, exact cached version only, at most 2 attempts per published

@@ -1874,7 +1874,10 @@ class Conductor:
     # Kept for the module's lifetime (DEV-298):
     #   bl         its bootloader's 0xB1 reply as a list, or None (1.x: no 0xB1);
     #              absent = never read
-    #   bl_visits  dedicated version-read visits so far (capped)
+    #   bl_app     the app version the module ran when "bl" was read; a module seen
+    #              later with an app version this brain did not install (re-flashed
+    #              elsewhere, e.g. the one-time layout-4 full image) gets "bl" re-read
+    #   bl_visits  dedicated version-read visits for that app version (capped)
     #   s1_ver/s1_n  stage-1 install attempts for that published version (capped)
     USB_MAX_S1_TRIES     = 2          # stage-1 installs per published version
     USB_MAX_BL_READS     = 2          # dedicated version-read visits per lifetime
@@ -2000,6 +2003,8 @@ class Conductor:
                 results.append({"uid": serial, "type": rec.get("type"),
                                 "action": "verified" if ok else "failed",
                                 "detail": "running %s (flashed %s)" % (m.firmware_version, flashed)})
+                if "bl" in rec:
+                    rec["bl_app"] = m.firmware_version   # this brain installed it
                 for k in self._USB_CYCLE_KEYS:
                     rec.pop(k, None)
                 continue
@@ -2138,17 +2143,21 @@ class Conductor:
                                   % (len(image), ".".join(str(x) for x in bl[1:4]), target)})
         return True
 
-    def usb_bootloader(self, serial):
+    def usb_bootloader(self, serial, app_version=None):
         """(known, version): what the brain knows about a USB module's
-        bootloader. known=False = never read; version None = 1.x (no 0xB1),
-        else the 0xB1 tuple (proto, major, minor, patch, layout)."""
+        bootloader. known=False = never read, or stale: the module now runs an
+        app version (`app_version`) other than the one it ran when "bl" was read,
+        so something outside this brain re-flashed it; version None = 1.x (no
+        0xB1), else the 0xB1 tuple (proto, major, minor, patch, layout)."""
         rec = self._usb_records().get(serial)
         if not isinstance(rec, dict) or "bl" not in rec:
+            return False, None
+        if app_version and rec.get("bl_app") != app_version:
             return False, None
         bl = rec["bl"]
         return True, (tuple(bl) if bl else None)
 
-    def usb_schedule_visit(self, serial, purpose, mf_key=None):
+    def usb_schedule_visit(self, serial, purpose, mf_key=None, app_version=None):
         """Ask a running USB module into its bootloader for a visit on the next
         boot (DEV-298): purpose "read" (version only) or a stage-1 version to
         install. Records the visit in the Store BEFORE the 0xB0, so a power cut
@@ -2159,6 +2168,8 @@ class Conductor:
         if rec.get("pending"):
             return False, "another update is pending"
         if purpose == "read":
+            if app_version and rec.get("bl_app") != app_version:
+                rec["bl_app"], rec["bl_visits"] = app_version, 0   # new reason to read
             if rec.get("bl_visits", 0) >= self.USB_MAX_BL_READS:
                 return False, "version read %d times without an answer" % rec["bl_visits"]
             rec["bl_visits"] = rec.get("bl_visits", 0) + 1

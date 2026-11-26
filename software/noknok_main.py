@@ -2425,14 +2425,16 @@ def _usb_stage1_plan(c, s1_by_layout, report):
             serial = getattr(m, "_uid_hex", None)
             if not serial:
                 continue
-            known, bl = c.usb_bootloader(serial)
+            app_v = getattr(m, "firmware_version", None)
+            known, bl = c.usb_bootloader(serial, app_v)
             if not known:
                 if serial in app_due:
                     log(f"[bl] {mf_key} {serial}: bootloader version unknown - read "
                         f"during today's app update")
                     continue
                 purpose = "read"
-                log(f"[bl] {mf_key} {serial}: reading the bootloader version (once)")
+                log(f"[bl] {mf_key} {serial}: reading the bootloader version (once per app "
+                    f"version this brain did not install)")
             elif bl is None:
                 continue                    # 1.x: no self-update, never offered
             else:
@@ -2455,7 +2457,7 @@ def _usb_stage1_plan(c, s1_by_layout, report):
                 log(f"[bl] {mf_key} {serial}: stage-1 {bl[1]}.{bl[2]}.{bl[3]} -> "
                     f"{purpose} - asking it into its bootloader")
             try:
-                ok, why = c.usb_schedule_visit(serial, purpose, mf_key)
+                ok, why = c.usb_schedule_visit(serial, purpose, mf_key, app_v)
             except Exception as e:
                 ok, why = False, repr(e)
             if ok:

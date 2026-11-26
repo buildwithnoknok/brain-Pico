@@ -428,7 +428,7 @@ check("  ...bl in the record is now 2.0.1", rec().get("bl") == [1, 2, 0, 1, 4], 
 acts, rst = boot()
 check("boot 4: app back -> verified, no reset", acts == ["verified"] and not rst, acts)
 check("  ...cycle keys cleared; bl / s1_ver / s1_n / bl_visits kept",
-      set(rec()) == {"type", "bl", "bl_visits", "s1_ver", "s1_n"}, rec())
+      set(rec()) == {"type", "bl", "bl_app", "bl_visits", "s1_ver", "s1_n"}, rec())
 resets = 0
 SimFlasher.log = []
 check("next day: current -> no visit, no 0xB0, no reset",
@@ -460,6 +460,34 @@ boot()
 check("LEDs 8x on 1.x: same - read once, then left alone",
       rec(S8).get("bl") is None and not day_pass() and MODS[S8].app == "1.8.2")
 
+print("\nPart 2: re-flashed elsewhere (stale bl, e.g. the one-time layout-4 full image)")
+fresh(Module(S, bl=(1, 2, 0, 0, 4), app="2.2.2"))
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": None, "bl_app": "2.2.1",
+                               "bl_visits": 2}})
+SimFlasher.log = []
+check("bl null read under app 2.2.1, module now runs 2.2.2 -> fresh read visit (cap reset)",
+      day_pass() and rec().get("s1") == "read" and rec().get("bl_visits") == 1
+      and rec().get("bl_app") == "2.2.2", rec())
+boot()
+check("  ...re-read: layout 4, 2.0.0", rec().get("bl") == [1, 2, 0, 0, 4], rec())
+check("  ...and the stage-1 visit follows", day_pass() and rec().get("s1") == "2.0.1", rec())
+fresh(Module(S, bl=(1, 2, 0, 0, 4)))
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": None}})
+check("record from before bl_app existed -> treated as stale, read again",
+      day_pass() and rec().get("s1") == "read", rec())
+fresh(Module(S, bl=None))
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": None, "bl_app": "2.2.2"}})
+SimFlasher.log = []
+check("bl null under the SAME app version -> left alone", not day_pass() and SimFlasher.log == [])
+fresh(Module(S, bl=None, app="2.2.1"))
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": None, "bl_app": "2.2.1"}})
+conductor().update_module({"type": "usb_leds_16x", "bus": "usb", "uid": S}, b"x")
+boot()
+boot()
+SimFlasher.log = []
+check("app updated BY THIS BRAIN 2.2.1 -> 2.2.2: bl_app follows, no extra read visit",
+      rec().get("bl_app") == "2.2.2" and not day_pass() and SimFlasher.log == [], rec())
+
 print("\nPart 2: piggyback on an app update")
 fresh(Module(S))
 rep = [{"uid": S, "bus": "usb", "needs_update": True, "type": "usb_leds_16x"}]
@@ -478,7 +506,7 @@ check("  ...next day the stage-1 visit is planned directly",
 
 print("\nPart 2: stage-1 and app update due the same day")
 fresh(Module(S, app="2.2.1"))
-noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4]}})
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4], "bl_app": "2.2.1"}})
 day_pass(report=[{"uid": S, "bus": "usb", "needs_update": True}])
 c = conductor()
 SimFlasher.log = []
@@ -494,7 +522,7 @@ check("visit: stage1 -> stage1_ok + app (current 2.2.2) -> verified",
 
 print("\nPart 2: power cut during the stage-1 WRITE stream")
 fresh(Module(S, bl=(1, 2, 0, 0, 4)))
-noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4]}})
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4], "bl_app": "2.2.2"}})
 day_pass()
 SimFlasher.cut = "write"
 try:
@@ -516,7 +544,7 @@ check("next boots: retried (attempt 2) -> stage1_ok + app -> verified",
 
 print("\nPart 2: power cut after VERIFY_STAGE1, before BOOT")
 fresh(Module(S))
-noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4]}})
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4], "bl_app": "2.2.2"}})
 day_pass()
 SimFlasher.cut = "after_verify"
 try:
@@ -534,7 +562,7 @@ check("next boot: already 2.0.1 -> stage1_ok, app pushed (no 2nd install) -> ver
 
 print("\nPart 2: wrong image (not a V203 stage-1) -> error 8")
 fresh(Module(S))
-noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4]}})
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4], "bl_app": "2.2.2"}})
 cache_put("stage1_4", s1_image((1, 2, 0, 1, 4), chip=b"V003"), version="2.0.1", layout=4,
           size=113, crc32="0")
 day_pass()
@@ -561,17 +589,17 @@ check("a NEWER published stage-1 (2.0.2) gets fresh attempts",
 
 print("\nPart 2: cache does not hold the published stage-1 / app")
 fresh(Module(S))
-noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4]}})
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4], "bl_app": "2.2.2"}})
 CACHE.pop("stage1_4")
 SimFlasher.log = []
 check("stage-1 not cached (fetch failed) -> no visit", not day_pass() and SimFlasher.log == [])
 fresh(Module(S))
-noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4]}})
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4], "bl_app": "2.2.2"}})
 CACHE.pop("usb_leds_16x")
 check("app not cached -> no visit (it could not be restored), alert",
       not day_pass() and SimFlasher.log == [] and ns["_field_alerts"])
 fresh(Module(S))
-noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4]}})
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4], "bl_app": "2.2.2"}})
 day_pass()
 cache_put("stage1_4", s1_image((1, 2, 0, 2, 4)), version="2.0.2", layout=4, size=113, crc32="0")
 a1, _ = boot()
@@ -580,7 +608,7 @@ check("cache moved on between plan and visit -> stage1_failed, app pushed, not g
 
 print("\nPart 2: what is never touched")
 fresh(Module(S))
-noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4]}})
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 4], "bl_app": "2.2.2"}})
 SimFlasher.log = []
 check("registry without a USB stage-1 (old registry / only I2C chips) -> nothing",
       not day_pass(published=None) and SimFlasher.log == [])
@@ -589,13 +617,13 @@ check("published stage-1 for layout 2 (CH32V003) -> USB module not visited",
 check("a layout-4 stage-1 for a chip not in USB_STAGE1_CHIPS -> ignored",
       not day_pass(chip="CH32X035") and SimFlasher.log == [])
 fresh(Module(S, bl=(1, 2, 0, 0, 3)))
-noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 3]}})
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl": [1, 2, 0, 0, 3], "bl_app": "2.2.2"}})
 check("module reporting another layout -> not offered the layout-4 image",
       not day_pass() and SimFlasher.log == [])
 
 print("\nPart 2: read-visit caps")
 fresh(Module(S))
-noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl_visits": 2}})
+noknok.store().set("usb", {S: {"type": "usb_leds_16x", "bl_visits": 2, "bl_app": "2.2.2"}})
 SimFlasher.log = []
 check("2 read visits without an answer already -> no 3rd", not day_pass() and SimFlasher.log == [])
 fresh(Module(S))
