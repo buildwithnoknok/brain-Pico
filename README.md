@@ -253,6 +253,23 @@ setup-time writes into `/data`, `settings.toml` for pins and drive visibility; s
   monolithic bootloader is logged once and left for SWD. Each module's stage-1 version is
   read **once** (a bootloader round-trip) and remembered with the module state in the Store
   (`"bl"`), so later checks and the layout gate are a free comparison.
+- **USB bootloader updates (DEV-298, code.py 0.54).** A CH32V203 USB module on bootloader
+  2.0.0 (flash layout 4: frozen stage-0 + self-updating stage-1; registry
+  `bootloader.stage1.CH32V203`) gets a newer stage-1 in the same daily pass, through
+  **bootloader visits** around brain hard resets (a USB module answers `0xB1` only in its
+  bootloader, and the Pico's USB host only sees it there after a reset, DEV-45). Its bootloader
+  version is read whenever it is in its bootloader anyway (app update, rescue) and kept per USB
+  serial in the Store (`usb` record, `"bl"`; `null` = bootloader 1.x, which never gets a
+  stage-1); a module never read gets **one** dedicated read visit (one extra reset in its
+  lifetime; again only when it shows up with an app version this brain did not install, e.g. after
+  the one-time layout-4 full image - `bl_app`). A stage-1 update costs up to 3 extra resets: `0xB0` -> install the stage-1 from the
+  cache (`ERASE` / `WRITE` / `0x06 VERIFY_STAGE1` / `BOOT`; stage-0 installs it and the module
+  comes back in its bootloader without an app) -> check `0xB1`, push the app from the cache ->
+  verify. Same layout only, exact cached version only, at most 2 attempts per published
+  version and 2 read visits per module. A refused image (error 8) or a power cut leaves the old
+  stage-1; the app is pushed back. LEDs app indexes need no `layout` (the app address is the
+  same under both bootloaders). Events `[BL]` / `[USBFW] action=read|stage1|stage1_ok|stage1_failed`.
+  Test: `tools/test_usb_stage1.py` (host, tier S).
 - **Cache-first, once a day.** On a connected boot the OTA pass first refreshes an on-device
   image cache (one download per type per published version) — **before any Conductor exists**,
   the one condition under which downloads on this board are reliable — then creates the
@@ -371,6 +388,8 @@ Earlier features:
   and the boot after verifies the version (`[USBFW] ... flashed` / `verified`). The same pass
   rescues a USB module left in its bootloader for any reason (type remembered per USB serial in
   the Store, key `usb`); at most 2 flashes and 2 requests per module, then `gave_up` + alert.
+  It also reads the bootloader version of every module it finds there and carries out
+  scheduled bootloader visits (stage-1 updates, DEV-298, see above).
   After an X035 (PicoHub) update or rescue on a brain with USB host pins the brain hard-resets
   before the product too (DEV-134: J2 is off while the X035 is in its bootloader). Tests:
   `tools/test_usb_fw_pass.py` (host, tier S), `tools/bench/bench_dev133_*.py`,

@@ -144,6 +144,15 @@ handled, because it is the first point at which the Pico has internet:
    it, and its current app back, in one transaction from the cache — same
    layout only; legacy bootloaders skipped. A module's stage-1 version is read
    once and remembered in the Store's module state (`"bl"`).
+   **USB modules (DEV-298):** a CH32V203 on bootloader 2.0.0 (layout 4) cannot be
+   updated in-session; the pass only schedules a *bootloader visit* (Store record
+   `usb`, then `0xB0` and a hard reset before the product): one version read per
+   module lifetime when its `0xB1` was never read (skipped when an app update
+   reads it anyway), or a stage-1 install when its own layout has a newer
+   published stage-1 in the cache. After the reset `usb_fw_pass()` does the
+   visit: read `0xB1`, install the stage-1 (`0x06 VERIFY_STAGE1`), next boot push
+   the app from the cache, the boot after verify. Bootloader 1.x (no `0xB1`) is
+   never offered a stage-1.
 6. Compare installed app versions versus published; if nothing is outdated,
    stop here having written nothing further to flash.
 7. Check the index's `layout` against each outdated module's actual bootloader

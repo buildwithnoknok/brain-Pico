@@ -1,5 +1,13 @@
 # noknok_main.py — noknok Pico W provisioning + launcher (the body of code.py)
-# Version: 0.53 (code.py is a stub; this file ships precompiled as noknok_main.mpy — DEV-283)
+# Version: 0.54 (code.py is a stub; this file ships precompiled as noknok_main.mpy — DEV-283)
+#
+# v0.54 (Sue): DEV-298 — the daily update pass installs a newer CH32V203 USB stage-1
+#   (bootloader 2.0.0, layout 4). _usb_stage1_plan() schedules bootloader visits (one
+#   version read per module lifetime unless an app update reads it anyway; a stage-1
+#   visit when the module's own layout has a newer published stage-1 in the cache);
+#   usb_fw_pass() carries them out after the hard reset with _cached_usb_stage1().
+#   A 1.x USB bootloader is never offered a stage-1; LEDs apps need no `layout`.
+#   _resolve_stage1() keeps the chip name per entry. Needs noknok.py 1.32, noknok_usb 1.4.
 #
 # v0.53 (Explorer Sue): DEV-286 — `status` fits in one TCP segment by default (STATUS_BUDGET 1100
 #   bytes): third-party rows leave `modules` (count in `thirdparty_total`) and events are dropped
@@ -546,7 +554,7 @@ import adafruit_requests
 import adafruit_connection_manager
 from adafruit_httpserver import Server, Request, Response, POST
 
-CODE_VERSION = "0.53"
+CODE_VERSION = "0.54"
 
 LOG_FILE    = nk.DATA_DIR + "/log.txt"        # bench only (marker), see below
 EVENTS_KEY  = "events"     # audit history ([FW]/[CRASH]/[ROLE]/[RESET]...) lives in the
@@ -936,19 +944,31 @@ def _cached_usb_image(entry):
     log(f"[usb] using cached {entry['type']} {meta.get('version')} ({len(image)} B)")
     return image
 
+def _cached_usb_stage1(layout, version):
+    """Stage-1 image for a USB bootloader visit (DEV-298): the cache slot of that
+    layout, only if it holds exactly the version the visit was scheduled for
+    (size/crc32-checked). Anything else raises: the stage-1 is never guessed."""
+    image, meta = _cache_read(_s1_slot(layout))
+    if meta.get("version") != version or meta.get("layout") != layout:
+        raise ValueError("cache holds stage-1 %s (layout %s), visit wants %s (layout %s)"
+                         % (meta.get("version"), meta.get("layout"), version, layout))
+    log(f"[usb] using cached stage-1 {version} (layout {layout}, {len(image)} B)")
+    return image
+
 def _usb_fw(c):
     """Conductor.usb_fw_pass() with the cache as image source, results to the
     event log, problems to the customer alert, a hard reset when it moved a
     module. Best-effort: never stops the boot."""
     try:
-        results = c.usb_fw_pass(_cached_usb_image, logfn=log)
+        results = c.usb_fw_pass(_cached_usb_image, logfn=log,
+                                get_stage1=_cached_usb_stage1)
     except Exception as e:
         log(f"[usb] firmware pass failed (ignored): {e!r}")
         return
     for r in results:
         event(f"[USBFW] {r.get('type')} uid={r.get('uid')} action={r.get('action')} "
               f"detail={r.get('detail')}")
-        if r.get("action") in ("failed", "gave_up", "unknown"):
+        if r.get("action") in ("failed", "gave_up", "unknown", "stage1_failed"):
             _field_alerts.append("usb %s %s" % (r.get("action"), r.get("uid")))
     if getattr(c, "usb_needs_reset", False):
         _need_hard_reset_for_usb("a USB module was flashed or asked into its bootloader")
@@ -2244,7 +2264,7 @@ def _resolve_stage1(session, registry_doc):
             continue
         log(f"[bl] current {chip} stage-1 is {idx['version']} (layout {lay})")
         out[lay] = {"version": idx["version"], "url": idx["url"], "layout": lay,
-                    "size": idx["size"], "crc32": idx["crc32"]}
+                    "size": idx["size"], "crc32": idx["crc32"], "chip": chip}
     return out
 
 
@@ -2373,6 +2393,83 @@ def _stage1_pass(c, s1_by_layout):
             event(f"[BL]    {mf_key:<11} uid={uid}  stage-1 {'.'.join(map(str, have))} -> "
                   f"{s1['version']}  FAIL (after={after})")
             _field_alerts.append("stage-1 update failed %s" % uid)
+
+
+# Chip families whose stage-1 goes over USB (DEV-298); everything else in the
+# registry's bootloader.stage1 is I2C (_stage1_pass).
+USB_STAGE1_CHIPS = ("CH32V203",)
+
+def _usb_stage1_plan(c, s1_by_layout, report):
+    """Schedule USB bootloader visits for the daily pass (DEV-298, option (a)).
+
+    A USB module answers 0xB1 only in its bootloader, and each visit costs a
+    brain hard reset (DEV-45), so nothing here talks to a bootloader: it only
+    records a visit and sends 0xB0 (Conductor.usb_schedule_visit()); the visit
+    itself runs in usb_fw_pass() after the reset, from the cache.
+      - version never read, and no app update due (that visit reads it for
+        free) -> one "read" visit, once per module lifetime;
+      - 1.x bootloader (no 0xB1) -> never offered a stage-1;
+      - stage-1 older than the published one for ITS layout, the image and the
+        module's app in the cache -> a stage-1 visit (it pushes the app back).
+    Only while the registry publishes a USB stage-1 at all; an I2C-only brain
+    or an older registry costs nothing."""
+    usb_s1 = {lay: s1 for lay, s1 in (s1_by_layout or {}).items()
+              if s1.get("chip") in USB_STAGE1_CHIPS}
+    if not usb_s1:
+        return
+    app_due = set(r.get("uid") for r in report
+                  if r.get("bus") == "usb" and r.get("needs_update"))
+    asked = 0
+    for list_attr, mf_key in c._USB_FW_GROUPS:
+        for m in list(getattr(c, list_attr, [])):
+            serial = getattr(m, "_uid_hex", None)
+            if not serial:
+                continue
+            app_v = getattr(m, "firmware_version", None)
+            known, bl = c.usb_bootloader(serial, app_v)
+            if not known:
+                if serial in app_due:
+                    log(f"[bl] {mf_key} {serial}: bootloader version unknown - read "
+                        f"during today's app update")
+                    continue
+                purpose = "read"
+                log(f"[bl] {mf_key} {serial}: reading the bootloader version (once per app "
+                    f"version this brain did not install)")
+            elif bl is None:
+                continue                    # 1.x: no self-update, never offered
+            else:
+                lay = c.layout_of(bl)
+                s1 = usb_s1.get(lay)
+                want = _semver3(s1["version"]) if s1 else None
+                if want is None or (bl[1], bl[2], bl[3]) >= want:
+                    continue
+                meta = _cache_meta(_s1_slot(lay)) or {}
+                if meta.get("version") != s1["version"]:
+                    log(f"[bl] {mf_key} {serial}: stage-1 {s1['version']} not in the cache "
+                        f"(fetch failed?) - skipped")
+                    continue
+                if not (_cache_meta(mf_key) or {}).get("version"):
+                    log(f"[bl] {mf_key} {serial}: no cached app to restore after the "
+                        f"stage-1 update - skipped")
+                    _field_alerts.append("stage-1 no app %s" % serial)
+                    continue
+                purpose = s1["version"]
+                log(f"[bl] {mf_key} {serial}: stage-1 {bl[1]}.{bl[2]}.{bl[3]} -> "
+                    f"{purpose} - asking it into its bootloader")
+            try:
+                ok, why = c.usb_schedule_visit(serial, purpose, mf_key, app_v)
+            except Exception as e:
+                ok, why = False, repr(e)
+            if ok:
+                asked += 1
+                event(f"[BL]    {mf_key:<11} uid={serial}  bootloader visit scheduled "
+                      f"({'version read' if purpose == 'read' else 'stage-1 ' + purpose})")
+            else:
+                log(f"[bl] {mf_key} {serial}: no bootloader visit ({why})")
+                if purpose != "read" and "failed" in why:
+                    _field_alerts.append("stage-1 gave up %s" % serial)
+    if asked:
+        _need_hard_reset_for_usb("%d USB bootloader visit(s) scheduled" % asked)
 
 
 def _semver_lt(a, b):
@@ -2869,8 +2966,15 @@ def check_and_flash_modules(module_firmware):
     except Exception as e:
         log(f"[bl] stage-1 pass error (ignored): {e!r}")
 
-    todo = [r for r in c.log_firmware_report(resolved, logfn=log)
-            if r["needs_update"]]
+    report = c.log_firmware_report(resolved, logfn=log)
+    # USB stage-1 (DEV-298): only schedules bootloader visits (0xB0 + Store
+    # record); they run after the hard reset, from the cache refreshed above.
+    try:
+        _usb_stage1_plan(c, stage1, report)
+    except Exception as e:
+        log(f"[bl] USB stage-1 plan error (ignored): {e!r}")
+
+    todo = [r for r in report if r["needs_update"]]
     if not todo:
         log("[fw] all modules up to date")
         _mark_ota_checked()

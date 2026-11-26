@@ -23,7 +23,8 @@
 import time
 import struct
 
-__version__ = "1.3"   # 1.3 = DEV-178: console output through noknok._print (never blocks)
+__version__ = "1.4"   # 1.4 = DEV-298: bootloader 0xB1 get_version(), flash_stage1(), boot_only()
+                      # 1.3 = DEV-178: console output through noknok._print (never blocks)
                       # 1.2 = DEV-133: discover() notes bootloader devices, request_bootloader()
                       # 1.1 = DEV-46: LEDs 16x + dispatch on the 0xF0 type byte
 
@@ -570,6 +571,13 @@ def discover(dp=None, dm=None, settle_sec=3, max_sec=20, empty_grace=6):
 #   0x04 VERIFY crc32(4 LE)         -> writes the validity marker; state==READY
 #   0x05 BOOT                       jump to the app (no reply; device resets)
 #   state: 0 IDLE 1 BUSY 2 READY 3 ERROR ; err: 0 ok, 5 CRC mismatch, 6 region
+# Bootloader 2.0.0 (flash layout 4: frozen stage-0 + self-updating stage-1, DEV-237):
+#   0xB1 GET_VERSION                -> [proto, major, minor, patch, layout] (5 bytes;
+#                                      1.x ignores it: no reply at all)
+#   0x06 VERIFY_STAGE1 crc32(4 LE)  -> arms stage-0 to install the staged stage-1 at
+#                                      the next BOOT; err 8 = not a V203 layout-4
+#                                      stage-1, err 4 = too big for the stage-1 region
+#   BOOT with no valid app stays in the bootloader (err 6); 1.x jumped blind.
 #
 # A running app is flipped into the bootloader with CDC command 0xB0.
 # CRC32 = zlib (poly 0xEDB88320, init/final 0xFFFFFFFF) to match the bootloader.
@@ -617,6 +625,8 @@ class UsbModuleFlasher:
     CMD_STATUS  = 0x03
     CMD_VERIFY  = 0x04
     CMD_BOOT    = 0x05
+    CMD_VERIFY_STAGE1 = 0x06  # bootloader >= 2.0.0 (layout 4)
+    CMD_GET_VERSION   = 0xB1  # bootloader >= 2.0.0; 1.x does not answer
 
     ST_IDLE, ST_BUSY, ST_READY, ST_ERROR = 0, 1, 2, 3
     CHUNK = 32                # bootloader WRITE accepts up to 32 bytes per chunk
@@ -624,7 +634,9 @@ class UsbModuleFlasher:
     _EP_OUT = 0x02            # CDC data OUT (host -> module: commands)
     _EP_IN  = 0x83            # CDC data IN  (module -> host: [state, err])
 
-    _ERRMSG = {0: "none", 5: "CRC mismatch", 6: "region overflow"}
+    _ERRMSG = {0: "none", 4: "image too big for the stage-1 region", 5: "CRC mismatch",
+               6: "region overflow / no valid app",
+               8: "wrong image (not a stage-1 for this chip and layout)"}
 
     def __init__(self, dp=None, dm=None):
         ensure_host_port(dp, dm)     # raises if this build has no USB host support
@@ -759,6 +771,82 @@ class UsbModuleFlasher:
         except Exception:
             pass        # device resets into the app; the write need not complete
 
+    # ── bootloader self-update (layout 4, DEV-237 / DEV-298) ─────────────────
+    # These work on a module that is ALREADY in its bootloader (PID 4E42). On the
+    # Pico the brain never waits for a re-enumeration (DEV-45/DEV-133): the
+    # Conductor's usb_fw_pass() calls them on the boot after the 0xB0, and the
+    # brain hard-resets afterwards.
+    def _bootloader(self, serial):
+        bl = self._find(self.PID_BOOTLOADER, serial)
+        if bl is None:
+            raise UsbFlashError("bootloader (PID 4E42) %s not on the bus" % (serial or ""))
+        return bl
+
+    def _drain(self, dev):
+        """Drop any reply bytes still queued (e.g. a late 0xB1 answer), so the
+        next [state, err] read belongs to the next command."""
+        buf = bytearray(8)
+        for _ in range(4):
+            try:
+                if dev.read(self._EP_IN, buf, timeout=50) <= 0:
+                    return
+            except Exception:
+                return
+
+    def get_version(self, serial=None, tries=3):
+        """0xB1 GET_VERSION -> (proto, major, minor, patch, layout), or None for
+        a bootloader 1.x (it ignores 0xB1). Asked up to `tries` times: right after
+        the bootloader enumerates the first read can come back empty (DEV-237
+        bench, 26 Nov 2026), and one miss must not read as "1.x"."""
+        bl = self._bootloader(serial)
+        buf = bytearray(5)
+        for i in range(tries):
+            try:
+                self._send(bl, [self.CMD_GET_VERSION])
+                n = bl.read(self._EP_IN, buf, timeout=500)
+            except Exception:
+                n = 0
+            if n == 5:
+                return tuple(buf)
+            time.sleep(0.2)
+        return None
+
+    def flash_stage1(self, data, serial=None, progress=None):
+        """Install a new stage-1 bootloader on a module in its bootloader (2.0.0+):
+        ERASE -> WRITE xN -> 0x06 VERIFY_STAGE1 -> BOOT. The image is staged in the
+        app region (so the app is gone afterwards); BOOT resets the module, the
+        frozen stage-0 copies the new stage-1 into place and the module comes back
+        IN ITS BOOTLOADER, without an app: push the app next. No wait here (the
+        Pico host will not see it re-enumerate). Raises UsbFlashError on any
+        refusal; the module then stays in its (old) bootloader, nothing armed."""
+        total = len(data)
+        if total == 0:
+            raise UsbFlashError("empty stage-1 image")
+        bl = self._bootloader(serial)
+        self._drain(bl)
+        self.erase(bl)
+        off = 0
+        while off < total:
+            self.write_chunk(bl, data[off:off + self.CHUNK])
+            off += self.CHUNK
+            if progress:
+                progress(min(off, total), total)
+        crc = crc32(data)
+        self._send(bl, bytes([self.CMD_VERIFY_STAGE1, crc & 0xFF, (crc >> 8) & 0xFF,
+                              (crc >> 16) & 0xFF, (crc >> 24) & 0xFF]))
+        state = self._check(self._read_status(bl, timeout=3000), "VERIFY_STAGE1")
+        if state != self.ST_READY:
+            raise UsbFlashError("VERIFY_STAGE1: not armed (state %d, expected READY)" % state)
+        self.boot(bl)
+        return True
+
+    def boot_only(self, serial=None):
+        """Leave the bootloader without writing anything (after a version read).
+        With a valid app the module starts it; a 2.0.0 bootloader without one
+        stays put (err 6) and the next boot's rescue pushes the app."""
+        self.boot(self._bootloader(serial))
+        return True
+
     # ── orchestration (mirrors module_flasher.ModuleFlasher.flash) ───────────
     def flash(self, data, serial=None, progress=None, confirm_app=True):
         """
@@ -786,6 +874,7 @@ class UsbModuleFlasher:
             except Exception:
                 serial = None
         time.sleep(0.2)
+        self._drain(bl)               # a late 0xB1 reply must not pose as ERASE's status
 
         # 2. Erase.
         self.erase(bl)
