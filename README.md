@@ -602,7 +602,7 @@ while True:
 
 Providers: `departures(station, limit)`, `weather(place, hours)` (+ `geocode(place)`), `power_price(zone)`. Each result has
 `src`, the attribution line the product must show. Time helpers: `clock_ok()`, `utc_offset(epoch, std_hours)`, `local_hm(epoch, std_hours)`.
-**Rules learned on a real Pico 2 W (bench 20 + 23 Nov 2026, exploration repo `data-sources/FEEDS-DESIGN.md` 2b/2c):** the first connect to an HTTPS server
+**Rules learned on a real Pico 2 W (bench 20 + 23 Nov 2026; design record in the private architecture repo `flows/data-feeds.md`, decision ADR-013; probe scripts: `tools/bench/feeds_probes/`):** the first connect to an HTTPS server
 takes 4-13 s and keeps the app channel dead meanwhile; every server costs 33-70 KB of heap: use ONE server per product, TWO at most; a reconnect
 stalls the app ~4 s every minute or two (worst seen 24 s); keep `every` >= 20 s; never close and reopen connections. Host test: `python tools/test_feeds.py`
 (real API answers recorded in `tools/fixtures/feeds/`).
