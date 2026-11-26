@@ -1,8 +1,8 @@
 # DEV-298 bench: USB stage-1 update through the brain's daily pass
 
-Bench only. `registry_test.json` = the Ecosystem registry 2.1.0 (branch `dev-237-v203-layout4`) with
-`bootloader.stage1.CH32V203` pointed at Sam's TEST stage-1 2.0.1 index (module-USB-bootloader branch
-`dev-237-v203-stage0-stage1`, `firmware/test/stage1_2.0.1/`). Never put it on a field brain.
+Bench only. A bench registry (`registry_test.json`, NOT committed) is the Ecosystem registry 2.1.0 with
+`bootloader.stage1.CH32V203` pointed at a TEST stage-1 2.0.1 index (a version-bumped copy of the 2.0.0 source,
+also not committed). Never put it on a field brain.
 
 `deploy.sh` (on a bench Pi, in a brain-Pico checkout of this branch): builds nothing itself; give it the three
 `.mpy` files built with mpy-cross 10.3.1 from `software/` (`noknok_main` with `MODULE_REGISTRY_URL` replaced by the
