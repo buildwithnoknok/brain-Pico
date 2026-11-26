@@ -276,6 +276,10 @@ see whether a client reuses its connection.
 acknowledged the first part yet) is retried within that budget instead of ending the reply after
 its headers, and a reply that a network error ends is counted too: `send_errors` (how many) and
 `last_send_err` (the errno of the last one, e.g. 113 = no route).
+**Who closes (noknok_rpc 0.7.2, DEV-293):** after a `Connection: close` reply the brain waits up
+to 1 s for the client to close first (rule in [device-protocol.md § 3](device-protocol.md#3-carrier)).
+`link.client_closed` counts connections the client closed first (good), `link.brain_closed`
+those the brain had to close (client too slow or gone, or more than 4 waiting at once).
 
 `product_id` (the manifest id) is new and optional on `/connect` and `provision`; it is
 stored with the credentials so the app can fetch the right `config_schema` later.

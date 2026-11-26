@@ -80,6 +80,12 @@ Only one carrier exists: HTTP.
   client needs the slot (the client just reconnects). A client should close an idle
   connection before 20 s itself. The setup pages (`GET /`, form endpoints) still close after
   every reply.
+- **Who closes (noknok_rpc 0.7.2, DEV-293):** after a `Connection: close` reply the brain
+  waits up to 1 s for the CLIENT to close first, then closes its end. Whoever closes first
+  keeps the TCP TIME_WAIT record for 2 x 60 s, and on the brain lwIP takes that memory from
+  the same RAM as Python. A client should therefore close right after reading
+  `Content-Length` bytes (curl, Python urllib and Dart's `http` do). One that waits for the
+  brain to close first gets its reply complete, only its close is 1 s late.
 - A second carrier would feed the same `Dispatcher`; nothing in the dispatcher is HTTP-specific.
 
 ## 4. Operations
